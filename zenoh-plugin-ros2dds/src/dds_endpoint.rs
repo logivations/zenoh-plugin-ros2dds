@@ -434,8 +434,11 @@ mod tests {
     use super::*;
     use std::sync::{mpsc, Barrier};
 
+    static DDS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn every_pair_creation_failure_releases_real_dds_resources() {
+        let _serial = DDS_TEST.lock().unwrap();
         let config = std::ffi::CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
         let domain = unsafe { dds_create_domain(219, config.as_ptr()) };
         assert!(domain > 0, "domain: {domain}");
@@ -478,6 +481,75 @@ mod tests {
         }
         assert_eq!(children(), baseline);
         assert_eq!(CLEANUP_FAILURES.load(Ordering::Relaxed), 0);
+        delete_dds_entity(participant).unwrap();
+        delete_dds_entity(domain).unwrap();
+    }
+
+    #[test]
+    fn real_dds_deletion_drains_callback_before_releasing_its_argument() {
+        let _serial = DDS_TEST.lock().unwrap();
+        let config = std::ffi::CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+        let domain = unsafe { dds_create_domain(220, config.as_ptr()) };
+        let participant =
+            unsafe { dds_create_participant(220, std::ptr::null(), std::ptr::null()) };
+        assert!(participant > 0 && domain > 0);
+        let writer = DdsEndpoint::writer(
+            participant,
+            "rt/drain".into(),
+            "Raw".into(),
+            true,
+            Qos::default(),
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let release_callback = release.clone();
+        let reader = DdsEndpoint::reader(
+            participant,
+            "rt/drain".into(),
+            "Raw".into(),
+            &None,
+            true,
+            Qos::default(),
+            None,
+            move |_| {
+                entered_tx.send(()).unwrap();
+                release_callback.wait();
+            },
+        )
+        .unwrap();
+        let access = writer.access();
+        let writing = std::thread::spawn(move || {
+            access
+                .with(|entity| {
+                    crate::dds_utils::dds_write(
+                        entity,
+                        vec![0, 1, 0, 0, 4, 0, 0, 0, b'f', b'o', b'o', 0],
+                    )
+                })
+                .unwrap()
+                .unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (retired_tx, retired_rx) = mpsc::channel();
+        let retiring = std::thread::spawn(move || {
+            drop(reader);
+            retired_tx.send(()).unwrap();
+        });
+        assert!(retired_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert_eq!(
+            LIVE_LISTENERS.load(Ordering::Relaxed),
+            1,
+            "callback argument freed while in use"
+        );
+        release.wait();
+        retired_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        retiring.join().unwrap();
+        writing.join().unwrap();
+        drop(writer);
+        assert_eq!(LIVE_LISTENERS.load(Ordering::Relaxed), 0);
+        assert_eq!(LIVE_ENDPOINTS.load(Ordering::Relaxed), 0);
+        assert_eq!(LIVE_TOPICS.load(Ordering::Relaxed), 0);
         delete_dds_entity(participant).unwrap();
         delete_dds_entity(domain).unwrap();
     }
