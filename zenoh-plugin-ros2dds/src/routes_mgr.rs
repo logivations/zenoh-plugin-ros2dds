@@ -82,6 +82,7 @@ pub struct Context {
     pub(crate) discovered_entities: Arc<RwLock<DiscoveredEntities>>,
     // ros_discovery_info read/write manager
     pub(crate) ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
+    pub(crate) matching_changed: Arc<tokio::sync::Notify>,
 }
 
 pub struct RoutesMgr {
@@ -114,6 +115,7 @@ impl RoutesMgr {
             participant,
             discovered_entities,
             ros_discovery_mgr,
+            matching_changed: Arc::new(tokio::sync::Notify::new()),
         };
 
         RoutesMgr {
@@ -126,6 +128,25 @@ impl RoutesMgr {
             routes_action_cli: HashMap::new(),
             admin_prefix,
             admin_space: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn matching_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.context.matching_changed.clone()
+    }
+
+    pub(crate) fn reconcile(&mut self) {
+        for route in self.routes_publishers.values_mut() {
+            route.reconcile();
+        }
+        for route in self.routes_service_cli.values_mut() {
+            route.reconcile();
+        }
+        for route in self.routes_action_cli.values_mut() {
+            route.reconcile();
+        }
+        for route in self.routes_action_srv.values_mut() {
+            route.reconcile();
         }
     }
 

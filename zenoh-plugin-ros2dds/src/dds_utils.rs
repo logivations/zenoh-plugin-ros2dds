@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     ffi::{CStr, CString},
     mem::MaybeUninit,
-    sync::{atomic::AtomicI32, Arc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -49,10 +49,6 @@ where
     seq.end()
 }
 
-// An atomic dds_entity_t (=i32), for safe concurrent creation/deletion of DDS entities
-pub type AtomicDDSEntity = AtomicI32;
-
-pub const DDS_ENTITY_NULL: dds_entity_t = 0;
 pub const CDR_HEADER_LE: [u8; 4] = [0, 1, 0, 0];
 pub const CDR_HEADER_BE: [u8; 4] = [0, 0, 0, 0];
 
@@ -118,16 +114,6 @@ where
     }
 }
 
-pub fn serialize_atomic_entity_guid<S>(entity: &AtomicDDSEntity, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match entity.load(std::sync::atomic::Ordering::Relaxed) {
-        DDS_ENTITY_NULL => s.serialize_str(""),
-        entity => serialize_entity_guid(&entity, s),
-    }
-}
-
 pub fn get_instance_handle(entity: dds_entity_t) -> Result<dds_instance_handle_t, String> {
     unsafe {
         let mut handle: dds_instance_handle_t = 0;
@@ -167,10 +153,9 @@ pub unsafe fn create_topic(
                 500000000,
                 &mut descriptor,
             );
-            let mut topic: dds_entity_t = 0;
+            let mut topic: dds_entity_t = ret;
             if ret == (DDS_RETCODE_OK as i32) {
                 topic = dds_create_topic(dp, descriptor, cton, std::ptr::null(), std::ptr::null());
-                assert!(topic >= 0);
                 dds_delete_topic_descriptor(descriptor);
             }
             topic

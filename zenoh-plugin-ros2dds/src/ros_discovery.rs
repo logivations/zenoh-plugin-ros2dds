@@ -226,6 +226,17 @@ impl RosDiscoveryInfoMgr {
         });
     }
 
+    pub(crate) fn add_dds_pair(&self, reader: Gid, writer: Gid) {
+        let (ref mut info, ref mut has_changed) = *zwrite!(self.participant_entities_state);
+        let node = info
+            .node_entities_info_seq
+            .get_mut(&self.node_fullname)
+            .unwrap();
+        node.reader_gid_seq.insert(reader);
+        node.writer_gid_seq.insert(writer);
+        *has_changed = true;
+    }
+
     pub fn add_dds_writer(&self, gid: Gid) {
         let (ref mut info, ref mut has_changed) = *zwrite!(self.participant_entities_state);
         info.node_entities_info_seq

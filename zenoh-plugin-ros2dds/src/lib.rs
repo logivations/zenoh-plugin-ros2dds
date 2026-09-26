@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use cyclors::*;
 use events::ROS2AnnouncementEvent;
 use flume::{unbounded, Receiver, Sender};
-use futures::select;
+use futures::{select, FutureExt};
 use serde::Serializer;
 use tokio::task::JoinHandle;
 use zenoh::{
@@ -52,6 +52,7 @@ use zenoh_plugin_trait::{plugin_long_version, plugin_version, Plugin, PluginCont
 
 pub mod config;
 mod dds_discovery;
+mod dds_endpoint;
 mod dds_types;
 mod dds_utils;
 mod discovered_entities;
@@ -65,6 +66,7 @@ mod ros2_utils;
 mod ros_discovery;
 mod route_action_cli;
 mod route_action_srv;
+mod route_lifecycle;
 mod route_publisher;
 mod route_service_cli;
 mod route_service_srv;
@@ -481,8 +483,13 @@ impl ROS2PluginRuntime {
             admin_prefix.clone(),
         );
 
+        let matching_changed = routes_mgr.matching_changed();
+        let mut retry_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             select!(
+                _ = matching_changed.notified().fuse() => { routes_mgr.reconcile(); },
+                _ = retry_tick.tick().fuse() => { routes_mgr.reconcile(); },
                 evt = discovery_rcv.recv_async() => {
                     match evt {
                         Ok(evt) => {

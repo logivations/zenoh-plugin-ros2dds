@@ -12,13 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use std::{
-    collections::HashSet,
-    fmt,
-    ops::Deref,
-    sync::{atomic::Ordering, Arc},
-    time::Duration,
-};
+use std::{collections::HashSet, fmt, ops::Deref, sync::Arc, time::Duration};
 
 use cyclors::{
     qos::{HistoryKind, Qos},
@@ -28,6 +22,7 @@ use serde::{Serialize, Serializer};
 use zenoh::{
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
+    matching::{MatchingListener, MatchingStatus},
     qos::{CongestionControl, Priority, Reliability},
     sample::Locality,
     Wait,
@@ -35,16 +30,14 @@ use zenoh::{
 use zenoh_ext::{AdvancedPublisher, AdvancedPublisherBuilderExt, CacheConfig};
 
 use crate::{
+    dds_endpoint::DdsEndpoint,
     dds_types::{DDSRawSample, TypeInfo},
-    dds_utils::{
-        create_dds_reader, delete_dds_entity, get_guid, serialize_atomic_entity_guid,
-        serialize_local_nodes, AtomicDDSEntity, DDS_ENTITY_NULL,
-    },
+    dds_utils::serialize_local_nodes,
     gid::Gid,
     liveliness_mgt::new_ke_liveliness_pub,
     qos_helpers::*,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
-    ros_discovery::RosDiscoveryInfoMgr,
+    route_lifecycle::RouteLifecycle,
     routes_mgr::Context,
     Config, LOG_PAYLOAD,
 };
@@ -83,8 +76,11 @@ pub struct RoutePublisher {
     )]
     zenoh_publisher: ZPublisher,
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
-    #[serde(serialize_with = "serialize_atomic_entity_guid")]
-    dds_reader: Arc<AtomicDDSEntity>,
+    #[serde(serialize_with = "crate::dds_endpoint::serialize_optional")]
+    dds_reader: Option<DdsEndpoint>,
+    lifecycle: RouteLifecycle,
+    #[serde(skip)]
+    matching_listener: Option<MatchingListener<()>>,
     // the Zenoh Priority for publications
     #[serde(serialize_with = "serialize_priority")]
     priority: Priority,
@@ -112,7 +108,8 @@ pub struct RoutePublisher {
 
 impl Drop for RoutePublisher {
     fn drop(&mut self) {
-        self.deactivate_dds_reader();
+        self.matching_listener.take();
+        self.dds_reader.take();
     }
 }
 
@@ -220,48 +217,13 @@ impl RoutePublisher {
                 .map_err(|e| format!("Failed create Publisher for key {zenoh_key_expr}: {e}",))?,
         );
 
-        // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
-        // (copy/move all required args for the callback)
-        let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
-
-        publisher
+        let lifecycle = RouteLifecycle::new();
+        let observe = lifecycle.observer(context.matching_changed.clone());
+        let matching_listener = publisher
             .matching_listener()
-            .callback({
-                let dds_reader = dds_reader.clone();
-                let ros2_name = ros2_name.clone();
-                let ros2_type = ros2_type.clone();
-                let zenoh_key_expr = zenoh_key_expr.clone();
-                let route_id =
-                    format!("Route Publisher (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr})");
-                let context = context.clone();
-                let reader_qos = reader_qos.clone();
-                let type_info = type_info.clone();
-                let publisher = publisher.clone();
-
-                move |status| {
-                    tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
-                    if status.matching() {
-                        if let Err(e) = activate_dds_reader(
-                            &dds_reader,
-                            &ros2_name,
-                            &ros2_type,
-                            &route_id,
-                            &context,
-                            keyless,
-                            &reader_qos,
-                            &type_info,
-                            &publisher,
-                        ) {
-                            tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
-                        }
-                    } else {
-                        deactivate_dds_reader(&dds_reader, &route_id, &context.ros_discovery_mgr)
-                    }
-                }
-            })
-            .background()
+            .callback(move |status: MatchingStatus| observe(status.matching()))
             .await
-            .map_err(|e| format!("Failed to listen of matching status changes: {e}",))?;
+            .map_err(|e| format!("Failed to declare matching listener: {e}"))?;
 
         Ok(RoutePublisher {
             ros2_name,
@@ -272,7 +234,9 @@ impl RoutePublisher {
                 publisher,
                 cache_size,
             },
-            dds_reader,
+            dds_reader: None,
+            lifecycle,
+            matching_listener: Some(matching_listener),
             priority,
             _type_info: type_info.clone(),
             _reader_qos: reader_qos,
@@ -283,17 +247,22 @@ impl RoutePublisher {
         })
     }
 
-    fn deactivate_dds_reader(&mut self) {
-        let dds_reader = self.dds_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-        if dds_reader != DDS_ENTITY_NULL {
-            // remove reader's GID from ros_discovery_info message
-            match get_guid(&dds_reader) {
-                Ok(gid) => self.context.ros_discovery_mgr.remove_dds_reader(gid),
-                Err(e) => tracing::warn!("{self}: {e}"),
-            }
-            if let Err(e) = delete_dds_entity(dds_reader) {
-                tracing::warn!("{}: error deleting DDS Reader:  {}", self, e);
-            }
+    pub(crate) fn reconcile(&mut self) {
+        let route_id = self.to_string();
+        let result = self.lifecycle.reconcile(&mut self.dds_reader, || {
+            create_reader(
+                &self.ros2_name,
+                &self.ros2_type,
+                &route_id,
+                &self.context,
+                self.keyless,
+                &self._reader_qos,
+                &self._type_info,
+                &self.zenoh_publisher,
+            )
+        });
+        if let Err(error) = result {
+            tracing::error!("{route_id}: activation failed: {error}");
         }
     }
 
@@ -339,10 +308,7 @@ impl RoutePublisher {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
-        // if last remote route removed, deactivate the DDS Reader
-        if self.remote_routes.is_empty() {
-            self.deactivate_dds_reader();
-        }
+        // Native Zenoh subscribers may keep matching true when this set is empty.
     }
 
     #[inline]
@@ -351,11 +317,7 @@ impl RoutePublisher {
     }
 
     #[inline]
-    pub async fn add_local_node(
-        &mut self,
-        node_key: (Gid, String),
-        discovered_writer_qos: &Qos,
-    ) {
+    pub async fn add_local_node(&mut self, node_key: (Gid, String), discovered_writer_qos: &Qos) {
         if self.local_nodes.insert(node_key) {
             tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
             // if 1st local node added, announce the route
@@ -411,8 +373,7 @@ fn get_read_period(config: &Config, ros2_name: &str) -> Option<Duration> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn activate_dds_reader(
-    dds_reader: &Arc<AtomicDDSEntity>,
+fn create_reader(
     ros2_name: &str,
     ros2_type: &str,
     route_id: &str,
@@ -421,60 +382,21 @@ fn activate_dds_reader(
     reader_qos: &Qos,
     type_info: &Option<Arc<TypeInfo>>,
     publisher: &Arc<AdvancedPublisher<'static>>,
-) -> Result<(), String> {
-    tracing::debug!("{route_id}: create Reader with {reader_qos:?}");
-    let topic_name: String = format!("rt{}", ros2_name);
-    let type_name = ros2_message_type_to_dds_type(ros2_type);
-    let read_period = get_read_period(&context.config, ros2_name);
-
-    // create matching DDS Reader that forwards message coming from DDS to Zenoh
-    let reader = create_dds_reader(
+) -> Result<DdsEndpoint, String> {
+    let route_id = route_id.to_string();
+    let publisher = publisher.clone();
+    let mut reader = DdsEndpoint::reader(
         context.participant,
-        topic_name.clone(),
-        type_name,
+        format!("rt{ros2_name}"),
+        ros2_message_type_to_dds_type(ros2_type),
         type_info,
         keyless,
         reader_qos.clone(),
-        read_period,
-        {
-            let route_id = route_id.to_string();
-            let publisher = publisher.clone();
-            move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(sample, &publisher, &route_id);
-            }
-        },
+        get_read_period(&context.config, ros2_name),
+        move |sample| route_dds_message_to_zenoh(sample, &publisher, &route_id),
     )?;
-    let old = dds_reader.deref().swap(reader, Ordering::Relaxed);
-    // add reader's GID in ros_discovery_info message
-    context.ros_discovery_mgr.add_dds_reader(get_guid(&reader)?);
-
-    if old != DDS_ENTITY_NULL {
-        tracing::warn!("{route_id}: on activation their was already a DDS Reader - overwrite it");
-        if let Err(e) = delete_dds_entity(old) {
-            tracing::warn!("{route_id}: failed to delete overwritten DDS Reader: {e}");
-        }
-    }
-
-    Ok(())
-}
-
-fn deactivate_dds_reader(
-    dds_reader: &Arc<AtomicDDSEntity>,
-    route_id: &str,
-    ros_discovery_mgr: &Arc<RosDiscoveryInfoMgr>,
-) {
-    tracing::debug!("{route_id}: delete Reader");
-    let reader = dds_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-    if reader != DDS_ENTITY_NULL {
-        // remove reader's GID from ros_discovery_info message
-        match get_guid(&reader) {
-            Ok(gid) => ros_discovery_mgr.remove_dds_reader(gid),
-            Err(e) => tracing::warn!("{route_id}: {e}"),
-        }
-        if let Err(e) = delete_dds_entity(reader) {
-            tracing::warn!("{route_id}: error deleting DDS Reader:  {e}");
-        }
-    }
+    reader.advertise(context.ros_discovery_mgr.clone());
+    Ok(reader)
 }
 
 fn route_dds_message_to_zenoh(

@@ -145,6 +145,11 @@ impl RouteActionSrv {
         })
     }
 
+    pub(crate) fn reconcile(&mut self) {
+        self.route_feedback.reconcile();
+        self.route_status.reconcile();
+    }
+
     // Announce the route over Zenoh via a LivelinessToken
     async fn announce_route(&mut self) -> Result<(), String> {
         self.is_active = true;

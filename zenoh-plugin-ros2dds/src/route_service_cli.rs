@@ -15,14 +15,10 @@
 use std::{
     collections::HashSet,
     fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
-use cyclors::dds_entity_t;
 use serde::Serialize;
 use zenoh::{
     bytes::ZBytes,
@@ -30,25 +26,23 @@ use zenoh::{
     internal::buffers::{Buffer, ZBuf, ZSlice},
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
+    matching::{MatchingListener, MatchingStatus},
     query::{Querier, Reply},
     sample::Locality,
     Wait,
 };
 
 use crate::{
+    dds_endpoint::{DdsAccess, DdsEndpoint},
     dds_types::{DDSRawSample, TypeInfo},
-    dds_utils::{
-        create_dds_reader, create_dds_writer, dds_write, delete_dds_entity, get_guid,
-        is_cdr_little_endian, serialize_atomic_entity_guid, serialize_local_nodes,
-        AtomicDDSEntity, DDS_ENTITY_NULL,
-    },
+    dds_utils::{dds_write, is_cdr_little_endian, serialize_local_nodes},
     gid::Gid,
     liveliness_mgt::new_ke_liveliness_service_cli,
     ros2_utils::{
         is_service_for_action, new_service_id, ros2_service_type_to_reply_dds_type,
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
     },
-    ros_discovery::RosDiscoveryInfoMgr,
+    route_lifecycle::RouteLifecycle,
     routes_mgr::Context,
     LOG_PAYLOAD,
 };
@@ -70,12 +64,13 @@ pub struct RouteServiceCli {
     _zenoh_querier: Arc<Querier<'static>>,
     #[serde(serialize_with = "crate::config::serialize_duration_as_f32")]
     queries_timeout: Duration,
-    // the local DDS Reader receiving client's requests and routing them to Zenoh
-    #[serde(serialize_with = "serialize_atomic_entity_guid")]
-    req_reader: Arc<AtomicDDSEntity>,
-    // the local DDS Writer sending replies to the client
-    #[serde(serialize_with = "serialize_atomic_entity_guid")]
-    rep_writer: Arc<AtomicDDSEntity>,
+    #[serde(flatten, serialize_with = "serialize_proxy")]
+    proxy: Option<ServiceClientProxy>,
+    lifecycle: RouteLifecycle,
+    #[serde(skip)]
+    matching_listener: Option<MatchingListener<()>>,
+    #[serde(skip)]
+    type_info: Option<Arc<TypeInfo>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -88,7 +83,8 @@ pub struct RouteServiceCli {
 
 impl Drop for RouteServiceCli {
     fn drop(&mut self) {
-        self.deactivate();
+        self.matching_listener.take();
+        self.proxy.take();
     }
 }
 
@@ -127,51 +123,13 @@ impl RouteServiceCli {
                 .map_err(|e| format!("Failed create Querier for key {zenoh_key_expr}: {e}",))?,
         );
 
-        let route_id = format!("Route Service Client (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr}");
-
-        // activate/deactivate DDS Reader/Writer on detection/undetection of matching Subscribers
-        // (copy/move all required args for the callback)
-        let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
-        let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
-
-        zenoh_querier
+        let lifecycle = RouteLifecycle::new();
+        let observe = lifecycle.observer(context.matching_changed.clone());
+        let matching_listener = zenoh_querier
             .matching_listener()
-            .callback({
-                let rep_writer = rep_writer.clone();
-                let req_reader = req_reader.clone();
-                let ros2_name = ros2_name.clone();
-                let ros2_type = ros2_type.clone();
-                let context = context.clone();
-                let zquerier = zenoh_querier.clone();
-
-                move |status| {
-                        tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
-                        if status.matching() {
-                            if let Err(e) = activate(
-                                &rep_writer,
-                                &req_reader,
-                                &ros2_name,
-                                &ros2_type,
-                                &route_id,
-                                &context,
-                                &type_info,
-                                &zquerier,
-                            ) {
-                                tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
-                            }
-                        } else {
-                            deactivate(
-                                &rep_writer,
-                                &req_reader,
-                                &route_id,
-                                &context.ros_discovery_mgr,
-                            )
-                        }
-                }
-            })
-            .background()
+            .callback(move |status: MatchingStatus| observe(status.matching()))
             .await
-            .map_err(|e| format!("Route Service Client (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr}): failed to listen of matching status changes: {e}",))?;
+            .map_err(|e| format!("Failed to declare matching listener: {e}"))?;
 
         Ok(RouteServiceCli {
             ros2_name,
@@ -180,8 +138,10 @@ impl RouteServiceCli {
             context,
             _zenoh_querier: zenoh_querier,
             queries_timeout,
-            rep_writer,
-            req_reader,
+            proxy: None,
+            lifecycle,
+            matching_listener: Some(matching_listener),
+            type_info,
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
@@ -222,14 +182,21 @@ impl RouteServiceCli {
         self.liveliness_token = None;
     }
 
-    fn deactivate(&mut self) {
+    pub(crate) fn reconcile(&mut self) {
         let route_id = self.to_string();
-        deactivate(
-            &self.rep_writer,
-            &self.req_reader,
-            &route_id,
-            &self.context.ros_discovery_mgr,
-        );
+        let result = self.lifecycle.reconcile(&mut self.proxy, || {
+            create_proxy(
+                &self.ros2_name,
+                &self.ros2_type,
+                &route_id,
+                &self.context,
+                &self.type_info,
+                &self._zenoh_querier,
+            )
+        });
+        if let Err(error) = result {
+            tracing::error!("{route_id}: activation failed: {error}");
+        }
     }
 
     #[inline]
@@ -244,10 +211,7 @@ impl RouteServiceCli {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
-        // if last remote node removed, deactivate the route
-        if self.remote_routes.is_empty() {
-            self.deactivate();
-        }
+        // Matching may also come from native queryables, independently of this set.
     }
 
     #[inline]
@@ -289,127 +253,79 @@ impl RouteServiceCli {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn activate(
-    rep_writer: &Arc<AtomicDDSEntity>,
-    req_reader: &Arc<AtomicDDSEntity>,
+struct ServiceClientProxy {
+    // Stop requests before destroying the reply writer (field drop order).
+    req_reader: DdsEndpoint,
+    rep_writer: DdsEndpoint,
+}
+impl Drop for ServiceClientProxy {
+    fn drop(&mut self) {
+        self.rep_writer.fence();
+    }
+}
+fn serialize_proxy<S: serde::Serializer>(
+    proxy: &Option<ServiceClientProxy>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = s.serialize_map(Some(2))?;
+    if let Some(proxy) = proxy {
+        map.serialize_entry("req_reader", &proxy.req_reader)?;
+        map.serialize_entry("rep_writer", &proxy.rep_writer)?;
+    } else {
+        map.serialize_entry("req_reader", "")?;
+        map.serialize_entry("rep_writer", "")?;
+    }
+    map.end()
+}
+fn create_proxy(
     ros2_name: &str,
     ros2_type: &str,
     route_id: &str,
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
-    zenoh_querier: &Arc<Querier<'static>>,
-) -> Result<(), String> {
-    tracing::debug!("{route_id}: activate");
-    // Default Service QoS
+    querier: &Arc<Querier<'static>>,
+) -> Result<ServiceClientProxy, String> {
     let mut qos = QOS_DEFAULT_SERVICE.clone();
-
-    // Add DATA_USER QoS similarly to rmw_cyclone_dds here:
-    // https://github.com/ros2/rmw_cyclonedds/blob/2263814fab142ac19dd3395971fb1f358d22a653/rmw_cyclonedds_cpp/src/rmw_node.cpp#L5028C17-L5028C17
-    let server_id_str = new_service_id(&context.participant)?;
-    let user_data = format!("serviceid= {server_id_str};");
-    qos.user_data = Some(user_data.into_bytes());
-    tracing::debug!(
-        "{route_id}: using id '{server_id_str}' => USER_DATA={:?}",
-        qos.user_data.as_ref().unwrap()
-    );
-
-    // create DDS Writer to send replies coming from Zenoh to the Client
-    let rep_topic_name = format!("rr{}Reply", ros2_name);
-    let rep_type_name = ros2_service_type_to_reply_dds_type(ros2_type);
-    let dds_writer = create_dds_writer(
+    qos.user_data =
+        Some(format!("serviceid= {};", new_service_id(&context.participant)?).into_bytes());
+    let rep_writer = DdsEndpoint::writer(
         context.participant,
-        rep_topic_name,
-        rep_type_name,
+        format!("rr{ros2_name}Reply"),
+        ros2_service_type_to_reply_dds_type(ros2_type),
         true,
         qos.clone(),
     )?;
-    let old = rep_writer.swap(dds_writer, Ordering::Relaxed);
-    if old != DDS_ENTITY_NULL {
-        tracing::warn!(
-            "{route_id}: on activation their was already a DDS Reply Writer - overwrite it"
-        );
-        if let Err(e) = delete_dds_entity(old) {
-            tracing::warn!("{route_id}: failed to delete overwritten DDS Reply Writer: {e}");
-        }
-    }
-
-    // add writer's GID in ros_discovery_info message
-    context
-        .ros_discovery_mgr
-        .add_dds_writer(get_guid(&dds_writer)?);
-
-    // create DDS Reader to receive requests and route them to Zenoh
-    let req_topic_name = format!("rq{}Request", ros2_name);
-    let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
-    let zquerier = zenoh_querier.clone();
-    let route_id2 = route_id.to_owned();
-    let dds_reader = create_dds_reader(
+    let access = rep_writer.access();
+    let querier = querier.clone();
+    let route_id = route_id.to_owned();
+    let req_reader = DdsEndpoint::reader(
         context.participant,
-        req_topic_name,
-        req_type_name,
+        format!("rq{ros2_name}Request"),
+        ros2_service_type_to_request_dds_type(ros2_type),
         type_info,
         true,
         qos,
         None,
-        move |sample| {
-            route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
-        },
+        move |sample| route_dds_request_to_zenoh(&route_id, sample, &querier, access.clone()),
     )?;
-    let old = req_reader.swap(dds_reader, Ordering::Relaxed);
-    if old != DDS_ENTITY_NULL {
-        tracing::warn!(
-            "{route_id}: on activation their was already a DDS Request Reader - overwrite it"
-        );
-        if let Err(e) = delete_dds_entity(old) {
-            tracing::warn!("{route_id}: failed to delete overwritten DDS Request Reader: {e}");
-        }
-    }
-
-    // add reader's GID in ros_discovery_info message
-    context
-        .ros_discovery_mgr
-        .add_dds_reader(get_guid(&dds_reader)?);
-
-    Ok(())
-}
-
-fn deactivate(
-    rep_writer: &Arc<AtomicDDSEntity>,
-    req_reader: &Arc<AtomicDDSEntity>,
-    route_id: &str,
-    ros_discovery_mgr: &Arc<RosDiscoveryInfoMgr>,
-) {
-    tracing::debug!("{route_id}: Deactivate");
-    let req_reader = req_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-    if req_reader != DDS_ENTITY_NULL {
-        // remove reader's GID from ros_discovery_info message
-        match get_guid(&req_reader) {
-            Ok(gid) => ros_discovery_mgr.remove_dds_reader(gid),
-            Err(e) => tracing::warn!("{route_id}: {e}"),
-        }
-        if let Err(e) = delete_dds_entity(req_reader) {
-            tracing::warn!("{route_id}: error deleting DDS Reader: {e}");
-        }
-    }
-    let rep_writer = rep_writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-    if rep_writer != DDS_ENTITY_NULL {
-        // remove writer's GID from ros_discovery_info message
-        match get_guid(&rep_writer) {
-            Ok(gid) => ros_discovery_mgr.remove_dds_writer(gid),
-            Err(e) => tracing::warn!("{route_id}: {e}"),
-        }
-        if let Err(e) = delete_dds_entity(rep_writer) {
-            tracing::warn!("{route_id}: error deleting DDS Writer: {e}");
-        }
-    }
+    let mut proxy = ServiceClientProxy {
+        req_reader,
+        rep_writer,
+    };
+    DdsEndpoint::advertise_pair(
+        &mut proxy.req_reader,
+        &mut proxy.rep_writer,
+        context.ros_discovery_mgr.clone(),
+    );
+    Ok(proxy)
 }
 
 fn route_dds_request_to_zenoh(
     route_id: &str,
     sample: &DDSRawSample,
     querier: &Arc<Querier<'static>>,
-    rep_writer: dds_entity_t,
+    rep_writer: DdsAccess,
 ) {
     // Request payload is expected to be the Request type encoded as CDR, including a 4 bytes CDR header,
     // the 16 bytes request_id (8 bytes client guid + 8 bytes sequence_number), and the request payload. As per rmw_cyclonedds here:
@@ -462,7 +378,7 @@ fn route_dds_request_to_zenoh(
             CallbackDrop {
                 callback: move |reply| {
                         if !reply_received1.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer)
+                            route_zenoh_reply_to_dds(&route_id1, reply, request_id, &rep_writer)
                         } else {
                             tracing::warn!("{route_id1}: received more than 1 reply for request {request_id} - dropping the extra replies");
                         }
@@ -487,7 +403,7 @@ fn route_zenoh_reply_to_dds(
     route_id: &str,
     reply: Reply,
     request_id: CddsRequestHeader,
-    rep_writer: dds_entity_t,
+    rep_writer: &DdsAccess,
 ) {
     match reply.result() {
         Ok(sample) => {
@@ -516,7 +432,7 @@ fn route_zenoh_reply_to_dds(
                 );
             }
 
-            if let Err(e) = dds_write(rep_writer, dds_rep_buf) {
+            if let Some(Err(e)) = rep_writer.with(|writer| dds_write(writer, dds_rep_buf)) {
                 tracing::warn!(
                     "{route_id}: routing reply for {request_id} from Zenoh to DDS failed: {e}"
                 );
