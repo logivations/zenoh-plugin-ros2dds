@@ -461,13 +461,18 @@ fn route_zenoh_request_to_dds(
         retention,
         Instant::now(),
     );
-    req_writer.with(|writer| {
-        queries_in_progress.insert(request_id, query, deadline);
-        if let Err(e) = dds_write(writer, dds_req_buf) {
+    let completed = req_writer.with(|writer| {
+        let replaced = queries_in_progress.insert(request_id, query, deadline);
+        let failed = if let Err(e) = dds_write(writer, dds_req_buf) {
             tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
-            queries_in_progress.take(&request_id);
-        }
+            queries_in_progress.take(&request_id)
+        } else {
+            None
+        };
+        (replaced, failed)
     });
+    // Both replacement and failed-write cleanup can send a response-final.
+    drop(completed);
 }
 
 fn route_dds_reply_to_zenoh(

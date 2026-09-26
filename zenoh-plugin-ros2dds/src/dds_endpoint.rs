@@ -52,7 +52,14 @@ impl DdsAccess {
     }
     pub(crate) fn with<R>(&self, f: impl FnOnce(dds_entity_t) -> R) -> Option<R> {
         let guard = self.0.read().unwrap_or_else(|e| e.into_inner());
-        guard.map(f)
+        if let Some(entity) = *guard {
+            Some(f(entity))
+        } else {
+            // The unused closure may own a Query whose destructor sends a
+            // response-final. Release the fence before dropping its captures.
+            drop(guard);
+            None
+        }
     }
     pub(crate) fn close(&self) {
         self.0.write().unwrap_or_else(|e| e.into_inner()).take();
@@ -444,6 +451,25 @@ mod tests {
     use std::sync::{mpsc, Barrier};
 
     static DDS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn closed_access_releases_callback_capture_outside_the_fence() {
+        struct Capture(DdsAccess, Arc<AtomicBool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                // Query destruction sends a Zenoh response-final. It must be
+                // allowed to re-enter lifecycle code without a held read lock.
+                self.1
+                    .store(self.0 .0.try_write().is_ok(), Ordering::SeqCst);
+            }
+        }
+        let access = DdsAccess::new(42);
+        access.close();
+        let released = Arc::new(AtomicBool::new(false));
+        let capture = Capture(access.clone(), released.clone());
+        assert!(access.with(|_| drop(capture)).is_none());
+        assert!(released.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn every_pair_creation_failure_releases_real_dds_resources() {

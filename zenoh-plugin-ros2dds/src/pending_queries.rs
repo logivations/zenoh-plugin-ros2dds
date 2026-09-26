@@ -22,13 +22,18 @@ pub(crate) struct PendingQueries {
     expired: AtomicU64,
 }
 impl PendingQueries {
-    pub(crate) fn insert(&self, id: CddsRequestHeader, query: Query, deadline: Instant) {
-        let replaced = self
-            .entries
+    #[must_use = "Drop the replaced query outside any DDS access guard"]
+    pub(crate) fn insert(
+        &self,
+        id: CddsRequestHeader,
+        query: Query,
+        deadline: Instant,
+    ) -> Option<Query> {
+        self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, (deadline, query));
-        drop(replaced);
+            .insert(id, (deadline, query))
+            .map(|(_, query)| query)
     }
     pub(crate) fn take(&self, id: &CddsRequestHeader) -> Option<Query> {
         self.entries
@@ -71,14 +76,15 @@ pub(crate) fn deadline(parameter: Option<&str>, fallback: Duration, now: Instant
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn only_expired_requests_are_released_without_another_message() {
         let pending = PendingQueries::default();
         let now = Instant::now();
         let first = CddsRequestHeader::create(1, 1, true);
         let second = CddsRequestHeader::create(1, 2, true);
-        pending.insert(first, Query::empty(), now + Duration::from_secs(1));
-        pending.insert(second, Query::empty(), now + Duration::from_secs(300));
+        drop(pending.insert(first, Query::empty(), now + Duration::from_secs(1)));
+        drop(pending.insert(second, Query::empty(), now + Duration::from_secs(300)));
         pending.expire(now + Duration::from_secs(2));
         assert_eq!(pending.counts(), (1, 1));
         assert!(pending.take(&first).is_none());
