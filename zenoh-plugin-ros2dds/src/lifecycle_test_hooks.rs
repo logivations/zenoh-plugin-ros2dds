@@ -14,6 +14,7 @@ use std::{
 pub(crate) enum Command {
     InvalidateReader { service: String },
     OrphanWriter,
+    RetireSubscriber { topic: String },
     FailCreation { after: usize },
     PauseCreation { after: usize },
 }

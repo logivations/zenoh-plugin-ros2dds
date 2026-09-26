@@ -22,6 +22,9 @@ use serde::{ser::SerializeMap, Serialize, Serializer};
 
 use crate::{dds_types::TypeInfo, gid::Gid};
 
+pub(crate) static DDS_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Preserve legacy node names and add the participant identity, without storing
 /// a second membership set. Flattened into each route's admin representation.
 pub fn serialize_local_nodes<S: Serializer>(
@@ -169,6 +172,14 @@ pub unsafe fn create_topic(
 }
 
 pub fn dds_write(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), String> {
+    let result = dds_write_inner(data_writer, data);
+    if result.is_err() {
+        DDS_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+fn dds_write_inner(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), String> {
     unsafe {
         // Cyclone copies the serialized input into its serdata. Keep the Vec
         // owned here so every error path releases it, including size conversion.

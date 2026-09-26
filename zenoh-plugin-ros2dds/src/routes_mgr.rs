@@ -195,6 +195,15 @@ impl RoutesMgr {
                 cyclors::qos::Qos::default(),
             )
             .map(std::mem::forget),
+            Command::RetireSubscriber { topic } => {
+                self.admin_space.retain(
+                    |_, route| !matches!(route, RouteRef::Subscriber(name) if name == &topic),
+                );
+                self.routes_subscribers
+                    .remove(&topic)
+                    .ok_or_else(|| format!("No subscriber {topic} to retire"))?;
+                Ok(())
+            }
             Command::FailCreation { after } => {
                 dds_endpoint::fault::fail_after(after);
                 Ok(())
@@ -891,6 +900,7 @@ impl RoutesMgr {
             "owned_matching_listeners": self.routes_publishers.len() + self.routes_service_cli.len()
                 + self.routes_action_cli.len() * 3 + self.routes_action_srv.len() * 2,
             "cleanup_failures": CLEANUP_FAILURES.load(Ordering::Acquire),
+            "dds_write_failures": crate::dds_utils::DDS_WRITE_FAILURES.load(Ordering::Relaxed),
             "discovery": zread!(self.context.discovered_entities).counts(),
         })
     }

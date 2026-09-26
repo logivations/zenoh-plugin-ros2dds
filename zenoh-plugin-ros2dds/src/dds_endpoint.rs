@@ -156,8 +156,15 @@ impl DdsEndpoint {
         topic: String,
         typ: String,
         keyless: bool,
-        qos: Qos,
+        mut qos: Qos,
     ) -> Result<Self, String> {
+        // An in-flight write holds revocable access. Infinite DDS backpressure
+        // would prevent retirement from ever acquiring the fence. Use the DDS
+        // writer default (100 ms) as an upper bound, preserving stricter limits.
+        // max_blocking_time does not participate in DDS reliability matching.
+        if let Some(reliability) = &mut qos.reliability {
+            reliability.max_blocking_time = reliability.max_blocking_time.min(100_000_000);
+        }
         Self::create(
             participant,
             topic,
@@ -583,5 +590,84 @@ mod tests {
         worker.join().unwrap();
         retire.join().unwrap();
         assert!(access.with(|_| panic!("stale raw handle used")).is_none());
+    }
+
+    #[test]
+    fn stalled_reliable_reader_cannot_block_owned_writer_retirement() {
+        use cyclors::qos::{Reliability, ReliabilityKind, ResourceLimits, DDS_INFINITE_TIME};
+        let _serial = DDS_TEST.lock().unwrap();
+        let config = std::ffi::CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+        let domain = unsafe { dds_create_domain(221, config.as_ptr()) };
+        let participant =
+            unsafe { dds_create_participant(221, std::ptr::null(), std::ptr::null()) };
+        assert!(participant > 0 && domain > 0);
+        let qos = Qos {
+            history: Some(History {
+                kind: HistoryKind::KEEP_ALL,
+                depth: 0,
+            }),
+            reliability: Some(Reliability {
+                kind: ReliabilityKind::RELIABLE,
+                max_blocking_time: DDS_INFINITE_TIME,
+            }),
+            resource_limits: Some(ResourceLimits {
+                max_samples: 1,
+                max_instances: 1,
+                max_samples_per_instance: 1,
+            }),
+            ..Qos::default()
+        };
+        let writer = DdsEndpoint::writer(
+            participant,
+            "rt/backpressure".into(),
+            "Raw".into(),
+            true,
+            qos.clone(),
+        )
+        .unwrap();
+        let native_qos = unsafe { qos.to_qos_native() };
+        let reader = unsafe {
+            dds_create_reader(
+                participant,
+                writer.topic.as_ref().unwrap().0,
+                native_qos,
+                std::ptr::null(),
+            )
+        };
+        unsafe { Qos::delete_qos_native(native_qos) };
+        assert!(reader > 0);
+        let sample = vec![0, 1, 0, 0, 4, 0, 0, 0, b'f', b'o', b'o', 0];
+        crate::dds_utils::dds_write(writer.entity, sample.clone()).unwrap();
+        let access = writer.access();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let writing = std::thread::spawn(move || {
+            access.with(|entity| {
+                entered_tx.send(()).unwrap();
+                crate::dds_utils::dds_write(entity, sample)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let retiring = std::thread::spawn(move || {
+            drop(writer);
+            done_tx.send(()).unwrap();
+        });
+        let bounded = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        // Drain the deliberate backpressure before asserting. Deleting the
+        // reader itself would also wait on Cyclone's local-delivery retry lock.
+        drop(take_sample(reader));
+        let result = writing.join().unwrap();
+        retiring.join().unwrap();
+        delete_dds_entity(reader).unwrap();
+        delete_dds_entity(participant).unwrap();
+        delete_dds_entity(domain).unwrap();
+        assert!(
+            bounded,
+            "an unbounded DDS write held the retirement fence until the external reader drained"
+        );
+        assert!(
+            matches!(result, Some(Err(_))),
+            "full reliable reader should time out explicitly"
+        );
     }
 }

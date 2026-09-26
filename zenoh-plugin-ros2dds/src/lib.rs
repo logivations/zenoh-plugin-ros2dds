@@ -260,6 +260,11 @@ pub async fn run(runtime: DynamicRuntime, config: Config) {
     // But cannot be done twice in case of static link.
     zenoh::try_init_log_from_env();
     tracing::debug!("ROS2 plugin {}", ROS2Plugin::PLUGIN_VERSION);
+    tracing::info!(
+        build_id = env!("BRIDGE_BUILD_ID"),
+        test_hooks = cfg!(feature = "lifecycle-test-hooks"),
+        "ROS2DDS lifecycle build"
+    );
     tracing::info!("ROS2 plugin {config:?}");
 
     // Check config validity
