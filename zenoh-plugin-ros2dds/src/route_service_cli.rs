@@ -191,8 +191,7 @@ impl RouteServiceCli {
     // Retire the route over Zenoh removing the LivelinessToken
     fn retire_route(&mut self) {
         tracing::debug!("{self}: retire");
-        // Drop Zenoh Publisher and Liveliness token
-        // The DDS Writer remains to be discovered by local ROS nodes
+        // Withdraw the announcement; DDS resources follow retained route demand.
         self.liveliness_token = None;
     }
 
@@ -210,7 +209,7 @@ impl RouteServiceCli {
             )
         });
         if let Err(error) = result {
-            tracing::error!("{route_id}: activation failed: {error}");
+            self.lifecycle.log_activation_failure(&route_id, &error);
         }
         if !self.local_nodes.is_empty()
             && !is_service_for_action(&self.ros2_name)

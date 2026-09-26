@@ -900,6 +900,7 @@ impl RoutesMgr {
             "owned_matching_listeners": self.routes_publishers.len() + self.routes_service_cli.len()
                 + self.routes_action_cli.len() * 3 + self.routes_action_srv.len() * 2,
             "cleanup_failures": CLEANUP_FAILURES.load(Ordering::Acquire),
+            "recovery_required": CLEANUP_FAILURES.load(Ordering::Acquire) != 0,
             "dds_write_failures": crate::dds_utils::DDS_WRITE_FAILURES.load(Ordering::Relaxed),
             "ros_graph_pending": self.context.ros_discovery_mgr.publication_pending(),
             "discovery": zread!(self.context.discovered_entities).counts(),

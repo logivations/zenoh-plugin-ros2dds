@@ -42,7 +42,7 @@ impl PendingQueries {
             .remove(id)
             .map(|(_, query)| query)
     }
-    pub(crate) fn expire(&self, now: Instant) {
+    pub(crate) fn expire(&self, now: Instant) -> usize {
         let expired = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             let ids: Vec<_> = entries
@@ -53,9 +53,10 @@ impl PendingQueries {
                 .filter_map(|id| entries.remove(&id))
                 .collect::<Vec<_>>()
         };
-        self.expired
-            .fetch_add(expired.len() as u64, Ordering::Relaxed);
+        let count = expired.len();
+        self.expired.fetch_add(count as u64, Ordering::Relaxed);
         drop(expired);
+        count
     }
     pub(crate) fn counts(&self) -> (usize, u64) {
         (

@@ -270,6 +270,20 @@ impl DiscoveredEntities {
                 }
             }
             let old = previous.remove(name);
+            let pending_changed = match &old {
+                Some(previous) => {
+                    previous.undiscovered_reader != node.undiscovered_reader
+                        || previous.undiscovered_writer != node.undiscovered_writer
+                }
+                None => {
+                    !node.undiscovered_reader.is_empty() || !node.undiscovered_writer.is_empty()
+                }
+            };
+            if pending_changed {
+                tracing::debug!(%participant, node = %name,
+                    readers = ?node.undiscovered_reader, writers = ?node.undiscovered_writer,
+                    "ROS graph endpoints awaiting DDS discovery changed");
+            }
             if old.is_none() {
                 tracing::info!("Discovered ROS Node {name}");
             }

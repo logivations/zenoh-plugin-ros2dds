@@ -391,7 +391,8 @@ impl DdsEndpoint {
 fn quarantine(error: String) {
     CLEANUP_FAILURES.fetch_add(1, Ordering::Release);
     tracing::error!(
-        "DDS cleanup failed; refusing new route endpoints until bridge recovery: {error}"
+        recovery_required = true,
+        "DDS cleanup failed; refusing new route endpoints until this bridge is restarted: {error}"
     );
 }
 

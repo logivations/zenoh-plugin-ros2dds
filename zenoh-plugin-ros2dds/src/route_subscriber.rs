@@ -248,7 +248,7 @@ impl RouteSubscriber {
             writer.advertise(self.context.ros_discovery_mgr.clone());
             Ok(writer)
         }) {
-            tracing::error!("{route_id}: activation failed: {error}");
+            self.lifecycle.log_activation_failure(&route_id, &error);
         }
         if !self.local_nodes.is_empty()
             && self.dds_writer.is_some()

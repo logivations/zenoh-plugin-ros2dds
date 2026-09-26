@@ -211,7 +211,10 @@ impl RouteServiceSrv {
 
     pub(crate) async fn reconcile(&mut self) {
         if let Some(proxy) = &self.proxy {
-            proxy.queries_in_progress.expire(Instant::now());
+            let expired = proxy.queries_in_progress.expire(Instant::now());
+            if expired != 0 {
+                tracing::debug!(route = %self, expired, "Incoming service queries expired");
+            }
         }
         let route_id = self.to_string();
         // A retained server route exposes a local client pair even before a
@@ -227,7 +230,7 @@ impl RouteServiceSrv {
                 &self.type_info,
             )
         }) {
-            tracing::error!("{route_id}: activation failed: {error}");
+            self.lifecycle.log_activation_failure(&route_id, &error);
         }
         if !self.local_nodes.is_empty()
             && self.proxy.is_some()
@@ -244,8 +247,7 @@ impl RouteServiceSrv {
     // Retire the route over Zenoh removing the LivelinessToken
     fn retire_route(&mut self) {
         tracing::debug!("{self} retire");
-        // Drop Zenoh Publisher and Liveliness token
-        // The DDS Writer remains to be discovered by local ROS nodes
+        // Withdraw the announcement; DDS resources follow retained route demand.
         self.zenoh_queryable = None;
         self.liveliness_token = None;
     }

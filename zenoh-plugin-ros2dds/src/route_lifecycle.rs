@@ -103,6 +103,15 @@ impl RouteLifecycle {
         self.matching.store(desired, Ordering::Release);
     }
 
+    pub(crate) fn log_activation_failure(&self, route_id: &str, error: &str) {
+        tracing::error!(
+            generation = self.generation,
+            consecutive_failures = self.retry.consecutive_failures,
+            activation_failures = self.retry.activation_failures,
+            "{route_id}: activation failed: {error}"
+        );
+    }
+
     pub(crate) fn reconcile<T>(
         &mut self,
         actual: &mut Option<T>,
