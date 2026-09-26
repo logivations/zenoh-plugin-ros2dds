@@ -329,9 +329,6 @@ impl DdsEndpoint {
     pub(crate) fn entity(&self) -> i32 {
         self.entity
     }
-    pub(crate) fn gid(&self) -> Gid {
-        self.gid
-    }
     pub(crate) fn access(&self) -> DdsAccess {
         self.access.clone()
     }

@@ -19,13 +19,55 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[derive(Serialize)]
 pub(crate) struct RouteLifecycle {
     generation: u64,
-    #[serde(serialize_with = "serialize_matching")]
+    #[serde(rename = "desired", serialize_with = "serialize_matching")]
     matching: Arc<AtomicBool>,
+    #[serde(flatten)]
+    retry: Retry,
+}
+
+/// Backoff is state on the owner, never another task or callback.
+#[derive(Serialize)]
+pub(crate) struct Retry {
     activation_failures: u64,
     consecutive_failures: u32,
     last_error: Option<String>,
     #[serde(skip)]
     retry_at: Instant,
+}
+
+impl Retry {
+    pub(crate) fn new() -> Self {
+        Self {
+            activation_failures: 0,
+            consecutive_failures: 0,
+            last_error: None,
+            retry_at: Instant::now(),
+        }
+    }
+    pub(crate) fn ready(&self) -> bool {
+        Instant::now() >= self.retry_at
+    }
+    pub(crate) fn record(&mut self, result: Result<(), String>) -> Result<(), String> {
+        self.record_at(result, Instant::now())
+    }
+    fn record_at(&mut self, result: Result<(), String>, now: Instant) -> Result<(), String> {
+        match result {
+            Ok(()) => {
+                self.consecutive_failures = 0;
+                self.last_error = None;
+                self.retry_at = now;
+                Ok(())
+            }
+            Err(error) => {
+                self.activation_failures = self.activation_failures.saturating_add(1);
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                let shift = (self.consecutive_failures - 1).min(6);
+                self.retry_at = now + Duration::from_millis((100u64 << shift).min(5000));
+                self.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
 }
 
 fn serialize_matching<S: Serializer>(value: &Arc<AtomicBool>, s: S) -> Result<S::Ok, S::Error> {
@@ -37,10 +79,7 @@ impl RouteLifecycle {
         Self {
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             matching: Arc::new(AtomicBool::new(false)),
-            activation_failures: 0,
-            consecutive_failures: 0,
-            last_error: None,
-            retry_at: Instant::now(),
+            retry: Retry::new(),
         }
     }
 
@@ -60,6 +99,10 @@ impl RouteLifecycle {
         self.matching.load(Ordering::Acquire)
     }
 
+    pub(crate) fn set_desired(&mut self, desired: bool) {
+        self.matching.store(desired, Ordering::Release);
+    }
+
     pub(crate) fn reconcile<T>(
         &mut self,
         actual: &mut Option<T>,
@@ -76,10 +119,8 @@ impl RouteLifecycle {
     ) -> Result<(), String> {
         if !self.desired() {
             actual.take();
-            self.consecutive_failures = 0;
-            self.last_error = None;
-            self.retry_at = now;
-        } else if actual.is_none() && now >= self.retry_at {
+            self.retry.record_at(Ok(()), now)?;
+        } else if actual.is_none() && now >= self.retry.retry_at {
             match create() {
                 Ok(resources) => {
                     // Matching may change during a DDS call. Publish only if
@@ -87,17 +128,10 @@ impl RouteLifecycle {
                     if self.desired() {
                         *actual = Some(resources);
                     }
-                    self.consecutive_failures = 0;
-                    self.last_error = None;
-                    self.retry_at = now;
+                    self.retry.record_at(Ok(()), now)?;
                 }
                 Err(error) => {
-                    self.activation_failures = self.activation_failures.saturating_add(1);
-                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                    let shift = (self.consecutive_failures - 1).min(6);
-                    self.retry_at = now + Duration::from_millis((100u64 << shift).min(5000));
-                    self.last_error = Some(error.clone());
-                    return Err(error);
+                    return self.retry.record_at(Err(error), now);
                 }
             }
         }
@@ -191,7 +225,7 @@ mod tests {
             })
             .unwrap();
         assert!(actual.is_some());
-        assert!(owner.last_error.is_none());
-        assert_eq!(owner.activation_failures, 1);
+        assert!(owner.retry.last_error.is_none());
+        assert_eq!(owner.retry.activation_failures, 1);
     }
 }

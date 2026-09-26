@@ -37,7 +37,7 @@ use crate::{
     liveliness_mgt::new_ke_liveliness_pub,
     qos_helpers::*,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
-    route_lifecycle::RouteLifecycle,
+    route_lifecycle::{Retry, RouteLifecycle},
     routes_mgr::Context,
     Config, LOG_PAYLOAD,
 };
@@ -79,6 +79,9 @@ pub struct RoutePublisher {
     #[serde(serialize_with = "crate::dds_endpoint::serialize_optional")]
     dds_reader: Option<DdsEndpoint>,
     lifecycle: RouteLifecycle,
+    announcement_retry: Retry,
+    #[serde(skip)]
+    discovered_writer_qos: Option<Qos>,
     #[serde(skip)]
     matching_listener: Option<MatchingListener<()>>,
     // the Zenoh Priority for publications
@@ -236,6 +239,8 @@ impl RoutePublisher {
             },
             dds_reader: None,
             lifecycle,
+            announcement_retry: Retry::new(),
+            discovered_writer_qos: None,
             matching_listener: Some(matching_listener),
             priority,
             _type_info: type_info.clone(),
@@ -247,7 +252,7 @@ impl RoutePublisher {
         })
     }
 
-    pub(crate) fn reconcile(&mut self) {
+    pub(crate) async fn reconcile(&mut self) {
         let route_id = self.to_string();
         let result = self.lifecycle.reconcile(&mut self.dds_reader, || {
             create_reader(
@@ -263,6 +268,18 @@ impl RoutePublisher {
         });
         if let Err(error) = result {
             tracing::error!("{route_id}: activation failed: {error}");
+        }
+        if !self.local_nodes.is_empty()
+            && !is_message_for_action(&self.ros2_name)
+            && self.liveliness_token.is_none()
+            && self.announcement_retry.ready()
+        {
+            if let Some(qos) = self.discovered_writer_qos.clone() {
+                let result = self.announce_route(&qos).await;
+                if let Err(error) = self.announcement_retry.record(result) {
+                    tracing::error!("{route_id}: announcement failed: {error}");
+                }
+            }
         }
     }
 
@@ -318,15 +335,11 @@ impl RoutePublisher {
 
     #[inline]
     pub async fn add_local_node(&mut self, node_key: (Gid, String), discovered_writer_qos: &Qos) {
-        if self.local_nodes.insert(node_key) {
-            tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
-            // if 1st local node added, announce the route
-            if self.local_nodes.len() == 1 {
-                if let Err(e) = self.announce_route(discovered_writer_qos).await {
-                    tracing::error!("{self} announcement failed: {e}");
-                }
-            }
-        }
+        self.local_nodes.insert(node_key);
+        self.discovered_writer_qos
+            .get_or_insert_with(|| discovered_writer_qos.clone());
+        tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
+        self.reconcile().await;
     }
 
     #[inline]
@@ -336,6 +349,7 @@ impl RoutePublisher {
             // if last local node removed, retire the route
             if self.local_nodes.is_empty() {
                 self.retire_route();
+                self.discovered_writer_qos = None;
             }
         }
     }

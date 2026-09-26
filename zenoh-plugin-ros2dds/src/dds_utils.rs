@@ -14,23 +14,13 @@
 use std::{
     collections::{BTreeSet, HashSet},
     ffi::{CStr, CString},
-    mem::MaybeUninit,
     sync::Arc,
-    time::Duration,
 };
 
-use cyclors::{
-    qos::{History, HistoryKind, Qos},
-    *,
-};
+use cyclors::*;
 use serde::{ser::SerializeSeq, Serializer};
-use tokio::task;
 
-use crate::{
-    dds_types::{DDSRawSample, TypeInfo},
-    gid::Gid,
-    vec_into_raw_parts,
-};
+use crate::{dds_types::TypeInfo, gid::Gid};
 
 /// Serialize a `HashSet<(Gid, String)>` as a deduplicated array of the node fullnames,
 /// dropping the participant GID. Keeps the admin-space JSON format unchanged after #702 fix.
@@ -169,56 +159,19 @@ pub unsafe fn create_topic(
     topic
 }
 
-pub fn create_dds_writer(
-    dp: dds_entity_t,
-    topic_name: String,
-    type_name: String,
-    keyless: bool,
-    qos: Qos,
-) -> Result<dds_entity_t, String> {
-    let cton = CString::new(topic_name).unwrap().into_raw();
-    let ctyn = CString::new(type_name).unwrap().into_raw();
-
-    unsafe {
-        let t = cdds_create_blob_topic(dp, cton, ctyn, keyless);
-        let qos_native = qos.to_qos_native();
-        let writer: i32 = dds_create_writer(dp, t, qos_native, std::ptr::null_mut());
-        Qos::delete_qos_native(qos_native);
-        drop(CString::from_raw(cton));
-        drop(CString::from_raw(ctyn));
-        if writer >= 0 {
-            Ok(writer)
-        } else {
-            Err(format!(
-                "Error creating DDS Writer: {}",
-                CStr::from_ptr(dds_strretcode(-writer))
-                    .to_str()
-                    .unwrap_or("unrecoverable DDS retcode")
-            ))
-        }
-    }
-}
-
 pub fn dds_write(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), String> {
     unsafe {
-        // As per the Vec documentation (see https://doc.rust-lang.org/std/vec/struct.Vec.html#method.into_raw_parts)
-        // the only way to correctly releasing it is to create a vec using from_raw_parts
-        // and then have its destructor do the cleanup.
-        // Thus, while tempting to just pass the raw pointer to cyclone and then free it from C,
-        // that is not necessarily safe or guaranteed to be leak free.
-        // TODO replace when stable https://github.com/rust-lang/rust/issues/65816
-        let (ptr, len, capacity) = vec_into_raw_parts(data);
-        let size: ddsrt_iov_len_t = ddsrt_iov_len_from_usize(len)?;
-
+        // Cyclone copies the serialized input into its serdata. Keep the Vec
+        // owned here so every error path releases it, including size conversion.
+        let size = ddsrt_iov_len_from_usize(data.len())?;
         let data_out = ddsrt_iovec_t {
-            iov_base: ptr as *mut std::ffi::c_void,
+            iov_base: data.as_ptr() as *mut std::ffi::c_void,
             iov_len: size,
         };
 
         let mut sertype_ptr: *const ddsi_sertype = std::ptr::null_mut();
         let ret = dds_get_entity_sertype(data_writer, &mut sertype_ptr);
         if ret < 0 {
-            drop(Vec::from_raw_parts(ptr, len, capacity));
             return Err(format!(
                 "DDS write failed: sertype lookup failed ({})",
                 CStr::from_ptr(dds_strretcode(ret))
@@ -237,7 +190,6 @@ pub fn dds_write(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), String>
 
         let ret = dds_writecdr(data_writer, fwdp);
         if ret < 0 {
-            drop(Vec::from_raw_parts(ptr, len, capacity));
             return Err(format!(
                 "DDS write failed: {}",
                 CStr::from_ptr(dds_strretcode(ret))
@@ -246,126 +198,6 @@ pub fn dds_write(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), String>
             ));
         }
 
-        drop(Vec::from_raw_parts(ptr, len, capacity));
         Ok(())
-    }
-}
-
-unsafe extern "C" fn listener_to_callback<F>(dr: dds_entity_t, arg: *mut std::os::raw::c_void)
-where
-    F: Fn(&DDSRawSample),
-{
-    let callback = arg as *mut F;
-    let mut zp: *mut ddsi_serdata = std::ptr::null_mut();
-    #[allow(clippy::uninit_assumed_init)]
-    let mut si = MaybeUninit::<[dds_sample_info_t; 1]>::uninit();
-    while dds_takecdr(
-        dr,
-        &mut zp,
-        1,
-        si.as_mut_ptr() as *mut dds_sample_info_t,
-        DDS_ANY_STATE,
-    ) > 0
-    {
-        let si = si.assume_init();
-        if si[0].valid_data {
-            let raw_sample = DDSRawSample::create(zp);
-
-            (*callback)(&raw_sample);
-        }
-        ddsi_serdata_unref(zp);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn create_dds_reader<F>(
-    dp: dds_entity_t,
-    topic_name: String,
-    type_name: String,
-    type_info: &Option<Arc<TypeInfo>>,
-    keyless: bool,
-    mut qos: Qos,
-    read_period: Option<Duration>,
-    callback: F,
-) -> Result<dds_entity_t, String>
-where
-    F: Fn(&DDSRawSample) + std::marker::Send + 'static,
-{
-    unsafe {
-        let t = create_topic(dp, &topic_name, &type_name, type_info, keyless);
-        match read_period {
-            None => {
-                // Use a Listener to route data as soon as it arrives
-                let arg = Box::new(callback);
-                let sub_listener =
-                    dds_create_listener(Box::into_raw(arg) as *mut std::os::raw::c_void);
-                dds_lset_data_available(sub_listener, Some(listener_to_callback::<F>));
-                let qos_native = qos.to_qos_native();
-                let reader = dds_create_reader(dp, t, qos_native, sub_listener);
-                Qos::delete_qos_native(qos_native);
-                if reader >= 0 {
-                    let res = dds_reader_wait_for_historical_data(reader, qos::DDS_100MS_DURATION);
-                    if res < 0 {
-                        tracing::error!(
-                            "Error calling dds_reader_wait_for_historical_data(): {}",
-                            CStr::from_ptr(dds_strretcode(-res))
-                                .to_str()
-                                .unwrap_or("unrecoverable DDS retcode")
-                        );
-                    }
-                    Ok(reader)
-                } else {
-                    Err(format!(
-                        "Error creating DDS Reader: {}",
-                        CStr::from_ptr(dds_strretcode(-reader))
-                            .to_str()
-                            .unwrap_or("unrecoverable DDS retcode")
-                    ))
-                }
-            }
-            Some(period) => {
-                // Use a periodic task that takes data to route from a Reader with KEEP_LAST 1
-                qos.history = Some(History {
-                    kind: HistoryKind::KEEP_LAST,
-                    depth: 1,
-                });
-                let qos_native = qos.to_qos_native();
-                let reader = dds_create_reader(dp, t, qos_native, std::ptr::null());
-                task::spawn(async move {
-                    // loop while reader's instance handle remain the same
-                    // (if reader was deleted, its dds_entity_t value might have been
-                    // reused by a new entity... don't trust it! Only trust instance handle)
-                    let mut original_handle: dds_instance_handle_t = 0;
-                    dds_get_instance_handle(reader, &mut original_handle);
-                    let mut handle: dds_instance_handle_t = 0;
-                    while dds_get_instance_handle(reader, &mut handle) == DDS_RETCODE_OK as i32 {
-                        if handle != original_handle {
-                            break;
-                        }
-
-                        tokio::time::sleep(period).await;
-                        let mut zp: *mut ddsi_serdata = std::ptr::null_mut();
-                        #[allow(clippy::uninit_assumed_init)]
-                        let mut si = MaybeUninit::<[dds_sample_info_t; 1]>::uninit();
-                        while dds_takecdr(
-                            reader,
-                            &mut zp,
-                            1,
-                            si.as_mut_ptr() as *mut dds_sample_info_t,
-                            DDS_ANY_STATE,
-                        ) > 0
-                        {
-                            let si = si.assume_init();
-                            if si[0].valid_data {
-                                let raw_sample = DDSRawSample::create(zp);
-                                callback(&raw_sample);
-                            }
-                            ddsi_serdata_unref(zp);
-                        }
-                    }
-                });
-                Ok(reader)
-            }
-        }
     }
 }

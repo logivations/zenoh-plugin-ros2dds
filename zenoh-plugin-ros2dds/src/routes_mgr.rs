@@ -135,18 +135,24 @@ impl RoutesMgr {
         self.context.matching_changed.clone()
     }
 
-    pub(crate) fn reconcile(&mut self) {
+    pub(crate) async fn reconcile(&mut self) {
         for route in self.routes_publishers.values_mut() {
-            route.reconcile();
+            route.reconcile().await;
         }
         for route in self.routes_service_cli.values_mut() {
-            route.reconcile();
+            route.reconcile().await;
+        }
+        for route in self.routes_subscribers.values_mut() {
+            route.reconcile().await;
+        }
+        for route in self.routes_service_srv.values_mut() {
+            route.reconcile().await;
         }
         for route in self.routes_action_cli.values_mut() {
-            route.reconcile();
+            route.reconcile().await;
         }
         for route in self.routes_action_srv.values_mut() {
-            route.reconcile();
+            route.reconcile().await;
         }
     }
 

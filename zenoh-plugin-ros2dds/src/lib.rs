@@ -488,8 +488,8 @@ impl ROS2PluginRuntime {
         retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             select!(
-                _ = matching_changed.notified().fuse() => { routes_mgr.reconcile(); },
-                _ = retry_tick.tick().fuse() => { routes_mgr.reconcile(); },
+                _ = matching_changed.notified().fuse() => { routes_mgr.reconcile().await; },
+                _ = retry_tick.tick().fuse() => { routes_mgr.reconcile().await; },
                 evt = discovery_rcv.recv_async() => {
                     match evt {
                         Ok(evt) => {

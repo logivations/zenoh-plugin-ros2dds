@@ -42,7 +42,7 @@ use crate::{
         is_service_for_action, new_service_id, ros2_service_type_to_reply_dds_type,
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
     },
-    route_lifecycle::RouteLifecycle,
+    route_lifecycle::{Retry, RouteLifecycle},
     routes_mgr::Context,
     LOG_PAYLOAD,
 };
@@ -67,6 +67,7 @@ pub struct RouteServiceCli {
     #[serde(flatten, serialize_with = "serialize_proxy")]
     proxy: Option<ServiceClientProxy>,
     lifecycle: RouteLifecycle,
+    announcement_retry: Retry,
     #[serde(skip)]
     matching_listener: Option<MatchingListener<()>>,
     #[serde(skip)]
@@ -140,6 +141,7 @@ impl RouteServiceCli {
             queries_timeout,
             proxy: None,
             lifecycle,
+            announcement_retry: Retry::new(),
             matching_listener: Some(matching_listener),
             type_info,
             liveliness_token: None,
@@ -182,7 +184,7 @@ impl RouteServiceCli {
         self.liveliness_token = None;
     }
 
-    pub(crate) fn reconcile(&mut self) {
+    pub(crate) async fn reconcile(&mut self) {
         let route_id = self.to_string();
         let result = self.lifecycle.reconcile(&mut self.proxy, || {
             create_proxy(
@@ -196,6 +198,16 @@ impl RouteServiceCli {
         });
         if let Err(error) = result {
             tracing::error!("{route_id}: activation failed: {error}");
+        }
+        if !self.local_nodes.is_empty()
+            && !is_service_for_action(&self.ros2_name)
+            && self.liveliness_token.is_none()
+            && self.announcement_retry.ready()
+        {
+            let result = self.announce_route().await;
+            if let Err(error) = self.announcement_retry.record(result) {
+                tracing::error!("{route_id}: announcement failed: {error}");
+            }
         }
     }
 
@@ -221,14 +233,9 @@ impl RouteServiceCli {
 
     #[inline]
     pub async fn add_local_node(&mut self, node_key: (Gid, String)) {
-        if self.local_nodes.insert(node_key) && self.local_nodes.len() == 1 {
-            tracing::debug!("{self}: now serving local nodes {:?}", self.local_nodes);
-            if let Err(e) = self.announce_route().await {
-                tracing::error!("{self}: announcement failed: {e}");
-            }
-        } else {
-            tracing::debug!("{self}: now serving local nodes {:?}", self.local_nodes);
-        }
+        self.local_nodes.insert(node_key);
+        tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
+        self.reconcile().await;
     }
 
     #[inline]

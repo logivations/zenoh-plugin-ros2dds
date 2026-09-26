@@ -21,8 +21,9 @@ use zenoh::{
 
 use crate::{
     dds_utils::serialize_local_nodes, gid::Gid, liveliness_mgt::new_ke_liveliness_action_cli,
-    ros2_utils::*, route_action_srv::serialize_action_zenoh_key_expr,
+    ros2_utils::*, route_action_srv::serialize_action_zenoh_key_expr, route_lifecycle::Retry,
     route_service_cli::RouteServiceCli, route_subscriber::RouteSubscriber, routes_mgr::Context,
+    serialize_option_as_bool,
 };
 
 #[derive(Serialize)]
@@ -40,7 +41,7 @@ pub struct RouteActionCli {
     // the context
     #[serde(skip)]
     context: Context,
-    is_active: bool,
+    announcement_retry: Retry,
     #[serde(skip)]
     route_send_goal: RouteServiceCli,
     #[serde(skip)]
@@ -52,7 +53,7 @@ pub struct RouteActionCli {
     #[serde(skip)]
     route_status: RouteSubscriber,
     // a liveliness token associated to this route, for announcement to other plugins
-    #[serde(skip)]
+    #[serde(rename = "is_active", serialize_with = "serialize_option_as_bool")]
     liveliness_token: Option<LivelinessToken>,
     // the list of remote routes served by this route ("<zenoh_id>:<zenoh_key_expr>"")
     remote_routes: HashSet<String>,
@@ -146,7 +147,7 @@ impl RouteActionCli {
             ros2_type,
             zenoh_key_expr_prefix,
             context,
-            is_active: false,
+            announcement_retry: Retry::new(),
             route_send_goal,
             route_cancel_goal,
             route_get_result,
@@ -158,16 +159,25 @@ impl RouteActionCli {
         })
     }
 
-    pub(crate) fn reconcile(&mut self) {
-        self.route_send_goal.reconcile();
-        self.route_cancel_goal.reconcile();
-        self.route_get_result.reconcile();
+    pub(crate) async fn reconcile(&mut self) {
+        self.route_send_goal.reconcile().await;
+        self.route_cancel_goal.reconcile().await;
+        self.route_get_result.reconcile().await;
+        self.route_feedback.reconcile().await;
+        self.route_status.reconcile().await;
+        if !self.local_nodes.is_empty()
+            && self.liveliness_token.is_none()
+            && self.announcement_retry.ready()
+        {
+            let result = self.announce_route().await;
+            if let Err(error) = self.announcement_retry.record(result) {
+                tracing::error!("{self}: announcement failed: {error}");
+            }
+        }
     }
 
     // Announce the route over Zenoh via a LivelinessToken
     async fn announce_route(&mut self) -> Result<(), String> {
-        self.is_active = true;
-
         // create associated LivelinessToken
         let liveliness_ke = new_ke_liveliness_action_cli(
             &self.context.zsession.zid().into_keyexpr(),
@@ -194,7 +204,6 @@ impl RouteActionCli {
         tracing::debug!("{self} retire");
         // Drop Zenoh Publisher and Liveliness token
         // The DDS Writer remains to be discovered by local ROS nodes
-        self.is_active = false;
         self.liveliness_token = None;
     }
 
@@ -264,14 +273,9 @@ impl RouteActionCli {
                 .add_local_node(node_key.clone(), &QOS_DEFAULT_ACTION_STATUS),
         );
 
-        if self.local_nodes.insert(node_key) && self.local_nodes.len() == 1 {
-            tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
-            if let Err(e) = self.announce_route().await {
-                tracing::error!("{self} activation failed: {e}");
-            }
-        } else {
-            tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
-        }
+        self.local_nodes.insert(node_key);
+        tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
+        self.reconcile().await;
     }
 
     #[inline]
