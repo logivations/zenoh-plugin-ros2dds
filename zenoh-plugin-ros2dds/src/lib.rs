@@ -59,6 +59,8 @@ mod discovered_entities;
 mod discovery_mgr;
 mod events;
 mod gid;
+#[cfg(feature = "lifecycle-test-hooks")]
+mod lifecycle_test_hooks;
 mod liveliness_mgt;
 mod node_info;
 mod pending_queries;

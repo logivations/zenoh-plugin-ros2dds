@@ -148,6 +148,8 @@ impl RoutesMgr {
     }
 
     pub(crate) async fn reconcile(&mut self) {
+        #[cfg(feature = "lifecycle-test-hooks")]
+        self.inject_test_fault();
         for route in self.routes_publishers.values_mut() {
             route.reconcile().await;
         }
@@ -168,6 +170,42 @@ impl RoutesMgr {
         }
         self.last_reconciled = Instant::now();
         self.reconciliation_sequence = self.reconciliation_sequence.saturating_add(1);
+    }
+
+    #[cfg(feature = "lifecycle-test-hooks")]
+    fn inject_test_fault(&mut self) {
+        use crate::{
+            dds_endpoint::{self, DdsEndpoint},
+            lifecycle_test_hooks::{self, Command},
+        };
+        let Some((path, command)) = lifecycle_test_hooks::control() else {
+            return;
+        };
+        let result = command.and_then(|command| match command {
+            Command::InvalidateReader { service } => self
+                .routes_service_cli
+                .get(&service)
+                .ok_or_else(|| format!("No retained service client {service}"))?
+                .invalidate_reader_for_test(),
+            Command::OrphanWriter => DdsEndpoint::writer(
+                self.context.participant,
+                "rt/repro_orphan".into(),
+                "std_msgs::msg::dds_::String_".into(),
+                true,
+                cyclors::qos::Qos::default(),
+            )
+            .map(std::mem::forget),
+            Command::FailCreation { after } => {
+                dds_endpoint::fault::fail_after(after);
+                Ok(())
+            }
+            Command::PauseCreation { after } => {
+                lifecycle_test_hooks::arm_pause(after);
+                Ok(())
+            }
+        });
+        tracing::warn!("LAB-ONLY lifecycle fault: {result:?}");
+        lifecycle_test_hooks::acknowledge(path, result);
     }
 
     pub async fn on_ros_discovery_event(
@@ -835,6 +873,7 @@ impl RoutesMgr {
                 .sum::<usize>();
         serde_json::json!({
             "schema_version": 1,
+            "test_hooks": cfg!(feature = "lifecycle-test-hooks"),
             "build_id": env!("BRIDGE_BUILD_ID"),
             "base_version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),

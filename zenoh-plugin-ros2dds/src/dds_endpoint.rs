@@ -264,7 +264,7 @@ impl DdsEndpoint {
                 "DDS cleanup failed; endpoint state is quarantined until bridge recovery".into(),
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "lifecycle-test-hooks"))]
         fault::checkpoint("before topic")?;
         let topic = unsafe { create_topic(participant, &topic_name, &typ, type_info, keyless) };
         if topic <= 0 {
@@ -272,7 +272,7 @@ impl DdsEndpoint {
         }
         LIVE_TOPICS.fetch_add(1, Ordering::Relaxed);
         let topic = Topic(topic);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "lifecycle-test-hooks"))]
         fault::checkpoint("after topic")?;
         let entity = unsafe {
             let listener = listener_arg.as_ref().map(|arg| {
@@ -318,16 +318,23 @@ impl DdsEndpoint {
             poll: None,
             advertised: None,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "lifecycle-test-hooks"))]
         fault::checkpoint("after endpoint")?;
         endpoint.gid = get_guid(&entity)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "lifecycle-test-hooks"))]
         fault::checkpoint("after guid")?;
         Ok(endpoint)
     }
 
     pub(crate) fn entity(&self) -> i32 {
         self.entity
+    }
+
+    #[cfg(feature = "lifecycle-test-hooks")]
+    pub(crate) fn invalidate_for_test(&self) -> Result<(), String> {
+        // Intentionally violate ownership to test independent health detection.
+        // Leave the owner's handle unchanged. This build is never deployable.
+        delete_dds_entity(self.entity)
     }
     pub(crate) fn access(&self) -> DdsAccess {
         self.access.clone()
@@ -403,24 +410,21 @@ impl Drop for DdsEndpoint {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "lifecycle-test-hooks"))]
 pub(crate) mod fault {
-    use std::cell::Cell;
-    thread_local! { static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) }; }
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    static FAIL_AT: AtomicIsize = AtomicIsize::new(-1);
     pub(crate) fn fail_after(n: usize) {
-        FAIL_AT.set(Some(n));
+        FAIL_AT.store(n as isize, Ordering::SeqCst);
     }
     pub(crate) fn checkpoint(stage: &str) -> Result<(), String> {
-        match FAIL_AT.get() {
-            Some(0) => {
-                FAIL_AT.set(None);
-                Err(format!("injected failure: {stage}"))
-            }
-            Some(n) => {
-                FAIL_AT.set(Some(n - 1));
-                Ok(())
-            }
-            None => Ok(()),
+        #[cfg(feature = "lifecycle-test-hooks")]
+        crate::lifecycle_test_hooks::creation_checkpoint(stage)?;
+        match FAIL_AT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n >= 0).then_some(n - 1)
+        }) {
+            Ok(0) => Err(format!("injected failure: {stage}")),
+            _ => Ok(()),
         }
     }
 }

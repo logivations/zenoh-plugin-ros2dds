@@ -27,6 +27,7 @@ publish = false
 dds_shm = ["zenoh-plugin-ros2dds/dds_shm"]
 prefix_symbols = ["zenoh-plugin-ros2dds/prefix_symbols"]
 shared-memory = ["zenoh/shared-memory"]
+lifecycle-test-hooks = ["zenoh-plugin-ros2dds/lifecycle-test-hooks"]
 
 [dependencies]
 async-liveliness-monitor = { workspace = true }

@@ -101,6 +101,14 @@ impl fmt::Display for RouteServiceCli {
 }
 
 impl RouteServiceCli {
+    #[cfg(feature = "lifecycle-test-hooks")]
+    pub(crate) fn invalidate_reader_for_test(&self) -> Result<(), String> {
+        self.proxy
+            .as_ref()
+            .ok_or("No service proxy to invalidate")?
+            .req_reader
+            .invalidate_for_test()
+    }
     pub(crate) fn endpoint_count(&self) -> usize {
         usize::from(self.proxy.is_some()) * 2
     }
