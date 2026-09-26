@@ -69,14 +69,18 @@ fn test_zenoh_client_ros_service() {
 
         // Send request to ROS service
         let req = r2r::example_interfaces::srv::AddTwoInts::Request { a, b };
-        let buf = cdr::serialize::<_, _, cdr::CdrLe>(&req, cdr::size::Infinite).unwrap();
-        let recv_handler = client.get().payload(buf).await.unwrap();
-
-        // Process the response
-        let reply = recv_handler.recv().unwrap();
-        let reader = reply.result().unwrap().payload().reader();
-        let result: Result<i64, _> = cdr::deserialize_from(reader, cdr::size::Infinite);
-        assert_eq!(result.unwrap(), a + b);
+        for little_endian in [true, false] {
+            let buf = if little_endian {
+                cdr::serialize::<_, _, cdr::CdrLe>(&req, cdr::size::Infinite).unwrap()
+            } else {
+                cdr::serialize::<_, _, cdr::CdrBe>(&req, cdr::size::Infinite).unwrap()
+            };
+            let recv_handler = client.get().payload(buf).await.unwrap();
+            let reply = recv_handler.recv().unwrap();
+            let reader = reply.result().unwrap().payload().reader();
+            let result: Result<i64, _> = cdr::deserialize_from(reader, cdr::size::Infinite);
+            assert_eq!(result.unwrap(), a + b);
+        }
 
         // Tell the main test thread, we're completed
         sender.send(()).unwrap();

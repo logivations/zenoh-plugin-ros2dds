@@ -78,11 +78,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reply_correlation_is_independent_of_cdr_byte_order() {
+        let pending = PendingQueries::default();
+        let le = CddsRequestHeader::from_slice(
+            [
+                0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+                0xdc, 0xfe,
+            ],
+            true,
+        );
+        let be = CddsRequestHeader::from_slice(
+            [
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+                0x32, 0x10,
+            ],
+            false,
+        );
+        drop(pending.insert(le, Query::empty(), Instant::now() + Duration::from_secs(1)));
+        assert!(pending.take(&be).is_some());
+        assert_eq!(pending.counts(), (0, 0));
+    }
+
+    #[test]
     fn only_expired_requests_are_released_without_another_message() {
         let pending = PendingQueries::default();
         let now = Instant::now();
-        let first = CddsRequestHeader::create(1, 1, true);
-        let second = CddsRequestHeader::create(1, 2, true);
+        let first = CddsRequestHeader::create(1, 1);
+        let second = CddsRequestHeader::create(1, 2);
         drop(pending.insert(first, Query::empty(), now + Duration::from_secs(1)));
         drop(pending.insert(second, Query::empty(), now + Duration::from_secs(300)));
         pending.expire(now + Duration::from_secs(2));

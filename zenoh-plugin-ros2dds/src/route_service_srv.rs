@@ -36,8 +36,7 @@ use crate::{
     dds_endpoint::{DdsAccess, DdsEndpoint},
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
-        dds_write, get_instance_handle, is_cdr_little_endian, serialize_local_nodes, CDR_HEADER_BE,
-        CDR_HEADER_LE,
+        dds_write, get_instance_handle, is_cdr_little_endian, serialize_local_nodes, CDR_HEADER_LE,
     },
     gid::Gid,
     liveliness_mgt::new_ke_liveliness_service_srv,
@@ -389,14 +388,11 @@ fn route_zenoh_request_to_dds(
     req_writer: &DdsAccess,
     retention: Duration,
 ) {
-    // Get expected endianness from the query value:
-    // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
-    let is_little_endian = match query.payload() {
-        Some(value) if value.len() > 4 => {
-            is_cdr_little_endian(value.to_bytes().as_ref()).unwrap_or(true)
-        }
-        _ => true,
-    };
+    // Empty service requests may contain only the four-byte CDR header.
+    let is_little_endian = query
+        .payload()
+        .and_then(|value| is_cdr_little_endian(value.to_bytes().as_ref()))
+        .unwrap_or(true);
 
     // Try to get request_id from Query attachment (in case it comes from another bridge).
     // Otherwise, create one using client_guid + sequence_number
@@ -404,11 +400,7 @@ fn route_zenoh_request_to_dds(
         .attachment()
         .and_then(|a| CddsRequestHeader::try_from(a).ok())
         .unwrap_or_else(|| {
-            CddsRequestHeader::create(
-                client_guid,
-                sequence_number.fetch_add(1, Ordering::Relaxed),
-                is_little_endian,
-            )
+            CddsRequestHeader::create(client_guid, sequence_number.fetch_add(1, Ordering::Relaxed))
         });
 
     // prepend request payload with a (client_guid, sequence_number) header as per rmw_cyclonedds here:
@@ -428,7 +420,7 @@ fn route_zenoh_request_to_dds(
         //  - the remaining of query payload
         let mut dds_req_buf: Vec<u8> = Vec::new();
         dds_req_buf.extend_from_slice(&zenoh_req_buf[..4]);
-        dds_req_buf.extend_from_slice(request_id.as_slice());
+        dds_req_buf.extend_from_slice(&request_id.to_bytes(is_little_endian));
         dds_req_buf.extend_from_slice(&zenoh_req_buf[4..]);
         dds_req_buf
     } else {
@@ -436,12 +428,8 @@ fn route_zenoh_request_to_dds(
         // Send to DDS a buffer made of
         //  - a CDR header
         //  - the request_id as request header
-        let mut dds_req_buf: Vec<u8> = if request_id.is_little_endian() {
-            CDR_HEADER_LE.into()
-        } else {
-            CDR_HEADER_BE.into()
-        };
-        dds_req_buf.extend_from_slice(request_id.as_slice());
+        let mut dds_req_buf: Vec<u8> = CDR_HEADER_LE.into();
+        dds_req_buf.extend_from_slice(&request_id.to_bytes(is_little_endian));
         dds_req_buf
     };
 

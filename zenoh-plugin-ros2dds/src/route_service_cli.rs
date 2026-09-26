@@ -379,6 +379,7 @@ fn route_dds_request_to_zenoh(
     // route request buffer stripped from request_id
     let mut zenoh_req_buf = ZBuf::empty();
 
+    let attachment = request_id.as_attachment(header.as_ref()[1] == 1);
     zenoh_req_buf.push_zslice(header);
     zenoh_req_buf.push_zslice(payload);
 
@@ -395,7 +396,7 @@ fn route_dds_request_to_zenoh(
         .get()
         .parameters(format!("{RETENTION_PARAMETER}={}", queries_timeout.as_millis()))
         .payload(zenoh_req_buf)
-        .attachment(request_id.as_attachment())
+        .attachment(attachment)
         .with({
             let route_id1: String = route_id.to_string();
             let route_id2 = route_id.to_string();
@@ -445,7 +446,7 @@ fn route_zenoh_reply_to_dds(
             // copy CDR header
             dds_rep_buf.extend_from_slice(&zenoh_rep_buf[..4]);
             // add request_id
-            dds_rep_buf.extend_from_slice(request_id.as_slice());
+            dds_rep_buf.extend_from_slice(&request_id.to_bytes(zenoh_rep_buf[1] == 1));
             // add query payoad
             dds_rep_buf.extend_from_slice(&zenoh_rep_buf[4..]);
 

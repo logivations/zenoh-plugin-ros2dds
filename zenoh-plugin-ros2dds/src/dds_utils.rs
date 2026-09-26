@@ -55,7 +55,6 @@ pub fn serialize_local_nodes<S: Serializer>(
 }
 
 pub const CDR_HEADER_LE: [u8; 4] = [0, 1, 0, 0];
-pub const CDR_HEADER_BE: [u8; 4] = [0, 0, 0, 0];
 
 /// Return None if the buffer is shorter than a CDR header (4 bytes).
 /// Otherwise, return true if the encoding flag (last bit of 2nd byte) corresponds little endian
