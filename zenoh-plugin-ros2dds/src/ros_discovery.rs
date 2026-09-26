@@ -237,6 +237,17 @@ impl RosDiscoveryInfoMgr {
         *has_changed = true;
     }
 
+    pub(crate) fn remove_dds_pair(&self, reader: Gid, writer: Gid) {
+        let (ref mut info, ref mut has_changed) = *zwrite!(self.participant_entities_state);
+        let node = info
+            .node_entities_info_seq
+            .get_mut(&self.node_fullname)
+            .unwrap();
+        node.reader_gid_seq.remove(&reader);
+        node.writer_gid_seq.remove(&writer);
+        *has_changed = true;
+    }
+
     pub fn add_dds_writer(&self, gid: Gid) {
         let (ref mut info, ref mut has_changed) = *zwrite!(self.participant_entities_state);
         info.node_entities_info_seq

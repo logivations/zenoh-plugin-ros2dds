@@ -356,6 +356,13 @@ impl DdsEndpoint {
         self.enabled.store(false, Ordering::Release);
         self.access.close();
     }
+
+    pub(crate) fn withdraw_pair(reader: &mut Self, writer: &mut Self) {
+        if let Some(graph) = reader.advertised.take() {
+            graph.remove_dds_pair(reader.gid, writer.gid);
+            writer.advertised = None;
+        }
+    }
 }
 
 fn quarantine(error: String) {

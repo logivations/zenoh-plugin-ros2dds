@@ -87,6 +87,17 @@ enum EntityRef {
 }
 
 impl DiscoveredEntities {
+    pub(crate) fn counts(&self) -> serde_json::Value {
+        serde_json::json!({
+            "participants": self.participants.len(),
+            "ros_graphs": self.ros_participant_info.len(),
+            "readers": self.readers.len(), "writers": self.writers.len(),
+            "nodes": self.nodes_info.values().map(|nodes| nodes.len()).sum::<usize>(),
+            "pending_endpoints": self.nodes_info.values().flat_map(|nodes| nodes.values())
+                .map(|node| node.undiscovered_reader.len() + node.undiscovered_writer.len()).sum::<usize>(),
+        })
+    }
+
     pub fn add_participant(&mut self, participant: DdsParticipant) -> Vec<ROS2DiscoveryEvent> {
         let gid = participant.key;
         self.admin_space.insert(

@@ -42,15 +42,15 @@ pub struct RouteActionCli {
     #[serde(skip)]
     context: Context,
     announcement_retry: Retry,
-    #[serde(skip)]
+    #[serde(rename = "send_goal")]
     route_send_goal: RouteServiceCli,
-    #[serde(skip)]
+    #[serde(rename = "cancel_goal")]
     route_cancel_goal: RouteServiceCli,
-    #[serde(skip)]
+    #[serde(rename = "get_result")]
     route_get_result: RouteServiceCli,
-    #[serde(skip)]
+    #[serde(rename = "feedback")]
     route_feedback: RouteSubscriber,
-    #[serde(skip)]
+    #[serde(rename = "status")]
     route_status: RouteSubscriber,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(rename = "is_active", serialize_with = "serialize_option_as_bool")]
@@ -58,7 +58,7 @@ pub struct RouteActionCli {
     // the list of remote routes served by this route ("<zenoh_id>:<zenoh_key_expr>"")
     remote_routes: HashSet<String>,
     // the list of nodes served by this route, keyed by (participant_gid, node_fullname) — #702.
-    #[serde(serialize_with = "serialize_local_nodes")]
+    #[serde(flatten, serialize_with = "serialize_local_nodes")]
     local_nodes: HashSet<(Gid, String)>,
 }
 
@@ -73,6 +73,13 @@ impl fmt::Display for RouteActionCli {
 }
 
 impl RouteActionCli {
+    pub(crate) fn endpoint_count(&self) -> usize {
+        self.route_send_goal.endpoint_count()
+            + self.route_cancel_goal.endpoint_count()
+            + self.route_get_result.endpoint_count()
+            + self.route_feedback.endpoint_count()
+            + self.route_status.endpoint_count()
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,

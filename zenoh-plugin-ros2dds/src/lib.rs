@@ -61,6 +61,7 @@ mod events;
 mod gid;
 mod liveliness_mgt;
 mod node_info;
+mod pending_queries;
 mod qos_helpers;
 mod ros2_utils;
 mod ros_discovery;

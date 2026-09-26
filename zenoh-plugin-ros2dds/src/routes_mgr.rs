@@ -13,7 +13,8 @@
 //
 use std::{
     collections::{hash_map::Entry, HashMap},
-    sync::{Arc, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cyclors::{
@@ -87,6 +88,10 @@ pub struct Context {
 
 pub struct RoutesMgr {
     context: Context,
+    started: Instant,
+    started_unix_ms: u128,
+    last_reconciled: Instant,
+    reconciliation_sequence: u64,
     // maps of established routes - ecah map indexed by topic/service/action name
     routes_publishers: HashMap<String, RoutePublisher>,
     routes_subscribers: HashMap<String, RouteSubscriber>,
@@ -120,6 +125,13 @@ impl RoutesMgr {
 
         RoutesMgr {
             context,
+            started: Instant::now(),
+            started_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            last_reconciled: Instant::now(),
+            reconciliation_sequence: 0,
             routes_publishers: HashMap::new(),
             routes_subscribers: HashMap::new(),
             routes_service_srv: HashMap::new(),
@@ -154,6 +166,8 @@ impl RoutesMgr {
         for route in self.routes_action_srv.values_mut() {
             route.reconcile().await;
         }
+        self.last_reconciled = Instant::now();
+        self.reconciliation_sequence = self.reconciliation_sequence.saturating_add(1);
     }
 
     pub async fn on_ros_discovery_event(
@@ -536,7 +550,7 @@ impl RoutesMgr {
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_CLI / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_CLI / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -571,7 +585,7 @@ impl RoutesMgr {
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_SRV / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_SRV / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -787,7 +801,73 @@ impl RoutesMgr {
         }
     }
 
+    fn lifecycle_health(&self) -> serde_json::Value {
+        use crate::dds_endpoint::{CLEANUP_FAILURES, LIVE_ENDPOINTS, LIVE_LISTENERS, LIVE_TOPICS};
+        let owned = self
+            .routes_publishers
+            .values()
+            .map(RoutePublisher::endpoint_count)
+            .sum::<usize>()
+            + self
+                .routes_subscribers
+                .values()
+                .map(RouteSubscriber::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_service_cli
+                .values()
+                .map(RouteServiceCli::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_service_srv
+                .values()
+                .map(RouteServiceSrv::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_action_cli
+                .values()
+                .map(RouteActionCli::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_action_srv
+                .values()
+                .map(RouteActionSrv::endpoint_count)
+                .sum::<usize>();
+        serde_json::json!({
+            "schema_version": 1,
+            "build_id": env!("BRIDGE_BUILD_ID"),
+            "base_version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "started_unix_ms": self.started_unix_ms,
+            "uptime_ms": self.started.elapsed().as_millis(),
+            "zid": self.context.zsession.zid().to_string(),
+            "participant": crate::dds_utils::get_guid(&self.context.participant).ok(),
+            "reconciliation_sequence": self.reconciliation_sequence,
+            "reconciliation_age_ms": self.last_reconciled.elapsed().as_millis(),
+            "routes": self.admin_space.len(),
+            "owned_dds_endpoints": owned,
+            "live_dds_endpoints": LIVE_ENDPOINTS.load(Ordering::Acquire),
+            "owned_topic_references": LIVE_TOPICS.load(Ordering::Acquire),
+            "dds_callback_allocations": LIVE_LISTENERS.load(Ordering::Acquire),
+            "owned_matching_listeners": self.routes_publishers.len() + self.routes_service_cli.len()
+                + self.routes_action_cli.len() * 3 + self.routes_action_srv.len() * 2,
+            "cleanup_failures": CLEANUP_FAILURES.load(Ordering::Acquire),
+            "discovery": zread!(self.context.discovered_entities).counts(),
+        })
+    }
+
     pub async fn treat_admin_query(&self, query: &Query) {
+        let health_key = &self.admin_prefix / unsafe { keyexpr::from_str_unchecked("lifecycle") };
+        if query.key_expr().intersects(&health_key) {
+            let bytes = serde_json::to_vec(&self.lifecycle_health()).expect("lifecycle JSON value");
+            if let Err(error) = query
+                .reply(health_key, bytes)
+                .encoding(Encoding::APPLICATION_JSON)
+                .await
+            {
+                tracing::warn!("Unable to reply to lifecycle health query: {error}");
+            }
+        }
         let selector = query.selector();
 
         // get the list of sub-key expressions that will match the same stored keys than

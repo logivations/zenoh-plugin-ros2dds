@@ -105,7 +105,7 @@ pub struct RoutePublisher {
     remote_routes: HashSet<String>,
     // the list of nodes served by this route, keyed by (participant_gid, node_fullname) to
     // disambiguate same-named nodes across restarts (#702).
-    #[serde(serialize_with = "serialize_local_nodes")]
+    #[serde(flatten, serialize_with = "serialize_local_nodes")]
     local_nodes: HashSet<(Gid, String)>,
 }
 
@@ -127,6 +127,9 @@ impl fmt::Display for RoutePublisher {
 }
 
 impl RoutePublisher {
+    pub(crate) fn endpoint_count(&self) -> usize {
+        usize::from(self.dds_reader.is_some()) * 1
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,

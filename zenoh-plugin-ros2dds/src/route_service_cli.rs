@@ -38,6 +38,7 @@ use crate::{
     dds_utils::{dds_write, is_cdr_little_endian, serialize_local_nodes},
     gid::Gid,
     liveliness_mgt::new_ke_liveliness_service_cli,
+    pending_queries::RETENTION_PARAMETER,
     ros2_utils::{
         is_service_for_action, new_service_id, ros2_service_type_to_reply_dds_type,
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
@@ -78,7 +79,7 @@ pub struct RouteServiceCli {
     // the list of remote routes served by this route ("<zenoh_id>:<zenoh_key_expr>"")
     remote_routes: HashSet<String>,
     // the list of nodes served by this route, keyed by (participant_gid, node_fullname) — #702.
-    #[serde(serialize_with = "serialize_local_nodes")]
+    #[serde(flatten, serialize_with = "serialize_local_nodes")]
     local_nodes: HashSet<(Gid, String)>,
 }
 
@@ -100,6 +101,9 @@ impl fmt::Display for RouteServiceCli {
 }
 
 impl RouteServiceCli {
+    pub(crate) fn endpoint_count(&self) -> usize {
+        usize::from(self.proxy.is_some()) * 2
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,
@@ -194,6 +198,7 @@ impl RouteServiceCli {
                 &self.context,
                 &self.type_info,
                 &self._zenoh_querier,
+                self.queries_timeout,
             )
         });
         if let Err(error) = result {
@@ -268,6 +273,7 @@ struct ServiceClientProxy {
 impl Drop for ServiceClientProxy {
     fn drop(&mut self) {
         self.rep_writer.fence();
+        DdsEndpoint::withdraw_pair(&mut self.req_reader, &mut self.rep_writer);
     }
 }
 fn serialize_proxy<S: serde::Serializer>(
@@ -292,6 +298,7 @@ fn create_proxy(
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
     querier: &Arc<Querier<'static>>,
+    queries_timeout: Duration,
 ) -> Result<ServiceClientProxy, String> {
     let mut qos = QOS_DEFAULT_SERVICE.clone();
     qos.user_data =
@@ -314,7 +321,9 @@ fn create_proxy(
         true,
         qos,
         None,
-        move |sample| route_dds_request_to_zenoh(&route_id, sample, &querier, access.clone()),
+        move |sample| {
+            route_dds_request_to_zenoh(&route_id, sample, &querier, access.clone(), queries_timeout)
+        },
     )?;
     let mut proxy = ServiceClientProxy {
         req_reader,
@@ -333,6 +342,7 @@ fn route_dds_request_to_zenoh(
     sample: &DDSRawSample,
     querier: &Arc<Querier<'static>>,
     rep_writer: DdsAccess,
+    queries_timeout: Duration,
 ) {
     // Request payload is expected to be the Request type encoded as CDR, including a 4 bytes CDR header,
     // the 16 bytes request_id (8 bytes client guid + 8 bytes sequence_number), and the request payload. As per rmw_cyclonedds here:
@@ -375,6 +385,7 @@ fn route_dds_request_to_zenoh(
 
     if let Err(e) = querier
         .get()
+        .parameters(format!("{RETENTION_PARAMETER}={}", queries_timeout.as_millis()))
         .payload(zenoh_req_buf)
         .attachment(request_id.as_attachment())
         .with({

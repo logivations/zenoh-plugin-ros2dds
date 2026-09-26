@@ -18,25 +18,34 @@ use std::{
 };
 
 use cyclors::*;
-use serde::{ser::SerializeSeq, Serializer};
+use serde::{ser::SerializeMap, Serialize, Serializer};
 
 use crate::{dds_types::TypeInfo, gid::Gid};
 
-/// Serialize a `HashSet<(Gid, String)>` as a deduplicated array of the node fullnames,
-/// dropping the participant GID. Keeps the admin-space JSON format unchanged after #702 fix.
-pub fn serialize_local_nodes<S>(
+/// Preserve legacy node names and add the participant identity, without storing
+/// a second membership set. Flattened into each route's admin representation.
+pub fn serialize_local_nodes<S: Serializer>(
     set: &HashSet<(Gid, String)>,
     serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let dedup: BTreeSet<&str> = set.iter().map(|(_, name)| name.as_str()).collect();
-    let mut seq = serializer.serialize_seq(Some(dedup.len()))?;
-    for name in &dedup {
-        seq.serialize_element(name)?;
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Identity<'a> {
+        participant: Gid,
+        name: &'a str,
     }
-    seq.end()
+    let names: BTreeSet<&str> = set.iter().map(|(_, name)| name.as_str()).collect();
+    let sorted: BTreeSet<_> = set.iter().collect();
+    let identities: Vec<_> = sorted
+        .into_iter()
+        .map(|(participant, name)| Identity {
+            participant: *participant,
+            name,
+        })
+        .collect();
+    let mut map = serializer.serialize_map(Some(2))?;
+    map.serialize_entry("local_nodes", &names)?;
+    map.serialize_entry("local_node_identities", &identities)?;
+    map.end()
 }
 
 pub const CDR_HEADER_LE: [u8; 4] = [0, 1, 0, 0];

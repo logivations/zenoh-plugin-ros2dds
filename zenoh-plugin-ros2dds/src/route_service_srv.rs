@@ -13,21 +13,19 @@
 //
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc,
     },
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
 use zenoh::{
     bytes::ZBytes,
-    internal::{
-        buffers::{Buffer, ZBuf, ZSlice},
-        zwrite,
-    },
+    internal::buffers::{Buffer, ZBuf, ZSlice},
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
     query::{Query, Queryable},
@@ -43,6 +41,7 @@ use crate::{
     },
     gid::Gid,
     liveliness_mgt::new_ke_liveliness_service_srv,
+    pending_queries::{self, PendingQueries, RETENTION_PARAMETER},
     ros2_utils::{
         is_service_for_action, new_service_id, ros2_service_type_to_reply_dds_type,
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
@@ -80,7 +79,7 @@ pub struct RouteServiceSrv {
     // the list of remote routes served by this route ("<zenoh_id>:<zenoh_key_expr>"")
     remote_routes: HashSet<String>,
     // the list of nodes served by this route, keyed by (participant_gid, node_fullname) — #702.
-    #[serde(serialize_with = "serialize_local_nodes")]
+    #[serde(flatten, serialize_with = "serialize_local_nodes")]
     local_nodes: HashSet<(Gid, String)>,
 }
 
@@ -107,6 +106,9 @@ impl fmt::Display for RouteServiceSrv {
 }
 
 impl RouteServiceSrv {
+    pub(crate) fn endpoint_count(&self) -> usize {
+        usize::from(self.proxy.is_some()) * 2
+    }
     pub(crate) fn is_active(&self) -> bool {
         self.zenoh_queryable.is_some()
     }
@@ -155,6 +157,10 @@ impl RouteServiceSrv {
         let route_id: String = self.to_string();
         let client_guid = proxy.client_guid;
         let req_writer = proxy.req_writer.access();
+        let retention = self
+            .context
+            .config
+            .get_incoming_query_retention(&self.ros2_name);
         let queryable = Some(
             self.context
                 .zsession
@@ -167,6 +173,7 @@ impl RouteServiceSrv {
                         &route_id,
                         client_guid,
                         &req_writer,
+                        retention,
                     )
                 })
                 .await
@@ -204,6 +211,9 @@ impl RouteServiceSrv {
     }
 
     pub(crate) async fn reconcile(&mut self) {
+        if let Some(proxy) = &self.proxy {
+            proxy.queries_in_progress.expire(Instant::now());
+        }
         let route_id = self.to_string();
         // A retained server route exposes a local client pair even before a
         // local server appears, so DDS discovery can converge in either order.
@@ -294,11 +304,12 @@ struct ServiceServerProxy {
     req_writer: DdsEndpoint,
     client_guid: u64,
     sequence_number: Arc<AtomicU64>,
-    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>>,
+    queries_in_progress: Arc<PendingQueries>,
 }
 impl Drop for ServiceServerProxy {
     fn drop(&mut self) {
         self.req_writer.fence();
+        DdsEndpoint::withdraw_pair(&mut self.rep_reader, &mut self.req_writer);
     }
 }
 fn serialize_proxy<S: serde::Serializer>(
@@ -306,13 +317,18 @@ fn serialize_proxy<S: serde::Serializer>(
     s: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
-    let mut map = s.serialize_map(Some(2))?;
+    let mut map = s.serialize_map(Some(4))?;
     if let Some(proxy) = proxy {
         map.serialize_entry("req_writer", &proxy.req_writer)?;
         map.serialize_entry("rep_reader", &proxy.rep_reader)?;
+        let (pending, expired) = proxy.queries_in_progress.counts();
+        map.serialize_entry("pending_queries", &pending)?;
+        map.serialize_entry("expired_queries", &expired)?;
     } else {
         map.serialize_entry("req_writer", "")?;
         map.serialize_entry("rep_reader", "")?;
+        map.serialize_entry("pending_queries", &0usize)?;
+        map.serialize_entry("expired_queries", &0u64)?;
     }
     map.end()
 }
@@ -335,7 +351,7 @@ fn create_proxy(
         qos.clone(),
     )?;
     let client_guid = get_instance_handle(req_writer.entity())?;
-    let queries_in_progress = Arc::new(RwLock::new(HashMap::new()));
+    let queries_in_progress = Arc::new(PendingQueries::default());
     let pending = queries_in_progress.clone();
     let route_id = route_id.to_owned();
     let key = zenoh_key_expr.clone();
@@ -366,11 +382,12 @@ fn create_proxy(
 
 fn route_zenoh_request_to_dds(
     query: Query,
-    queries_in_progress: &RwLock<HashMap<CddsRequestHeader, Query>>,
+    queries_in_progress: &PendingQueries,
     sequence_number: &AtomicU64,
     route_id: &str,
     client_guid: u64,
     req_writer: &DdsAccess,
+    retention: Duration,
 ) {
     // Get expected endianness from the query value:
     // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
@@ -439,11 +456,16 @@ fn route_zenoh_request_to_dds(
         );
     }
 
+    let deadline = pending_queries::deadline(
+        query.parameters().get(RETENTION_PARAMETER),
+        retention,
+        Instant::now(),
+    );
     req_writer.with(|writer| {
-        zwrite!(queries_in_progress).insert(request_id, query);
+        queries_in_progress.insert(request_id, query, deadline);
         if let Err(e) = dds_write(writer, dds_req_buf) {
             tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
-            zwrite!(queries_in_progress).remove(&request_id);
+            queries_in_progress.take(&request_id);
         }
     });
 }
@@ -451,7 +473,7 @@ fn route_zenoh_request_to_dds(
 fn route_dds_reply_to_zenoh(
     sample: &DDSRawSample,
     zenoh_key_expr: OwnedKeyExpr,
-    queries_in_progress: &RwLock<HashMap<CddsRequestHeader, Query>>,
+    queries_in_progress: &PendingQueries,
     route_id: &str,
 ) {
     // Reply payload is expected to be the Response type encoded as CDR, including a 4 bytes CDR header,
@@ -479,7 +501,7 @@ fn route_dds_reply_to_zenoh(
     };
 
     // Check if it's one of my queries in progress. Drop otherwise
-    let query = zwrite!(queries_in_progress).remove(&request_id);
+    let query = queries_in_progress.take(&request_id);
     match query {
         Some(query) => {
             // route reply buffer stripped from request_id

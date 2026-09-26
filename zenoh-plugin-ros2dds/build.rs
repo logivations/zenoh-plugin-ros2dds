@@ -12,6 +12,11 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 fn main() {
+    println!("cargo:rerun-if-env-changed=BRIDGE_BUILD_ID");
+    println!(
+        "cargo:rustc-env=BRIDGE_BUILD_ID={}",
+        std::env::var("BRIDGE_BUILD_ID").unwrap_or_else(|_| "development-unidentified".into())
+    );
     // Add rustc version to zenohd
     let version_meta = rustc_version::version_meta().unwrap();
     println!(
