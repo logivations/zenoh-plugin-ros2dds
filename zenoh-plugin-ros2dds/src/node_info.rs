@@ -21,7 +21,7 @@ use zenoh::key_expr::{keyexpr, KeyExpr};
 
 use crate::{dds_discovery::DdsEntity, events::ROS2DiscoveryEvent, gid::Gid, ros2_utils::*};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MsgPub {
     pub name: String,
     #[serde(rename = "type")]
@@ -58,7 +58,7 @@ impl std::fmt::Display for MsgPub {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MsgSub {
     pub name: String,
     #[serde(rename = "type")]
@@ -95,7 +95,7 @@ impl std::fmt::Display for MsgSub {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServiceSrvEntities {
     pub req_reader: Gid,
     pub rep_writer: Gid,
@@ -119,7 +119,7 @@ impl std::fmt::Debug for ServiceSrvEntities {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ServiceSrv {
     pub name: String,
     #[serde(rename = "type")]
@@ -155,7 +155,7 @@ impl std::fmt::Display for ServiceSrv {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServiceCliEntities {
     pub req_writer: Gid,
     pub rep_reader: Gid,
@@ -179,7 +179,7 @@ impl std::fmt::Debug for ServiceCliEntities {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ServiceCli {
     pub name: String,
     #[serde(rename = "type")]
@@ -215,7 +215,7 @@ impl std::fmt::Display for ServiceCli {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ActionSrvEntities {
     pub send_goal: ServiceSrvEntities,
     pub cancel_goal: ServiceSrvEntities,
@@ -250,7 +250,7 @@ impl std::fmt::Debug for ActionSrvEntities {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ActionSrv {
     pub name: String,
     #[serde(rename = "type")]
@@ -286,7 +286,7 @@ impl std::fmt::Display for ActionSrv {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ActionCliEntities {
     pub send_goal: ServiceCliEntities,
     pub cancel_goal: ServiceCliEntities,
@@ -321,7 +321,7 @@ impl std::fmt::Debug for ActionCliEntities {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ActionCli {
     pub name: String,
     #[serde(rename = "type")]
@@ -486,7 +486,7 @@ impl NodeInfo {
     }
 
     pub fn update_with_reader(&mut self, entity: &DdsEntity) -> Option<ROS2DiscoveryEvent> {
-        let topic_prefix = &entity.topic_name[..3];
+        let topic_prefix = entity.topic_name.get(..3)?;
         let topic_suffix = &entity.topic_name[2..];
         match topic_prefix {
             "rt/" if topic_suffix.ends_with("/_action/status") => self
@@ -560,7 +560,7 @@ impl NodeInfo {
     }
 
     pub fn update_with_writer(&mut self, entity: &DdsEntity) -> Option<ROS2DiscoveryEvent> {
-        let topic_prefix = &entity.topic_name[..3];
+        let topic_prefix = entity.topic_name.get(..3)?;
         let topic_suffix = &entity.topic_name[2..];
         match topic_prefix {
             "rt/" if topic_suffix.ends_with("/_action/status") => self
@@ -742,7 +742,11 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.req_reader != *reader {
@@ -754,7 +758,11 @@ impl NodeInfo {
                     }
                     v.entities.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -793,7 +801,11 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.rep_writer != *writer {
@@ -805,7 +817,11 @@ impl NodeInfo {
                     }
                     v.entities.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -844,7 +860,11 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.rep_reader != *reader {
@@ -856,7 +876,11 @@ impl NodeInfo {
                     }
                     v.entities.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -895,7 +919,11 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.req_writer != *writer {
@@ -907,7 +935,11 @@ impl NodeInfo {
                     }
                     v.entities.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -948,7 +980,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.send_goal.req_reader != *reader {
@@ -960,7 +996,11 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1001,7 +1041,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.send_goal.rep_writer != *writer {
@@ -1013,7 +1057,11 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1056,7 +1104,11 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1099,7 +1151,11 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1140,7 +1196,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.get_result.req_reader != *reader {
@@ -1152,7 +1212,11 @@ impl NodeInfo {
                     }
                     v.entities.get_result.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1193,7 +1257,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.get_result.rep_writer != *writer {
@@ -1205,7 +1273,11 @@ impl NodeInfo {
                     }
                     v.entities.get_result.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1248,7 +1320,11 @@ impl NodeInfo {
                     }
                     v.entities.status_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1289,7 +1365,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.feedback_writer != *writer {
@@ -1301,7 +1381,11 @@ impl NodeInfo {
                     }
                     v.entities.feedback_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1342,7 +1426,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.send_goal.rep_reader != *reader {
@@ -1354,7 +1442,11 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1395,7 +1487,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.send_goal.req_writer != *writer {
@@ -1407,7 +1503,11 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1450,7 +1550,11 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1493,7 +1597,11 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1534,7 +1642,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.get_result.rep_reader != *reader {
@@ -1546,7 +1658,11 @@ impl NodeInfo {
                     }
                     v.entities.get_result.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1587,7 +1703,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.get_result.req_writer != *writer {
@@ -1599,7 +1719,11 @@ impl NodeInfo {
                     }
                     v.entities.get_result.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1642,7 +1766,11 @@ impl NodeInfo {
                     }
                     v.entities.status_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1683,7 +1811,11 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname.clone(),
+                            v.clone(),
+                        ))
                     };
                 }
                 if v.entities.feedback_reader != *reader {
@@ -1695,7 +1827,11 @@ impl NodeInfo {
                     }
                     v.entities.feedback_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(self.participant, node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(
+                            self.participant,
+                            node_fullname,
+                            v.clone(),
+                        ))
                     };
                 }
                 result
@@ -1710,22 +1846,46 @@ impl NodeInfo {
         let mut events = Vec::new();
 
         for (_, v) in self.msg_pub.drain() {
-            events.push(UndiscoveredMsgPub(self.participant, node_fullname.clone(), v))
+            events.push(UndiscoveredMsgPub(
+                self.participant,
+                node_fullname.clone(),
+                v,
+            ))
         }
         for (_, v) in self.msg_sub.drain() {
-            events.push(UndiscoveredMsgSub(self.participant, node_fullname.clone(), v))
+            events.push(UndiscoveredMsgSub(
+                self.participant,
+                node_fullname.clone(),
+                v,
+            ))
         }
-        for (_, v) in self.service_srv.drain() {
-            events.push(UndiscoveredServiceSrv(self.participant, node_fullname.clone(), v))
+        for (_, v) in self.service_srv.drain().filter(|(_, v)| v.is_complete()) {
+            events.push(UndiscoveredServiceSrv(
+                self.participant,
+                node_fullname.clone(),
+                v,
+            ))
         }
-        for (_, v) in self.service_cli.drain() {
-            events.push(UndiscoveredServiceCli(self.participant, node_fullname.clone(), v))
+        for (_, v) in self.service_cli.drain().filter(|(_, v)| v.is_complete()) {
+            events.push(UndiscoveredServiceCli(
+                self.participant,
+                node_fullname.clone(),
+                v,
+            ))
         }
-        for (_, v) in self.action_srv.drain() {
-            events.push(UndiscoveredActionSrv(self.participant, node_fullname.clone(), v))
+        for (_, v) in self.action_srv.drain().filter(|(_, v)| v.is_complete()) {
+            events.push(UndiscoveredActionSrv(
+                self.participant,
+                node_fullname.clone(),
+                v,
+            ))
         }
-        for (_, v) in self.action_cli.drain() {
-            events.push(UndiscoveredActionCli(self.participant, node_fullname.clone(), v))
+        for (_, v) in self.action_cli.drain().filter(|(_, v)| v.is_complete()) {
+            events.push(UndiscoveredActionCli(
+                self.participant,
+                node_fullname.clone(),
+                v,
+            ))
         }
         self.undiscovered_reader.resize(0, Gid::NOT_DISCOVERED);
         self.undiscovered_writer.resize(0, Gid::NOT_DISCOVERED);
@@ -1733,128 +1893,79 @@ impl NodeInfo {
         events
     }
 
-    // Remove a DDS Reader possibly used by this node, and returns an UndiscoveredX event if
-    // this Reader was used by some Subscription, Service or Action
-    pub fn remove_reader(&mut self, reader: &Gid) -> Option<ROS2DiscoveryEvent> {
+    /// Emit changes between two derived snapshots. Endpoint replacement updates
+    /// an existing interface; a delayed disposal cannot erase its new counterpart.
+    pub(crate) fn delta(&self, previous: Option<&Self>) -> Vec<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::*;
-        let node_fullname = self.fullname().to_string();
-        // Search in Subscribers list if one is using the writer
-        if let Some(name) = self.msg_sub.iter_mut().find_map(|(name, sub)| {
-            if sub.readers.remove(reader) && sub.readers.is_empty() {
-                // found Subscriber using the reader: remove the reader from list
-                // and if the list is empty return the Subscriber name to "undiscover" it
-                Some(name.clone())
-            } else {
-                None
-            }
-        }) {
-            // Return undiscovery event for this Subscriber, since all its DDS Writer have been undiscovered
-            return Some(UndiscoveredMsgSub(self.participant, node_fullname,
-                self.msg_sub.remove(&name).unwrap(),
-            ));
+        let mut events = Vec::new();
+        macro_rules! diff {
+            ($field:ident, $complete:expr, $added:ident, $removed:ident) => {{
+                let old = previous.map(|n| &n.$field);
+                if let Some(old) = old {
+                    for (name, value) in old {
+                        if $complete(value)
+                            && self
+                                .$field
+                                .get(name)
+                                .filter(|v| $complete(v) && v.typ == value.typ)
+                                .is_none()
+                        {
+                            events.push($removed(
+                                self.participant,
+                                self.fullname().to_owned(),
+                                value.clone(),
+                            ));
+                        }
+                    }
+                }
+                for (name, value) in &self.$field {
+                    if $complete(value) && old.and_then(|n| n.get(name)) != Some(value) {
+                        events.push($added(
+                            self.participant,
+                            self.fullname().to_owned(),
+                            value.clone(),
+                        ));
+                    }
+                }
+            }};
         }
-        if let Some((name, _)) = self
-            .service_srv
-            .iter()
-            .find(|(_, v)| v.entities.req_reader == *reader)
-        {
-            return Some(UndiscoveredServiceSrv(self.participant, node_fullname,
-                self.service_srv.remove(&name.clone()).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self
-            .service_cli
-            .iter()
-            .find(|(_, v)| v.entities.rep_reader == *reader)
-        {
-            return Some(UndiscoveredServiceCli(self.participant, node_fullname,
-                self.service_cli.remove(&name.clone()).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self.action_srv.iter().find(|(_, v)| {
-            v.entities.send_goal.req_reader == *reader
-                || v.entities.cancel_goal.req_reader == *reader
-                || v.entities.get_result.req_reader == *reader
-        }) {
-            return Some(UndiscoveredActionSrv(self.participant, node_fullname,
-                self.action_srv.remove(&name.clone()).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self.action_cli.iter().find(|(_, v)| {
-            v.entities.send_goal.rep_reader == *reader
-                || v.entities.cancel_goal.rep_reader == *reader
-                || v.entities.get_result.rep_reader == *reader
-                || v.entities.status_reader == *reader
-                || v.entities.feedback_reader == *reader
-        }) {
-            return Some(UndiscoveredActionCli(self.participant, node_fullname,
-                self.action_cli.remove(&name.clone()).unwrap(),
-            ));
-        }
-        self.undiscovered_reader.retain(|gid| gid != reader);
-        None
-    }
-
-    // Remove a DDS Writer possibly used by this node, and returns an UndiscoveredX event if
-    // this Writer was used by some Publication, Service or Action
-    pub fn remove_writer(&mut self, writer: &Gid) -> Option<ROS2DiscoveryEvent> {
-        use ROS2DiscoveryEvent::*;
-        let node_fullname = self.fullname().to_string();
-        // Search in Publishers list if one is using the writer
-        if let Some(name) = self.msg_pub.iter_mut().find_map(|(name, publ)| {
-            if publ.writers.remove(writer) && publ.writers.is_empty() {
-                // found Publisher using the writer: remove the writer from list
-                // and if the list is empty return the Publisher name to "undiscover" it
-                Some(name.clone())
-            } else {
-                None
-            }
-        }) {
-            // Return undiscovery event for this Publisher, since all its DDS Writer have been undiscovered
-            return Some(UndiscoveredMsgPub(self.participant, node_fullname,
-                self.msg_pub.remove(&name).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self
-            .service_srv
-            .iter()
-            .find(|(_, v)| v.entities.rep_writer == *writer)
-        {
-            return Some(UndiscoveredServiceSrv(self.participant, node_fullname,
-                self.service_srv.remove(&name.clone()).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self
-            .service_cli
-            .iter()
-            .find(|(_, v)| v.entities.req_writer == *writer)
-        {
-            return Some(UndiscoveredServiceCli(self.participant, node_fullname,
-                self.service_cli.remove(&name.clone()).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self.action_srv.iter().find(|(_, v)| {
-            v.entities.send_goal.rep_writer == *writer
-                || v.entities.cancel_goal.rep_writer == *writer
-                || v.entities.get_result.rep_writer == *writer
-                || v.entities.status_writer == *writer
-                || v.entities.feedback_writer == *writer
-        }) {
-            return Some(UndiscoveredActionSrv(self.participant, node_fullname,
-                self.action_srv.remove(&name.clone()).unwrap(),
-            ));
-        }
-        if let Some((name, _)) = self.action_cli.iter().find(|(_, v)| {
-            v.entities.send_goal.req_writer == *writer
-                || v.entities.cancel_goal.req_writer == *writer
-                || v.entities.get_result.req_writer == *writer
-        }) {
-            return Some(UndiscoveredActionCli(self.participant, node_fullname,
-                self.action_cli.remove(&name.clone()).unwrap(),
-            ));
-        }
-        self.undiscovered_writer.retain(|gid| gid != writer);
-        None
+        diff!(
+            msg_pub,
+            |v: &MsgPub| !v.writers.is_empty(),
+            DiscoveredMsgPub,
+            UndiscoveredMsgPub
+        );
+        diff!(
+            msg_sub,
+            |v: &MsgSub| !v.readers.is_empty(),
+            DiscoveredMsgSub,
+            UndiscoveredMsgSub
+        );
+        diff!(
+            service_srv,
+            |v: &ServiceSrv| v.is_complete(),
+            DiscoveredServiceSrv,
+            UndiscoveredServiceSrv
+        );
+        diff!(
+            service_cli,
+            |v: &ServiceCli| v.is_complete(),
+            DiscoveredServiceCli,
+            UndiscoveredServiceCli
+        );
+        diff!(
+            action_srv,
+            |v: &ActionSrv| v.is_complete(),
+            DiscoveredActionSrv,
+            UndiscoveredActionSrv
+        );
+        diff!(
+            action_cli,
+            |v: &ActionCli| v.is_complete(),
+            DiscoveredActionCli,
+            UndiscoveredActionCli
+        );
+        events
     }
 }
 

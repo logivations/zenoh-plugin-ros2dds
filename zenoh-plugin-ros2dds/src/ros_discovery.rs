@@ -296,11 +296,20 @@ impl RosDiscoveryInfoMgr {
                 let si = si.assume_init();
                 if si[0].valid_data {
                     let raw_sample = DDSRawSample::create(zp);
-
-                    // No need to deserialize the full payload. Just read the Participant gid (first 16 bytes of the payload)
-                    let gid = hex::encode(&raw_sample.payload_as_slice()[0..16]);
-
-                    map.insert(gid, raw_sample);
+                    // A queued graph sample from an already disposed writer must
+                    // not resurrect that participant's cached node membership.
+                    // Check the DDS source, independently of discovery-event order.
+                    let source =
+                        dds_get_matched_publication_data(self.reader, si[0].publication_handle);
+                    if !source.is_null() {
+                        if raw_sample.len() >= 20
+                            && raw_sample.payload_as_slice()[..16] == (*source).participant_key.v
+                        {
+                            let gid = hex::encode((*source).participant_key.v);
+                            map.insert(gid, raw_sample);
+                        }
+                        dds_builtintopic_free_endpoint(source);
+                    }
                 }
                 ddsi_serdata_unref(zp);
             }
