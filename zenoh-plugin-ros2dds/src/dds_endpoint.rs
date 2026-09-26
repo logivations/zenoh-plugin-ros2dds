@@ -163,7 +163,9 @@ impl DdsEndpoint {
         // writer default (100 ms) as an upper bound, preserving stricter limits.
         // max_blocking_time does not participate in DDS reliability matching.
         if let Some(reliability) = &mut qos.reliability {
-            reliability.max_blocking_time = reliability.max_blocking_time.min(100_000_000);
+            reliability.max_blocking_time = reliability
+                .max_blocking_time
+                .min(crate::dds_utils::MAX_DDS_WRITE_BLOCKING_TIME);
         }
         Self::create(
             participant,

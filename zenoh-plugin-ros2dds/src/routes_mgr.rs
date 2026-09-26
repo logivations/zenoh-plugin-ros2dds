@@ -901,6 +901,7 @@ impl RoutesMgr {
                 + self.routes_action_cli.len() * 3 + self.routes_action_srv.len() * 2,
             "cleanup_failures": CLEANUP_FAILURES.load(Ordering::Acquire),
             "dds_write_failures": crate::dds_utils::DDS_WRITE_FAILURES.load(Ordering::Relaxed),
+            "ros_graph_pending": self.context.ros_discovery_mgr.publication_pending(),
             "discovery": zread!(self.context.discovered_entities).counts(),
         })
     }
