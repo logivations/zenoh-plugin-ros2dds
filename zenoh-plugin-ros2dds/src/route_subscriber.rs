@@ -108,7 +108,7 @@ impl fmt::Display for RouteSubscriber {
 
 impl RouteSubscriber {
     pub(crate) fn endpoint_count(&self) -> usize {
-        usize::from(self.dds_writer.is_some()) * 1
+        usize::from(self.dds_writer.is_some())
     }
     #[allow(clippy::too_many_arguments)]
     pub async fn create(

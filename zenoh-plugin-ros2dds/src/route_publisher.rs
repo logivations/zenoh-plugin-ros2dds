@@ -128,7 +128,7 @@ impl fmt::Display for RoutePublisher {
 
 impl RoutePublisher {
     pub(crate) fn endpoint_count(&self) -> usize {
-        usize::from(self.dds_reader.is_some()) * 1
+        usize::from(self.dds_reader.is_some())
     }
     #[allow(clippy::too_many_arguments)]
     pub async fn create(

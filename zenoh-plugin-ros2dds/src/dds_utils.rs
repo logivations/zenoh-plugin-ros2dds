@@ -208,7 +208,7 @@ fn dds_write_inner(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), Strin
             ddsi_serdata_kind_SDK_DATA,
             1,
             &data_out,
-            size as usize,
+            data.len(),
         );
 
         let ret = dds_writecdr(data_writer, fwdp);
