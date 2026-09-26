@@ -1013,3 +1013,54 @@ impl RoutesMgr {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dds_endpoint::DDS_TEST;
+    use crate::dds_utils::delete_dds_entity;
+    use cyclors::{dds_create_domain, dds_create_participant};
+
+    #[test]
+    fn action_retirement_removes_the_route_and_its_admin_entry() {
+        let _serial = DDS_TEST.lock().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let xml = std::ffi::CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+            let domain = unsafe { dds_create_domain(224, xml.as_ptr()) };
+            let participant = unsafe { dds_create_participant(224, std::ptr::null(), std::ptr::null()) };
+            assert!(domain > 0 && participant > 0);
+            let mut config = zenoh::Config::default();
+            config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+            config.insert_json5("listen/endpoints", "[]").unwrap();
+            config.insert_json5("timestamping/enabled", "true").unwrap();
+            let session = Arc::new(zenoh::open(config).await.unwrap());
+            let graph = Arc::new(RosDiscoveryInfoMgr::new(participant, "/", "actions_test").unwrap());
+            let mut manager = RoutesMgr::new(
+                Arc::new(serde_json::from_str("{}").unwrap()), session.clone(), participant,
+                Arc::new(RwLock::new(DiscoveredEntities::default())), graph,
+                OwnedKeyExpr::try_from("@/test/ros2").unwrap(),
+            );
+            let zenoh_id = OwnedKeyExpr::try_from("remote").unwrap();
+            let zenoh_key_expr = OwnedKeyExpr::try_from("test/fibonacci").unwrap();
+            let ros2_type = "example_interfaces/action/Fibonacci".to_string();
+            use ROS2AnnouncementEvent::*;
+            for (announce, retire, prefix) in [
+                (AnnouncedActionSrv { zenoh_id: zenoh_id.clone(), zenoh_key_expr: zenoh_key_expr.clone(), ros2_type: ros2_type.clone() },
+                 RetiredActionSrv { zenoh_id: zenoh_id.clone(), zenoh_key_expr: zenoh_key_expr.clone() }, *KE_PREFIX_ROUTE_ACTION_CLI),
+                (AnnouncedActionCli { zenoh_id: zenoh_id.clone(), zenoh_key_expr: zenoh_key_expr.clone(), ros2_type },
+                 RetiredActionCli { zenoh_id, zenoh_key_expr: zenoh_key_expr.clone() }, *KE_PREFIX_ROUTE_ACTION_SRV),
+            ] {
+                manager.on_ros_announcement_event(announce).await.unwrap();
+                assert!(manager.admin_space.contains_key(&(prefix / &zenoh_key_expr)));
+                manager.on_ros_announcement_event(retire).await.unwrap();
+                assert!(manager.admin_space.is_empty());
+                assert!(manager.routes_action_cli.is_empty() && manager.routes_action_srv.is_empty());
+            }
+            drop(manager);
+            session.close().await.unwrap();
+            delete_dds_entity(participant).unwrap();
+            delete_dds_entity(domain).unwrap();
+        });
+    }
+}

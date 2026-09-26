@@ -609,6 +609,60 @@ mod tests {
     }
 
     #[test]
+    fn owned_pair_is_published_and_withdrawn_as_one_graph_update() {
+        use crate::dds_endpoint::{DdsEndpoint, DDS_TEST};
+        let _serial = DDS_TEST.lock().unwrap();
+        let config = CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+        let domain = unsafe { dds_create_domain(223, config.as_ptr()) };
+        let participant =
+            unsafe { dds_create_participant(223, std::ptr::null(), std::ptr::null()) };
+        assert!(domain > 0 && participant > 0);
+        let graph = Arc::new(RosDiscoveryInfoMgr::new(participant, "/", "pair_test").unwrap());
+        let mut reader = DdsEndpoint::reader(
+            participant,
+            "rq/pairRequest".into(),
+            "Request".into(),
+            &None,
+            true,
+            Qos::default(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let mut writer = DdsEndpoint::writer(
+            participant,
+            "rr/pairReply".into(),
+            "Reply".into(),
+            true,
+            Qos::default(),
+        )
+        .unwrap();
+        DdsEndpoint::advertise_pair(&mut reader, &mut writer, graph.clone());
+        publish_graph_update(&graph.participant_entities_state, |snapshot| {
+            let node = &snapshot.node_entities_info_seq["/pair_test"];
+            assert_eq!(
+                (node.reader_gid_seq.len(), node.writer_gid_seq.len()),
+                (1, 1)
+            );
+            // Retirement may occur while a previous snapshot is in flight.
+            DdsEndpoint::withdraw_pair(&mut reader, &mut writer);
+            Ok(())
+        })
+        .unwrap();
+        assert!(graph.publication_pending());
+        publish_graph_update(&graph.participant_entities_state, |snapshot| {
+            let node = &snapshot.node_entities_info_seq["/pair_test"];
+            assert!(node.reader_gid_seq.is_empty() && node.writer_gid_seq.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!graph.publication_pending());
+        drop((reader, writer, graph));
+        delete_dds_entity(participant).unwrap();
+        delete_dds_entity(domain).unwrap();
+    }
+
+    #[test]
     fn failed_graph_publication_retries_without_another_discovery_event() {
         let state = graph_state();
         assert!(publish_graph_update(&state, |_| Err("injected write failure".into())).is_err());

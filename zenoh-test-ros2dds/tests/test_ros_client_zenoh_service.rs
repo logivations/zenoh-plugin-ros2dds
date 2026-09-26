@@ -42,7 +42,7 @@ fn test_ros_client_zenoh_service() {
 
     let (sender, receiver) = std::sync::mpsc::channel();
 
-    rt.block_on(async {
+    rt.spawn(async move {
         common::init_env();
         // Create zenoh-bridge-ros2dds
         tokio::spawn(common::create_bridge());

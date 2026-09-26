@@ -28,6 +28,8 @@ pub(crate) static LIVE_ENDPOINTS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static LIVE_TOPICS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static LIVE_LISTENERS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static DDS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Topic(dds_entity_t);
 impl Drop for Topic {
@@ -451,8 +453,6 @@ mod tests {
     use super::*;
     use std::sync::{mpsc, Barrier};
 
-    static DDS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn closed_access_releases_callback_capture_outside_the_fence() {
         struct Capture(DdsAccess, Arc<AtomicBool>);
@@ -619,6 +619,71 @@ mod tests {
         worker.join().unwrap();
         retire.join().unwrap();
         assert!(access.with(|_| panic!("stale raw handle used")).is_none());
+    }
+
+    #[test]
+    fn periodic_reader_retires_while_forwarding_an_owned_sample() {
+        let _serial = DDS_TEST.lock().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let config = std::ffi::CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+        let domain = unsafe { dds_create_domain(222, config.as_ptr()) };
+        let participant =
+            unsafe { dds_create_participant(222, std::ptr::null(), std::ptr::null()) };
+        assert!(domain > 0 && participant > 0);
+        let writer = DdsEndpoint::writer(
+            participant,
+            "rt/poll".into(),
+            "Raw".into(),
+            true,
+            Qos::default(),
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (sample_tx, sample_rx) = mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let release_callback = release.clone();
+        let reader = DdsEndpoint::reader(
+            participant,
+            "rt/poll".into(),
+            "Raw".into(),
+            &None,
+            true,
+            Qos::default(),
+            Some(Duration::from_millis(1)),
+            move |sample| {
+                entered_tx.send(()).unwrap();
+                release_callback.wait();
+                let bytes: zenoh::bytes::ZBytes = sample.into();
+                sample_tx.send(bytes.to_bytes().into_owned()).unwrap();
+            },
+        )
+        .unwrap();
+        let sample = vec![0, 1, 0, 0, 4, 0, 0, 0, b'f', b'o', b'o', 0];
+        crate::dds_utils::dds_write(writer.entity, sample.clone()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (retired_tx, retired_rx) = mpsc::channel();
+        let retiring = std::thread::spawn(move || {
+            drop(reader);
+            retired_tx.send(()).unwrap();
+        });
+        let retired = retired_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        // Always release the deliberately blocked forwarding callback, even if
+        // a regression kept its lifecycle borrow and prevented retirement.
+        release.wait();
+        let received = sample_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        retiring.join().unwrap();
+        drop(writer);
+        delete_dds_entity(participant).unwrap();
+        delete_dds_entity(domain).unwrap();
+        assert!(
+            retired,
+            "forwarding held the periodic reader's retirement fence"
+        );
+        assert_eq!(
+            received, sample,
+            "sample must remain valid after reader deletion"
+        );
     }
 
     #[test]
