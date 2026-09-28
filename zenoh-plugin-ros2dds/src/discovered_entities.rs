@@ -98,6 +98,7 @@ impl DiscoveredEntities {
         })
     }
 
+    #[inline]
     pub fn add_participant(&mut self, participant: DdsParticipant) -> Vec<ROS2DiscoveryEvent> {
         let gid = participant.key;
         self.admin_space.insert(
@@ -108,6 +109,7 @@ impl DiscoveredEntities {
         self.reconcile_participant(gid)
     }
 
+    #[inline]
     pub fn remove_participant(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
         self.participants.remove(gid);
         self.ros_participant_info.remove(gid);
@@ -130,6 +132,7 @@ impl DiscoveredEntities {
         events
     }
 
+    #[inline]
     pub fn add_writer(&mut self, writer: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
         let participant = writer.participant_key;
         self.admin_space.insert(
@@ -146,10 +149,12 @@ impl DiscoveredEntities {
         self.reconcile_participant(participant)
     }
 
+    #[inline]
     pub fn get_writer(&self, gid: &Gid) -> Option<&DdsEntity> {
         self.writers.get(gid)
     }
 
+    #[inline]
     pub fn remove_writer(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
         match self.writers.remove(gid) {
             Some(writer) => {
@@ -168,6 +173,7 @@ impl DiscoveredEntities {
         }
     }
 
+    #[inline]
     pub fn add_reader(&mut self, reader: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
         let participant = reader.participant_key;
         self.admin_space.insert(
@@ -184,10 +190,12 @@ impl DiscoveredEntities {
         self.reconcile_participant(participant)
     }
 
+    #[inline]
     pub fn get_reader(&self, gid: &Gid) -> Option<&DdsEntity> {
         self.readers.get(gid)
     }
 
+    #[inline]
     pub fn remove_reader(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
         match self.readers.remove(gid) {
             Some(reader) => {
