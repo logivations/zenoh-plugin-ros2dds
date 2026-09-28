@@ -73,50 +73,21 @@ impl DiscoveryMgr {
             loop {
                 select!(
                     evt = dds_disco_rcv.recv_async() => {
-                        match evt.unwrap() {
-                            DDSDiscoveryEvent::DiscoveredParticipant {entity} => {
-                                zwrite!(discovered_entities).add_participant(entity);
-                            },
-                            DDSDiscoveryEvent::UndiscoveredParticipant {key} => {
-                                let evts = zwrite!(discovered_entities).remove_participant(&key);
-                                for e in evts {
-                                    if let Err(err) = evt_sender.try_send(e) {
-                                        tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
-                                    }
-                                }
-                            },
-                            DDSDiscoveryEvent::DiscoveredPublication{entity} => {
-                                let e = zwrite!(discovered_entities).add_writer(entity);
-                                if let Some(e) = e {
-                                    if let Err(err) = evt_sender.try_send(e) {
-                                        tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
-                                    }
-                                }
-                            },
-                            DDSDiscoveryEvent::UndiscoveredPublication{key} => {
-                                let e = zwrite!(discovered_entities).remove_writer(&key);
-                                if let Some(e) = e {
-                                    if let Err(err) = evt_sender.try_send(e) {
-                                        tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
-                                    }
-                                }
-                            },
-                            DDSDiscoveryEvent::DiscoveredSubscription {entity} => {
-                                let e = zwrite!(discovered_entities).add_reader(entity);
-                                if let Some(e) = e {
-                                    if let Err(err) = evt_sender.try_send(e) {
-                                        tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
-                                    }
-                                }
-                            },
-                            DDSDiscoveryEvent::UndiscoveredSubscription {key} => {
-                                let e = zwrite!(discovered_entities).remove_reader(&key);
-                                if let Some(e) = e {
-                                    if let Err(err) = evt_sender.try_send(e) {
-                                        tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
-                                    }
-                                }
-                            },
+                        let events = {
+                            let mut entities = zwrite!(discovered_entities);
+                            match evt.unwrap() {
+                                DDSDiscoveryEvent::DiscoveredParticipant { entity } => entities.add_participant(entity),
+                                DDSDiscoveryEvent::UndiscoveredParticipant { key } => entities.remove_participant(&key),
+                                DDSDiscoveryEvent::DiscoveredPublication { entity } => entities.add_writer(entity),
+                                DDSDiscoveryEvent::UndiscoveredPublication { key } => entities.remove_writer(&key),
+                                DDSDiscoveryEvent::DiscoveredSubscription { entity } => entities.add_reader(entity),
+                                DDSDiscoveryEvent::UndiscoveredSubscription { key } => entities.remove_reader(&key),
+                            }
+                        };
+                        for event in events {
+                            if let Err(error) = evt_sender.try_send(event) {
+                                tracing::error!("Internal error: failed to send discovery event: {error}");
+                            }
                         }
                     }
 

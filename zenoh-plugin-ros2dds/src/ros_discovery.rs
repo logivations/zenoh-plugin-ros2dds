@@ -12,13 +12,11 @@ use cyclors::{
     qos::{Durability, History, IgnoreLocal, IgnoreLocalKind, Qos, Reliability, DDS_INFINITE_TIME},
     *,
 };
-use flume::{unbounded, Receiver, Sender};
-use futures::select;
 use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::task;
 use zenoh::{
     bytes::ZBytes,
-    internal::{zwrite, TimedEvent, Timer},
+    internal::{zread, zwrite},
 };
 
 //
@@ -38,10 +36,10 @@ use crate::{
     dds_types::DDSRawSample,
     gid::Gid,
     ros2_utils::{ros_distro_is_less_than, ROS_DISTRO},
-    ChannelEvent, ROS_DISCOVERY_INFO_PUSH_INTERVAL_MS,
+    ROS_DISCOVERY_INFO_PUSH_INTERVAL_MS,
 };
 use crate::{
-    dds_utils::{ddsrt_iov_len_from_usize, delete_dds_entity, get_guid},
+    dds_utils::{dds_write, delete_dds_entity, get_guid, MAX_DDS_WRITE_BLOCKING_TIME},
     ros2_utils::{USER_DATA_PROPS_SEPARATOR, USER_DATA_TYPEHASH_KEY},
 };
 
@@ -59,6 +57,28 @@ pub struct RosDiscoveryInfoMgr {
     // The ParticipantEntitiesInfo to publish on "ros_discovery_info" topic when changed,
     // plus a bool indicating if it changed
     participant_entities_state: Arc<RwLock<(ParticipantEntitiesInfo, bool)>>,
+}
+
+// Take one dirty snapshot without holding the graph lock across DDS I/O. Clearing
+// dirty before publication preserves concurrent edits; failed publication makes
+// the latest state dirty again, even if no further discovery event arrives.
+fn publish_graph_update(
+    state: &RwLock<(ParticipantEntitiesInfo, bool)>,
+    publish: impl FnOnce(&ParticipantEntitiesInfo) -> Result<(), String>,
+) -> Result<(), String> {
+    let snapshot = {
+        let mut state = zwrite!(state);
+        if !state.1 {
+            return Ok(());
+        }
+        state.1 = false;
+        state.0.clone()
+    };
+    if let Err(error) = publish(&snapshot) {
+        zwrite!(state).1 = true;
+        return Err(error);
+    }
+    Ok(())
 }
 
 impl Drop for RosDiscoveryInfoMgr {
@@ -142,7 +162,7 @@ impl RosDiscoveryInfoMgr {
             let mut qos = Qos::default();
             qos.reliability = Some(Reliability {
                 kind: qos::ReliabilityKind::RELIABLE,
-                max_blocking_time: DDS_INFINITE_TIME,
+                max_blocking_time: MAX_DDS_WRITE_BLOCKING_TIME,
             });
             qos.durability = Some(Durability {
                 kind: qos::DurabilityKind::TRANSIENT_LOCAL,
@@ -195,35 +215,45 @@ impl RosDiscoveryInfoMgr {
         let writer = self.writer;
         let participant_entities_state = self.participant_entities_state.clone();
         task::spawn(async move {
-            // Timer for periodic write of "ros_discovery_info" topic
-            let timer = Timer::default();
-            let (tx, ros_disco_timer_rcv): (Sender<()>, Receiver<()>) = unbounded();
-            let ros_disco_timer_event = TimedEvent::periodic(
-                Duration::from_millis(ROS_DISCOVERY_INFO_PUSH_INTERVAL_MS),
-                ChannelEvent { tx },
-            );
-            timer.add_async(ros_disco_timer_event).await;
-
+            let mut timer =
+                tokio::time::interval(Duration::from_millis(ROS_DISCOVERY_INFO_PUSH_INTERVAL_MS));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                select!(
-                    _ = ros_disco_timer_rcv.recv_async() => {
-                        let (ref msg, ref mut has_changed) = *zwrite!(participant_entities_state);
-                        if *has_changed {
-                            tracing::debug!("Publish update on 'ros_discovery_info' with {} writers and {} readers",
-                                msg.node_entities_info_seq.values().next().map_or(0, |n| n.writer_gid_seq.len()),
-                                msg.node_entities_info_seq.values().next().map_or(0, |n| n.reader_gid_seq.len())
-                            );
-                            tracing::trace!("Publish update on 'ros_discovery_info': {msg:?}");
-                            Self::write(writer, msg).unwrap_or_else(|e|
-                                tracing::error!("Failed to publish update on 'ros_discovery_info' topic: {e}")
-                            );
-                            *has_changed = false;
-                        }
-
-                    }
-                )
+                timer.tick().await;
+                if let Err(error) = publish_graph_update(&participant_entities_state, |msg| {
+                    tracing::trace!("Publish update on 'ros_discovery_info': {msg:?}");
+                    Self::write(writer, msg)
+                }) {
+                    tracing::error!("Failed to publish 'ros_discovery_info'; will retry: {error}");
+                }
             }
         });
+    }
+
+    pub(crate) fn publication_pending(&self) -> bool {
+        zread!(self.participant_entities_state).1
+    }
+
+    pub(crate) fn add_dds_pair(&self, reader: Gid, writer: Gid) {
+        let (ref mut info, ref mut has_changed) = *zwrite!(self.participant_entities_state);
+        let node = info
+            .node_entities_info_seq
+            .get_mut(&self.node_fullname)
+            .unwrap();
+        node.reader_gid_seq.insert(reader);
+        node.writer_gid_seq.insert(writer);
+        *has_changed = true;
+    }
+
+    pub(crate) fn remove_dds_pair(&self, reader: Gid, writer: Gid) {
+        let (ref mut info, ref mut has_changed) = *zwrite!(self.participant_entities_state);
+        let node = info
+            .node_entities_info_seq
+            .get_mut(&self.node_fullname)
+            .unwrap();
+        node.reader_gid_seq.remove(&reader);
+        node.writer_gid_seq.remove(&writer);
+        *has_changed = true;
     }
 
     pub fn add_dds_writer(&self, gid: Gid) {
@@ -285,11 +315,20 @@ impl RosDiscoveryInfoMgr {
                 let si = si.assume_init();
                 if si[0].valid_data {
                     let raw_sample = DDSRawSample::create(zp);
-
-                    // No need to deserialize the full payload. Just read the Participant gid (first 16 bytes of the payload)
-                    let gid = hex::encode(&raw_sample.payload_as_slice()[0..16]);
-
-                    map.insert(gid, raw_sample);
+                    // A queued graph sample from an already disposed writer must
+                    // not resurrect that participant's cached node membership.
+                    // Check the DDS source, independently of discovery-event order.
+                    let source =
+                        dds_get_matched_publication_data(self.reader, si[0].publication_handle);
+                    if !source.is_null() {
+                        if raw_sample.len() >= 20
+                            && raw_sample.payload_as_slice()[..16] == (*source).participant_key.v
+                        {
+                            let gid = hex::encode((*source).participant_key.v);
+                            map.insert(gid, raw_sample);
+                        }
+                        dds_builtintopic_free_endpoint(source);
+                    }
                 }
                 ddsi_serdata_unref(zp);
             }
@@ -331,46 +370,9 @@ impl RosDiscoveryInfoMgr {
     }
 
     fn write(writer: dds_entity_t, info: &ParticipantEntitiesInfo) -> Result<(), String> {
-        unsafe {
-            let buf = cdr::serialize::<_, _, CdrLe>(info, Infinite)
-                .map_err(|e| format!("Error serializing ParticipantEntitiesInfo: {e}"))?;
-
-            let mut sertype: *const ddsi_sertype = std::ptr::null_mut();
-            let ret = dds_get_entity_sertype(writer, &mut sertype);
-            if ret < 0 {
-                return Err(format!(
-                    "Error creating payload for ParticipantEntitiesInfo: {}",
-                    CStr::from_ptr(dds_strretcode(ret))
-                        .to_str()
-                        .unwrap_or("unrecoverable DDS retcode")
-                ));
-            }
-
-            // As per the Vec documentation (see https://doc.rust-lang.org/std/vec/struct.Vec.html#method.into_raw_parts)
-            // the only way to correctly releasing it is to create a vec using from_raw_parts
-            // and then have its destructor do the cleanup.
-            // Thus, while tempting to just pass the raw pointer to cyclone and then free it from C,
-            // that is not necessarily safe or guaranteed to be leak free.
-            // TODO replace when stable https://github.com/rust-lang/rust/issues/65816
-            let (ptr, len, capacity) = crate::vec_into_raw_parts(buf);
-            let size: ddsrt_iov_len_t = ddsrt_iov_len_from_usize(len)?;
-
-            let data_out = ddsrt_iovec_t {
-                iov_base: ptr as *mut std::ffi::c_void,
-                iov_len: size,
-            };
-
-            let fwdp = ddsi_serdata_from_ser_iov(
-                sertype,
-                ddsi_serdata_kind_SDK_DATA,
-                1,
-                &data_out,
-                size as usize,
-            );
-            dds_writecdr(writer, fwdp);
-            drop(Vec::from_raw_parts(ptr, len, capacity));
-            Ok(())
-        }
+        let buf = cdr::serialize::<_, _, CdrLe>(info, Infinite)
+            .map_err(|e| format!("Error serializing ParticipantEntitiesInfo: {e}"))?;
+        dds_write(writer, buf)
     }
 }
 
@@ -598,7 +600,113 @@ where
     Ok(map)
 }
 
+#[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn graph_state() -> RwLock<(ParticipantEntitiesInfo, bool)> {
+        RwLock::new((ParticipantEntitiesInfo::new(Gid::from([1; 16])), true))
+    }
+
+    #[test]
+    fn owned_pair_is_published_and_withdrawn_as_one_graph_update() {
+        use crate::dds_endpoint::{DdsEndpoint, DDS_TEST};
+        let _serial = DDS_TEST.lock().unwrap();
+        let config = CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+        let domain = unsafe { dds_create_domain(223, config.as_ptr()) };
+        let participant =
+            unsafe { dds_create_participant(223, std::ptr::null(), std::ptr::null()) };
+        assert!(domain > 0 && participant > 0);
+        let graph = Arc::new(RosDiscoveryInfoMgr::new(participant, "/", "pair_test").unwrap());
+        let mut reader = DdsEndpoint::reader(
+            participant,
+            "rq/pairRequest".into(),
+            "Request".into(),
+            &None,
+            true,
+            Qos::default(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let mut writer = DdsEndpoint::writer(
+            participant,
+            "rr/pairReply".into(),
+            "Reply".into(),
+            true,
+            Qos::default(),
+        )
+        .unwrap();
+        DdsEndpoint::advertise_pair(&mut reader, &mut writer, graph.clone());
+        publish_graph_update(&graph.participant_entities_state, |snapshot| {
+            let node = &snapshot.node_entities_info_seq["/pair_test"];
+            assert_eq!(
+                (node.reader_gid_seq.len(), node.writer_gid_seq.len()),
+                (1, 1)
+            );
+            // Retirement may occur while a previous snapshot is in flight.
+            DdsEndpoint::withdraw_pair(&mut reader, &mut writer);
+            Ok(())
+        })
+        .unwrap();
+        assert!(graph.publication_pending());
+        publish_graph_update(&graph.participant_entities_state, |snapshot| {
+            let node = &snapshot.node_entities_info_seq["/pair_test"];
+            assert!(node.reader_gid_seq.is_empty() && node.writer_gid_seq.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!graph.publication_pending());
+        drop((reader, writer, graph));
+        delete_dds_entity(participant).unwrap();
+        delete_dds_entity(domain).unwrap();
+    }
+
+    #[test]
+    fn failed_graph_publication_retries_without_another_discovery_event() {
+        let state = graph_state();
+        assert!(publish_graph_update(&state, |_| Err("injected write failure".into())).is_err());
+        assert!(state.read().unwrap().1);
+        let mut attempts = 0;
+        publish_graph_update(&state, |_| {
+            attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+        publish_graph_update(&state, |_| {
+            attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert!(!state.read().unwrap().1);
+    }
+
+    #[test]
+    fn graph_publication_does_not_lock_or_lose_concurrent_edits() {
+        let state = graph_state();
+        publish_graph_update(&state, |snapshot| {
+            assert!(snapshot.node_entities_info_seq.is_empty());
+            let mut latest = state
+                .try_write()
+                .expect("DDS I/O must not hold the graph lock");
+            latest.0.node_entities_info_seq.insert(
+                "/replacement".into(),
+                NodeEntitiesInfo::new("/".into(), "replacement".into()),
+            );
+            latest.1 = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(state.read().unwrap().1);
+        publish_graph_update(&state, |snapshot| {
+            assert!(snapshot.node_entities_info_seq.contains_key("/replacement"));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!state.read().unwrap().1);
+    }
+
     #[test]
     fn test_serde_prior_to_iron() {
         use std::str::FromStr;

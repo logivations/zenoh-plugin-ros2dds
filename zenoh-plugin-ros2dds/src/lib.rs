@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use cyclors::*;
 use events::ROS2AnnouncementEvent;
 use flume::{unbounded, Receiver, Sender};
-use futures::select;
+use futures::{select, FutureExt};
 use serde::Serializer;
 use tokio::task::JoinHandle;
 use zenoh::{
@@ -52,19 +52,24 @@ use zenoh_plugin_trait::{plugin_long_version, plugin_version, Plugin, PluginCont
 
 pub mod config;
 mod dds_discovery;
+mod dds_endpoint;
 mod dds_types;
 mod dds_utils;
 mod discovered_entities;
 mod discovery_mgr;
 mod events;
 mod gid;
+#[cfg(feature = "lifecycle-test-hooks")]
+mod lifecycle_test_hooks;
 mod liveliness_mgt;
 mod node_info;
+mod pending_queries;
 mod qos_helpers;
 mod ros2_utils;
 mod ros_discovery;
 mod route_action_cli;
 mod route_action_srv;
+mod route_lifecycle;
 mod route_publisher;
 mod route_service_cli;
 mod route_service_srv;
@@ -255,6 +260,11 @@ pub async fn run(runtime: DynamicRuntime, config: Config) {
     // But cannot be done twice in case of static link.
     zenoh::try_init_log_from_env();
     tracing::debug!("ROS2 plugin {}", ROS2Plugin::PLUGIN_VERSION);
+    tracing::info!(
+        build_id = env!("BRIDGE_BUILD_ID"),
+        test_hooks = cfg!(feature = "lifecycle-test-hooks"),
+        "ROS2DDS lifecycle build"
+    );
     tracing::info!("ROS2 plugin {config:?}");
 
     // Check config validity
@@ -481,8 +491,13 @@ impl ROS2PluginRuntime {
             admin_prefix.clone(),
         );
 
+        let matching_changed = routes_mgr.matching_changed();
+        let mut retry_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             select!(
+                _ = matching_changed.notified().fuse() => { routes_mgr.reconcile().await; },
+                _ = retry_tick.tick().fuse() => { routes_mgr.reconcile().await; },
                 evt = discovery_rcv.recv_async() => {
                     match evt {
                         Ok(evt) => {
@@ -666,22 +681,22 @@ impl ROS2PluginRuntime {
         if let Some(allowance) = &self.config.allowance {
             use ROS2DiscoveryEvent::*;
             match evt {
-                DiscoveredMsgPub(_, iface) | UndiscoveredMsgPub(_, iface) => {
+                DiscoveredMsgPub(_, _, iface) | UndiscoveredMsgPub(_, _, iface) => {
                     allowance.is_publisher_allowed(&iface.name)
                 }
-                DiscoveredMsgSub(_, iface) | UndiscoveredMsgSub(_, iface) => {
+                DiscoveredMsgSub(_, _, iface) | UndiscoveredMsgSub(_, _, iface) => {
                     allowance.is_subscriber_allowed(&iface.name)
                 }
-                DiscoveredServiceSrv(_, iface) | UndiscoveredServiceSrv(_, iface) => {
+                DiscoveredServiceSrv(_, _, iface) | UndiscoveredServiceSrv(_, _, iface) => {
                     allowance.is_service_srv_allowed(&iface.name)
                 }
-                DiscoveredServiceCli(_, iface) | UndiscoveredServiceCli(_, iface) => {
+                DiscoveredServiceCli(_, _, iface) | UndiscoveredServiceCli(_, _, iface) => {
                     allowance.is_service_cli_allowed(&iface.name)
                 }
-                DiscoveredActionSrv(_, iface) | UndiscoveredActionSrv(_, iface) => {
+                DiscoveredActionSrv(_, _, iface) | UndiscoveredActionSrv(_, _, iface) => {
                     allowance.is_action_srv_allowed(&iface.name)
                 }
-                DiscoveredActionCli(_, iface) | UndiscoveredActionCli(_, iface) => {
+                DiscoveredActionCli(_, _, iface) | UndiscoveredActionCli(_, _, iface) => {
                     allowance.is_action_cli_allowed(&iface.name)
                 }
             }

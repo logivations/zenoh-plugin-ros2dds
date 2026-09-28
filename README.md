@@ -262,5 +262,10 @@ This admin space can be queried via Zenoh `get()` operation. If the REST plugin 
 - `http://\<bridge-IP\>:8000/@/local/ros2/node/**` : to get all ROS nodes with their interfaces discovered by the bridge
 - `http://\<bridge-IP\>:8000/@/local/ros2/dds/**` : to get all the DDS Readers/Writers discovered by the bridge
 - `http://\<bridge-IP\>:8000/@/local/ros2/route/**` : to get all routes between ROS interfaces and Zenoh established by the bridge
+- `http://\<bridge-IP\>:8000/@/local/ros2/lifecycle` : build/session identity, reconciliation progress, owned resource counts and unrecoverable cleanup status
 - `http://\<bridge-IP\>:8000/@/*/ros2/node/**` : to get all ROS nodes discovered by all bridges
 - `http://\<bridge-IP\>:8000/@/*/ros2/route/**/cmd_vel` : to get all routes between established by all bridges on `cmd_vel` topic
+
+Lifecycle counters describe the bridge's ownership, not an independent DDS inventory
+or successful application requests. See [the lifecycle contract](LIFECYCLE.md) for
+their limits, cleanup failure recovery and regression tests.

@@ -13,22 +13,19 @@
 //
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc,
     },
+    time::{Duration, Instant},
 };
 
-use cyclors::dds_entity_t;
 use serde::Serialize;
 use zenoh::{
     bytes::ZBytes,
-    internal::{
-        buffers::{Buffer, ZBuf, ZSlice},
-        zwrite,
-    },
+    internal::buffers::{Buffer, ZBuf, ZSlice},
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
     query::{Query, Queryable},
@@ -36,17 +33,19 @@ use zenoh::{
 };
 
 use crate::{
+    dds_endpoint::{DdsAccess, DdsEndpoint},
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
-        create_dds_reader, create_dds_writer, dds_write, delete_dds_entity, get_guid,
-        get_instance_handle, is_cdr_little_endian, serialize_entity_guid, CDR_HEADER_BE,
-        CDR_HEADER_LE,
+        dds_write, get_instance_handle, is_cdr_little_endian, serialize_local_nodes, CDR_HEADER_LE,
     },
+    gid::Gid,
     liveliness_mgt::new_ke_liveliness_service_srv,
+    pending_queries::{self, PendingQueries, RETENTION_PARAMETER},
     ros2_utils::{
         is_service_for_action, new_service_id, ros2_service_type_to_reply_dds_type,
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
     },
+    route_lifecycle::{Retry, RouteLifecycle},
     routes_mgr::Context,
     serialize_option_as_bool, LOG_PAYLOAD,
 };
@@ -67,49 +66,31 @@ pub struct RouteServiceSrv {
     // `None` when route is created on a remote announcement and no local ROS2 Service Server discovered yet
     #[serde(rename = "is_active", serialize_with = "serialize_option_as_bool")]
     zenoh_queryable: Option<Queryable<()>>,
-    // the local DDS Writer sending requests to the service server
-    #[serde(serialize_with = "serialize_entity_guid")]
-    req_writer: dds_entity_t,
-    // the local DDS Reader receiving replies from the service server
-    #[serde(serialize_with = "serialize_entity_guid")]
-    rep_reader: dds_entity_t,
-    // the client GUID used in each request
+    #[serde(flatten, serialize_with = "serialize_proxy")]
+    proxy: Option<ServiceServerProxy>,
+    lifecycle: RouteLifecycle,
+    announcement_retry: Retry,
     #[serde(skip)]
-    client_guid: u64,
-    // the ROS sequence number for requests
-    #[serde(skip)]
-    sequence_number: Arc<AtomicU64>,
-    // queries waiting for a reply
-    #[serde(skip)]
-    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>>,
+    type_info: Option<Arc<TypeInfo>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
     // the list of remote routes served by this route ("<zenoh_id>:<zenoh_key_expr>"")
     remote_routes: HashSet<String>,
-    // the list of nodes served by this route
-    local_nodes: HashSet<String>,
+    // the list of nodes served by this route, keyed by (participant_gid, node_fullname) — #702.
+    #[serde(flatten, serialize_with = "serialize_local_nodes")]
+    local_nodes: HashSet<(Gid, String)>,
 }
 
 impl Drop for RouteServiceSrv {
     fn drop(&mut self) {
-        // remove writer's GID from ros_discovery_info message
-        match get_guid(&self.req_writer) {
-            Ok(gid) => self.context.ros_discovery_mgr.remove_dds_writer(gid),
-            Err(e) => tracing::warn!("{self}: {e}"),
+        // Fence data callbacks before unregistering their source. An already
+        // queued query can run after Queryable::drop, but cannot borrow DDS.
+        if let Some(proxy) = &self.proxy {
+            proxy.req_writer.fence();
         }
-        // remove reader's GID from ros_discovery_info message
-        match get_guid(&self.rep_reader) {
-            Ok(gid) => self.context.ros_discovery_mgr.remove_dds_reader(gid),
-            Err(e) => tracing::warn!("{self}: {e}"),
-        }
-
-        if let Err(e) = delete_dds_entity(self.req_writer) {
-            tracing::warn!("{}: error deleting DDS Writer:  {}", self, e);
-        }
-        if let Err(e) = delete_dds_entity(self.rep_reader) {
-            tracing::warn!("{}: error deleting DDS Reader:  {}", self, e);
-        }
+        self.zenoh_queryable.take();
+        self.proxy.take();
     }
 }
 
@@ -124,6 +105,12 @@ impl fmt::Display for RouteServiceSrv {
 }
 
 impl RouteServiceSrv {
+    pub(crate) fn endpoint_count(&self) -> usize {
+        usize::from(self.proxy.is_some()) * 2
+    }
+    pub(crate) fn is_active(&self) -> bool {
+        self.zenoh_queryable.is_some()
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,
@@ -135,83 +122,16 @@ impl RouteServiceSrv {
         let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
         tracing::debug!("{route_id}: creation with type {ros2_type}");
 
-        // Default Service QoS
-        let mut qos = QOS_DEFAULT_SERVICE.clone();
-
-        // Add DATA_USER QoS similarly to rmw_cyclone_dds here:
-        // https://github.com/ros2/rmw_cyclonedds/blob/2263814fab142ac19dd3395971fb1f358d22a653/rmw_cyclonedds_cpp/src/rmw_node.cpp#L5028C17-L5028C17
-        let client_id_str = new_service_id(&context.participant)?;
-        let user_data = format!("clientid= {client_id_str};");
-        qos.user_data = Some(user_data.into_bytes());
-
-        // create DDS Writer to send requests coming from Zenoh to the Service
-        let req_topic_name = format!("rq{ros2_name}Request");
-        let req_type_name = ros2_service_type_to_request_dds_type(&ros2_type);
-        let req_writer = create_dds_writer(
-            context.participant,
-            req_topic_name,
-            req_type_name,
-            true,
-            qos.clone(),
-        )?;
-        // add writer's GID in ros_discovery_info message
-        context
-            .ros_discovery_mgr
-            .add_dds_writer(get_guid(&req_writer)?);
-
-        // client_guid used in requests; use dds_instance_handle of writer as rmw_cyclonedds here:
-        // https://github.com/ros2/rmw_cyclonedds/blob/2263814fab142ac19dd3395971fb1f358d22a653/rmw_cyclonedds_cpp/src/rmw_node.cpp#L4848
-        let client_guid = get_instance_handle(req_writer)?;
-
-        tracing::debug!(
-            "{route_id}: (local client_guid={client_guid:02x?})  id='{client_id_str}' => USER_DATA={:?}",
-            qos.user_data.as_ref().unwrap()
-        );
-
-        // map of queries in progress
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
-        // create DDS Reader to receive replies and route them to Zenoh
-        let rep_topic_name = format!("rr{ros2_name}Reply");
-        let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
-        let rep_reader = create_dds_reader(
-            context.participant,
-            rep_topic_name,
-            rep_type_name,
-            type_info,
-            true,
-            qos,
-            None,
-            {
-                let queries_in_progress = queries_in_progress.clone();
-                let zenoh_key_expr = zenoh_key_expr.clone();
-                move |sample| {
-                    route_dds_reply_to_zenoh(
-                        sample,
-                        zenoh_key_expr.clone(),
-                        &mut zwrite!(queries_in_progress),
-                        &route_id,
-                    );
-                }
-            },
-        )?;
-        // add reader's GID in ros_discovery_info message
-        context
-            .ros_discovery_mgr
-            .add_dds_reader(get_guid(&rep_reader)?);
-
         Ok(RouteServiceSrv {
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             context,
             zenoh_queryable: None,
-            req_writer,
-            rep_reader,
-            client_guid,
-            sequence_number: Arc::new(AtomicU64::default()),
-            queries_in_progress,
+            proxy: None,
+            lifecycle: RouteLifecycle::new(),
+            announcement_retry: Retry::new(),
+            type_info: type_info.clone(),
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
@@ -230,24 +150,29 @@ impl RouteServiceSrv {
 
         // create the zenoh Queryable
         // if Reader is TRANSIENT_LOCAL, use a PublicationCache to store historical data
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
-            self.queries_in_progress.clone();
-        let sequence_number: Arc<AtomicU64> = self.sequence_number.clone();
+        let proxy = self.proxy.as_ref().ok_or("DDS proxy not available")?;
+        let queries_in_progress = proxy.queries_in_progress.clone();
+        let sequence_number = proxy.sequence_number.clone();
         let route_id: String = self.to_string();
-        let client_guid = self.client_guid;
-        let req_writer: i32 = self.req_writer;
-        self.zenoh_queryable = Some(
+        let client_guid = proxy.client_guid;
+        let req_writer = proxy.req_writer.access();
+        let retention = self
+            .context
+            .config
+            .get_incoming_query_retention(&self.ros2_name);
+        let queryable = Some(
             self.context
                 .zsession
                 .declare_queryable(&self.zenoh_key_expr)
                 .callback(move |query| {
                     route_zenoh_request_to_dds(
                         query,
-                        &mut zwrite!(queries_in_progress),
+                        &queries_in_progress,
                         &sequence_number,
                         &route_id,
                         client_guid,
-                        req_writer,
+                        &req_writer,
+                        retention,
                     )
                 })
                 .await
@@ -280,14 +205,49 @@ impl RouteServiceSrv {
                 })?
             );
         }
+        self.zenoh_queryable = queryable;
         Ok(())
+    }
+
+    pub(crate) async fn reconcile(&mut self) {
+        if let Some(proxy) = &self.proxy {
+            let expired = proxy.queries_in_progress.expire(Instant::now());
+            if expired != 0 {
+                tracing::debug!(route = %self, expired, "Incoming service queries expired");
+            }
+        }
+        let route_id = self.to_string();
+        // A retained server route exposes a local client pair even before a
+        // local server appears, so DDS discovery can converge in either order.
+        self.lifecycle.set_desired(true);
+        if let Err(error) = self.lifecycle.reconcile(&mut self.proxy, || {
+            create_proxy(
+                &self.ros2_name,
+                &self.ros2_type,
+                &self.zenoh_key_expr,
+                &route_id,
+                &self.context,
+                &self.type_info,
+            )
+        }) {
+            self.lifecycle.log_activation_failure(&route_id, &error);
+        }
+        if !self.local_nodes.is_empty()
+            && self.proxy.is_some()
+            && self.zenoh_queryable.is_none()
+            && self.announcement_retry.ready()
+        {
+            let result = self.announce_route().await;
+            if let Err(error) = self.announcement_retry.record(result) {
+                tracing::error!("{route_id}: announcement failed: {error}");
+            }
+        }
     }
 
     // Retire the route over Zenoh removing the LivelinessToken
     fn retire_route(&mut self) {
         tracing::debug!("{self} retire");
-        // Drop Zenoh Publisher and Liveliness token
-        // The DDS Writer remains to be discovered by local ROS nodes
+        // Withdraw the announcement; DDS resources follow retained route demand.
         self.zenoh_queryable = None;
         self.liveliness_token = None;
     }
@@ -312,24 +272,20 @@ impl RouteServiceSrv {
     }
 
     #[inline]
-    pub async fn add_local_node(&mut self, node: String) {
-        self.local_nodes.insert(node);
+    pub async fn add_local_node(&mut self, node_key: (Gid, String)) {
+        self.local_nodes.insert(node_key);
         tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
-        // if 1st local node added, activate the route
-        if self.local_nodes.len() == 1 {
-            if let Err(e) = self.announce_route().await {
-                tracing::error!("{self} activation failed: {e}");
-            }
-        }
+        self.reconcile().await;
     }
 
     #[inline]
-    pub fn remove_local_node(&mut self, node: &str) {
-        self.local_nodes.remove(node);
-        tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
-        // if last local node removed, deactivate the route
-        if self.local_nodes.is_empty() {
-            self.retire_route();
+    pub fn remove_local_node(&mut self, node_key: &(Gid, String)) {
+        if self.local_nodes.remove(node_key) {
+            tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
+            // if last local node removed, deactivate the route
+            if self.local_nodes.is_empty() {
+                self.retire_route();
+            }
         }
     }
 
@@ -344,22 +300,101 @@ impl RouteServiceSrv {
     }
 }
 
+struct ServiceServerProxy {
+    rep_reader: DdsEndpoint,
+    req_writer: DdsEndpoint,
+    client_guid: u64,
+    sequence_number: Arc<AtomicU64>,
+    queries_in_progress: Arc<PendingQueries>,
+}
+impl Drop for ServiceServerProxy {
+    fn drop(&mut self) {
+        self.req_writer.fence();
+        DdsEndpoint::withdraw_pair(&mut self.rep_reader, &mut self.req_writer);
+    }
+}
+fn serialize_proxy<S: serde::Serializer>(
+    proxy: &Option<ServiceServerProxy>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = s.serialize_map(Some(4))?;
+    if let Some(proxy) = proxy {
+        map.serialize_entry("req_writer", &proxy.req_writer)?;
+        map.serialize_entry("rep_reader", &proxy.rep_reader)?;
+        let (pending, expired) = proxy.queries_in_progress.counts();
+        map.serialize_entry("pending_queries", &pending)?;
+        map.serialize_entry("expired_queries", &expired)?;
+    } else {
+        map.serialize_entry("req_writer", "")?;
+        map.serialize_entry("rep_reader", "")?;
+        map.serialize_entry("pending_queries", &0usize)?;
+        map.serialize_entry("expired_queries", &0u64)?;
+    }
+    map.end()
+}
+fn create_proxy(
+    ros2_name: &str,
+    ros2_type: &str,
+    zenoh_key_expr: &OwnedKeyExpr,
+    route_id: &str,
+    context: &Context,
+    type_info: &Option<Arc<TypeInfo>>,
+) -> Result<ServiceServerProxy, String> {
+    let mut qos = QOS_DEFAULT_SERVICE.clone();
+    qos.user_data =
+        Some(format!("clientid= {};", new_service_id(&context.participant)?).into_bytes());
+    let req_writer = DdsEndpoint::writer(
+        context.participant,
+        format!("rq{ros2_name}Request"),
+        ros2_service_type_to_request_dds_type(ros2_type),
+        true,
+        qos.clone(),
+    )?;
+    let client_guid = get_instance_handle(req_writer.entity())?;
+    let queries_in_progress = Arc::new(PendingQueries::default());
+    let pending = queries_in_progress.clone();
+    let route_id = route_id.to_owned();
+    let key = zenoh_key_expr.clone();
+    let rep_reader = DdsEndpoint::reader(
+        context.participant,
+        format!("rr{ros2_name}Reply"),
+        ros2_service_type_to_reply_dds_type(ros2_type),
+        type_info,
+        true,
+        qos,
+        None,
+        move |sample| route_dds_reply_to_zenoh(sample, key.clone(), &pending, &route_id),
+    )?;
+    let mut proxy = ServiceServerProxy {
+        rep_reader,
+        req_writer,
+        client_guid,
+        queries_in_progress,
+        sequence_number: Arc::new(AtomicU64::new(0)),
+    };
+    DdsEndpoint::advertise_pair(
+        &mut proxy.rep_reader,
+        &mut proxy.req_writer,
+        context.ros_discovery_mgr.clone(),
+    );
+    Ok(proxy)
+}
+
 fn route_zenoh_request_to_dds(
     query: Query,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &PendingQueries,
     sequence_number: &AtomicU64,
     route_id: &str,
     client_guid: u64,
-    req_writer: i32,
+    req_writer: &DdsAccess,
+    retention: Duration,
 ) {
-    // Get expected endianness from the query value:
-    // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
-    let is_little_endian = match query.payload() {
-        Some(value) if value.len() > 4 => {
-            is_cdr_little_endian(value.to_bytes().as_ref()).unwrap_or(true)
-        }
-        _ => true,
-    };
+    // Empty service requests may contain only the four-byte CDR header.
+    let is_little_endian = query
+        .payload()
+        .and_then(|value| is_cdr_little_endian(value.to_bytes().as_ref()))
+        .unwrap_or(true);
 
     // Try to get request_id from Query attachment (in case it comes from another bridge).
     // Otherwise, create one using client_guid + sequence_number
@@ -367,11 +402,7 @@ fn route_zenoh_request_to_dds(
         .attachment()
         .and_then(|a| CddsRequestHeader::try_from(a).ok())
         .unwrap_or_else(|| {
-            CddsRequestHeader::create(
-                client_guid,
-                sequence_number.fetch_add(1, Ordering::Relaxed),
-                is_little_endian,
-            )
+            CddsRequestHeader::create(client_guid, sequence_number.fetch_add(1, Ordering::Relaxed))
         });
 
     // prepend request payload with a (client_guid, sequence_number) header as per rmw_cyclonedds here:
@@ -391,7 +422,7 @@ fn route_zenoh_request_to_dds(
         //  - the remaining of query payload
         let mut dds_req_buf: Vec<u8> = Vec::new();
         dds_req_buf.extend_from_slice(&zenoh_req_buf[..4]);
-        dds_req_buf.extend_from_slice(request_id.as_slice());
+        dds_req_buf.extend_from_slice(&request_id.to_bytes(is_little_endian));
         dds_req_buf.extend_from_slice(&zenoh_req_buf[4..]);
         dds_req_buf
     } else {
@@ -399,12 +430,8 @@ fn route_zenoh_request_to_dds(
         // Send to DDS a buffer made of
         //  - a CDR header
         //  - the request_id as request header
-        let mut dds_req_buf: Vec<u8> = if request_id.is_little_endian() {
-            CDR_HEADER_LE.into()
-        } else {
-            CDR_HEADER_BE.into()
-        };
-        dds_req_buf.extend_from_slice(request_id.as_slice());
+        let mut dds_req_buf: Vec<u8> = CDR_HEADER_LE.into();
+        dds_req_buf.extend_from_slice(&request_id.to_bytes(is_little_endian));
         dds_req_buf
     };
 
@@ -419,17 +446,29 @@ fn route_zenoh_request_to_dds(
         );
     }
 
-    queries_in_progress.insert(request_id, query);
-    if let Err(e) = dds_write(req_writer, dds_req_buf) {
-        tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
-        queries_in_progress.remove(&request_id);
-    }
+    let deadline = pending_queries::deadline(
+        query.parameters().get(RETENTION_PARAMETER),
+        retention,
+        Instant::now(),
+    );
+    let completed = req_writer.with(|writer| {
+        let replaced = queries_in_progress.insert(request_id, query, deadline);
+        let failed = if let Err(e) = dds_write(writer, dds_req_buf) {
+            tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
+            queries_in_progress.take(&request_id)
+        } else {
+            None
+        };
+        (replaced, failed)
+    });
+    // Both replacement and failed-write cleanup can send a response-final.
+    drop(completed);
 }
 
 fn route_dds_reply_to_zenoh(
     sample: &DDSRawSample,
     zenoh_key_expr: OwnedKeyExpr,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &PendingQueries,
     route_id: &str,
 ) {
     // Reply payload is expected to be the Response type encoded as CDR, including a 4 bytes CDR header,
@@ -457,7 +496,8 @@ fn route_dds_reply_to_zenoh(
     };
 
     // Check if it's one of my queries in progress. Drop otherwise
-    match queries_in_progress.remove(&request_id) {
+    let query = queries_in_progress.take(&request_id);
+    match query {
         Some(query) => {
             // route reply buffer stripped from request_id
             let mut zenoh_rep_buf = ZBuf::empty();

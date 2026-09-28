@@ -13,7 +13,8 @@
 //
 use std::{
     collections::{hash_map::Entry, HashMap},
-    sync::{Arc, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cyclors::{
@@ -82,10 +83,15 @@ pub struct Context {
     pub(crate) discovered_entities: Arc<RwLock<DiscoveredEntities>>,
     // ros_discovery_info read/write manager
     pub(crate) ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
+    pub(crate) matching_changed: Arc<tokio::sync::Notify>,
 }
 
 pub struct RoutesMgr {
     context: Context,
+    started: Instant,
+    started_unix_ms: u128,
+    last_reconciled: Instant,
+    reconciliation_sequence: u64,
     // maps of established routes - ecah map indexed by topic/service/action name
     routes_publishers: HashMap<String, RoutePublisher>,
     routes_subscribers: HashMap<String, RouteSubscriber>,
@@ -114,10 +120,18 @@ impl RoutesMgr {
             participant,
             discovered_entities,
             ros_discovery_mgr,
+            matching_changed: Arc::new(tokio::sync::Notify::new()),
         };
 
         RoutesMgr {
             context,
+            started: Instant::now(),
+            started_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            last_reconciled: Instant::now(),
+            reconciliation_sequence: 0,
             routes_publishers: HashMap::new(),
             routes_subscribers: HashMap::new(),
             routes_service_srv: HashMap::new(),
@@ -129,13 +143,87 @@ impl RoutesMgr {
         }
     }
 
+    pub(crate) fn matching_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.context.matching_changed.clone()
+    }
+
+    pub(crate) async fn reconcile(&mut self) {
+        #[cfg(feature = "lifecycle-test-hooks")]
+        self.inject_test_fault();
+        for route in self.routes_publishers.values_mut() {
+            route.reconcile().await;
+        }
+        for route in self.routes_service_cli.values_mut() {
+            route.reconcile().await;
+        }
+        for route in self.routes_subscribers.values_mut() {
+            route.reconcile().await;
+        }
+        for route in self.routes_service_srv.values_mut() {
+            route.reconcile().await;
+        }
+        for route in self.routes_action_cli.values_mut() {
+            route.reconcile().await;
+        }
+        for route in self.routes_action_srv.values_mut() {
+            route.reconcile().await;
+        }
+        self.last_reconciled = Instant::now();
+        self.reconciliation_sequence = self.reconciliation_sequence.saturating_add(1);
+    }
+
+    #[cfg(feature = "lifecycle-test-hooks")]
+    fn inject_test_fault(&mut self) {
+        use crate::{
+            dds_endpoint::{self, DdsEndpoint},
+            lifecycle_test_hooks::{self, Command},
+        };
+        let Some((path, command)) = lifecycle_test_hooks::control() else {
+            return;
+        };
+        let result = command.and_then(|command| match command {
+            Command::InvalidateReader { service } => self
+                .routes_service_cli
+                .get(&service)
+                .ok_or_else(|| format!("No retained service client {service}"))?
+                .invalidate_reader_for_test(),
+            Command::OrphanWriter => DdsEndpoint::writer(
+                self.context.participant,
+                "rt/repro_orphan".into(),
+                "std_msgs::msg::dds_::String_".into(),
+                true,
+                cyclors::qos::Qos::default(),
+            )
+            .map(std::mem::forget),
+            Command::RetireSubscriber { topic } => {
+                self.admin_space.retain(
+                    |_, route| !matches!(route, RouteRef::Subscriber(name) if name == &topic),
+                );
+                self.routes_subscribers
+                    .remove(&topic)
+                    .ok_or_else(|| format!("No subscriber {topic} to retire"))?;
+                Ok(())
+            }
+            Command::FailCreation { after } => {
+                dds_endpoint::fault::fail_after(after);
+                Ok(())
+            }
+            Command::PauseCreation { after } => {
+                lifecycle_test_hooks::arm_pause(after);
+                Ok(())
+            }
+        });
+        tracing::warn!("LAB-ONLY lifecycle fault: {result:?}");
+        lifecycle_test_hooks::acknowledge(path, result);
+    }
+
     pub async fn on_ros_discovery_event(
         &mut self,
         event: ROS2DiscoveryEvent,
     ) -> Result<(), String> {
         use ROS2DiscoveryEvent::*;
         match event {
-            DiscoveredMsgPub(node, iface) => {
+            DiscoveredMsgPub(participant, node, iface) => {
                 // Pick 1 discovered Writer amongst the possibly multiple ones listed in MsgPub
                 let entity = {
                     let entities = zread!(self.context.discovered_entities);
@@ -157,7 +245,7 @@ impl RoutesMgr {
                                 true,
                             )
                             .await?;
-                        route.add_local_node(node, &entity.qos).await;
+                        route.add_local_node((participant, node), &entity.qos).await;
                     }
                     None => {
                         return Err(format!(
@@ -168,11 +256,11 @@ impl RoutesMgr {
                 }
             }
 
-            UndiscoveredMsgPub(node, iface) => {
+            UndiscoveredMsgPub(participant, node, iface) => {
                 if let Entry::Occupied(mut entry) = self.routes_publishers.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
-                    route.remove_local_node(&node);
+                    route.remove_local_node(&(participant, node));
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_PUBLISHER / iface.name_as_keyexpr()));
@@ -182,7 +270,7 @@ impl RoutesMgr {
                 }
             }
 
-            DiscoveredMsgSub(node, iface) => {
+            DiscoveredMsgSub(participant, node, iface) => {
                 // Pick 1 discovered Reader amongst the possibly multiple ones listed in MsgSub
                 let entity = {
                     let entities = zread!(self.context.discovered_entities);
@@ -204,7 +292,7 @@ impl RoutesMgr {
                                 true,
                             )
                             .await?;
-                        route.add_local_node(node, &entity.qos).await;
+                        route.add_local_node((participant, node), &entity.qos).await;
                     }
                     None => {
                         return Err(format!(
@@ -215,12 +303,12 @@ impl RoutesMgr {
                 }
             }
 
-            UndiscoveredMsgSub(node, iface) => {
+            UndiscoveredMsgSub(participant, node, iface) => {
                 if let Entry::Occupied(mut entry) =
                     self.routes_subscribers.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
-                    route.remove_local_node(&node);
+                    route.remove_local_node(&(participant, node));
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_SUBSCRIBER / iface.name_as_keyexpr()));
@@ -229,19 +317,19 @@ impl RoutesMgr {
                     }
                 }
             }
-            DiscoveredServiceSrv(node, iface) => {
+            DiscoveredServiceSrv(participant, node, iface) => {
                 // Get route (create it if not yet exists)
                 let route = self
                     .get_or_create_route_service_srv(iface.name, iface.typ, true)
                     .await?;
-                route.add_local_node(node).await;
+                route.add_local_node((participant, node)).await;
             }
-            UndiscoveredServiceSrv(node, iface) => {
+            UndiscoveredServiceSrv(participant, node, iface) => {
                 if let Entry::Occupied(mut entry) =
                     self.routes_service_srv.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
-                    route.remove_local_node(&node);
+                    route.remove_local_node(&(participant, node));
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_SERVICE_SRV / iface.name_as_keyexpr()));
@@ -250,19 +338,19 @@ impl RoutesMgr {
                     }
                 }
             }
-            DiscoveredServiceCli(node, iface) => {
+            DiscoveredServiceCli(participant, node, iface) => {
                 // Get route (create it if not yet exists)
                 let route = self
                     .get_or_create_route_service_cli(iface.name, iface.typ, true)
                     .await?;
-                route.add_local_node(node).await;
+                route.add_local_node((participant, node)).await;
             }
-            UndiscoveredServiceCli(node, iface) => {
+            UndiscoveredServiceCli(participant, node, iface) => {
                 if let Entry::Occupied(mut entry) =
                     self.routes_service_cli.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
-                    route.remove_local_node(&node);
+                    route.remove_local_node(&(participant, node));
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_SERVICE_CLI / iface.name_as_keyexpr()));
@@ -271,18 +359,18 @@ impl RoutesMgr {
                     }
                 }
             }
-            DiscoveredActionSrv(node, iface) => {
+            DiscoveredActionSrv(participant, node, iface) => {
                 // Get route (create it if not yet exists)
                 let route = self
                     .get_or_create_route_action_srv(iface.name, iface.typ)
                     .await?;
-                route.add_local_node(node).await;
+                route.add_local_node((participant, node)).await;
             }
-            UndiscoveredActionSrv(node, iface) => {
+            UndiscoveredActionSrv(participant, node, iface) => {
                 if let Entry::Occupied(mut entry) = self.routes_action_srv.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
-                    route.remove_local_node(&node);
+                    route.remove_local_node(&(participant, node));
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_ACTION_SRV / iface.name_as_keyexpr()));
@@ -291,18 +379,18 @@ impl RoutesMgr {
                     }
                 }
             }
-            DiscoveredActionCli(node, iface) => {
+            DiscoveredActionCli(participant, node, iface) => {
                 // Get route (create it if not yet exists)
                 let route = self
                     .get_or_create_route_action_cli(iface.name, iface.typ)
                     .await?;
-                route.add_local_node(node).await;
+                route.add_local_node((participant, node)).await;
             }
-            UndiscoveredActionCli(node, iface) => {
+            UndiscoveredActionCli(participant, node, iface) => {
                 if let Entry::Occupied(mut entry) = self.routes_action_cli.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
-                    route.remove_local_node(&node);
+                    route.remove_local_node(&(participant, node));
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_ACTION_CLI / iface.name_as_keyexpr()));
@@ -509,7 +597,7 @@ impl RoutesMgr {
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_CLI / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_CLI / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -544,7 +632,7 @@ impl RoutesMgr {
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_SRV / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_SRV / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -760,7 +848,77 @@ impl RoutesMgr {
         }
     }
 
+    fn lifecycle_health(&self) -> serde_json::Value {
+        use crate::dds_endpoint::{CLEANUP_FAILURES, LIVE_ENDPOINTS, LIVE_LISTENERS, LIVE_TOPICS};
+        let owned = self
+            .routes_publishers
+            .values()
+            .map(RoutePublisher::endpoint_count)
+            .sum::<usize>()
+            + self
+                .routes_subscribers
+                .values()
+                .map(RouteSubscriber::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_service_cli
+                .values()
+                .map(RouteServiceCli::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_service_srv
+                .values()
+                .map(RouteServiceSrv::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_action_cli
+                .values()
+                .map(RouteActionCli::endpoint_count)
+                .sum::<usize>()
+            + self
+                .routes_action_srv
+                .values()
+                .map(RouteActionSrv::endpoint_count)
+                .sum::<usize>();
+        serde_json::json!({
+            "schema_version": 1,
+            "test_hooks": cfg!(feature = "lifecycle-test-hooks"),
+            "build_id": env!("BRIDGE_BUILD_ID"),
+            "base_version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "started_unix_ms": self.started_unix_ms,
+            "uptime_ms": self.started.elapsed().as_millis(),
+            "zid": self.context.zsession.zid().to_string(),
+            "participant": crate::dds_utils::get_guid(&self.context.participant).ok(),
+            "reconciliation_sequence": self.reconciliation_sequence,
+            "reconciliation_age_ms": self.last_reconciled.elapsed().as_millis(),
+            "routes": self.admin_space.len(),
+            "owned_dds_endpoints": owned,
+            "live_dds_endpoints": LIVE_ENDPOINTS.load(Ordering::Acquire),
+            "owned_topic_references": LIVE_TOPICS.load(Ordering::Acquire),
+            "dds_callback_allocations": LIVE_LISTENERS.load(Ordering::Acquire),
+            "owned_matching_listeners": self.routes_publishers.len() + self.routes_service_cli.len()
+                + self.routes_action_cli.len() * 3 + self.routes_action_srv.len() * 2,
+            "cleanup_failures": CLEANUP_FAILURES.load(Ordering::Acquire),
+            "recovery_required": CLEANUP_FAILURES.load(Ordering::Acquire) != 0,
+            "dds_write_failures": crate::dds_utils::DDS_WRITE_FAILURES.load(Ordering::Relaxed),
+            "ros_graph_pending": self.context.ros_discovery_mgr.publication_pending(),
+            "discovery": zread!(self.context.discovered_entities).counts(),
+        })
+    }
+
     pub async fn treat_admin_query(&self, query: &Query) {
+        let health_key = &self.admin_prefix / unsafe { keyexpr::from_str_unchecked("lifecycle") };
+        if query.key_expr().intersects(&health_key) {
+            let bytes = serde_json::to_vec(&self.lifecycle_health()).expect("lifecycle JSON value");
+            if let Err(error) = query
+                .reply(health_key, bytes)
+                .encoding(Encoding::APPLICATION_JSON)
+                .await
+            {
+                tracing::warn!("Unable to reply to lifecycle health query: {error}");
+            }
+        }
         let selector = query.selector();
 
         // get the list of sub-key expressions that will match the same stored keys than
@@ -853,5 +1011,56 @@ impl RoutesMgr {
                 .map(serde_json::to_value)
                 .transpose(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dds_endpoint::DDS_TEST;
+    use crate::dds_utils::delete_dds_entity;
+    use cyclors::{dds_create_domain, dds_create_participant};
+
+    #[test]
+    fn action_retirement_removes_the_route_and_its_admin_entry() {
+        let _serial = DDS_TEST.lock().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let xml = std::ffi::CString::new("<CycloneDDS><Domain><General><Interfaces><NetworkInterface address='127.0.0.1'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery></Domain></CycloneDDS>").unwrap();
+            let domain = unsafe { dds_create_domain(224, xml.as_ptr()) };
+            let participant = unsafe { dds_create_participant(224, std::ptr::null(), std::ptr::null()) };
+            assert!(domain > 0 && participant > 0);
+            let mut config = zenoh::Config::default();
+            config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+            config.insert_json5("listen/endpoints", "[]").unwrap();
+            config.insert_json5("timestamping/enabled", "true").unwrap();
+            let session = Arc::new(zenoh::open(config).await.unwrap());
+            let graph = Arc::new(RosDiscoveryInfoMgr::new(participant, "/", "actions_test").unwrap());
+            let mut manager = RoutesMgr::new(
+                Arc::new(serde_json::from_str("{}").unwrap()), session.clone(), participant,
+                Arc::new(RwLock::new(DiscoveredEntities::default())), graph,
+                OwnedKeyExpr::try_from("@/test/ros2").unwrap(),
+            );
+            let zenoh_id = OwnedKeyExpr::try_from("remote").unwrap();
+            let zenoh_key_expr = OwnedKeyExpr::try_from("test/fibonacci").unwrap();
+            let ros2_type = "example_interfaces/action/Fibonacci".to_string();
+            use ROS2AnnouncementEvent::*;
+            for (announce, retire, prefix) in [
+                (AnnouncedActionSrv { zenoh_id: zenoh_id.clone(), zenoh_key_expr: zenoh_key_expr.clone(), ros2_type: ros2_type.clone() },
+                 RetiredActionSrv { zenoh_id: zenoh_id.clone(), zenoh_key_expr: zenoh_key_expr.clone() }, *KE_PREFIX_ROUTE_ACTION_CLI),
+                (AnnouncedActionCli { zenoh_id: zenoh_id.clone(), zenoh_key_expr: zenoh_key_expr.clone(), ros2_type },
+                 RetiredActionCli { zenoh_id, zenoh_key_expr: zenoh_key_expr.clone() }, *KE_PREFIX_ROUTE_ACTION_SRV),
+            ] {
+                manager.on_ros_announcement_event(announce).await.unwrap();
+                assert!(manager.admin_space.contains_key(&(prefix / &zenoh_key_expr)));
+                manager.on_ros_announcement_event(retire).await.unwrap();
+                assert!(manager.admin_space.is_empty());
+                assert!(manager.routes_action_cli.is_empty() && manager.routes_action_srv.is_empty());
+            }
+            drop(manager);
+            session.close().await.unwrap();
+            delete_dds_entity(participant).unwrap();
+            delete_dds_entity(domain).unwrap();
+        });
     }
 }

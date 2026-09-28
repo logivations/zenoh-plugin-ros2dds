@@ -32,6 +32,8 @@ stats = ["zenoh/stats"]
 dynamic_plugin = []
 dds_shm = ["cyclors/iceoryx"]
 prefix_symbols = ["cyclors/prefix_symbols"]
+# Only for isolated full-binary fault tests. Never package this feature.
+lifecycle-test-hooks = []
 
 [dependencies]
 async-trait = { workspace = true }

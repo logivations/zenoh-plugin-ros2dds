@@ -187,52 +187,51 @@ const ATTACHMENT_KEY_REQUEST_HEADER: [u8; 3] = [0x72, 0x71, 0x68]; // "rqh" in A
 /// See https://github.com/ros2/rmw_cyclonedds/blob/2263814fab142ac19dd3395971fb1f358d22a653/rmw_cyclonedds_cpp/src/serdata.hpp#L73
 /// Note that it's different from the rmw_request_id_t defined in RMW interfaces in
 /// https://github.com/ros2/rmw/blob/9b3d9d0e3021b7a6e75d8886e3e061a53c36c789/rmw/include/rmw/types.h#L360
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct CddsRequestHeader {
-    // The header contains a u64 GUID (Client's) and a i64 sequence number.
-    // Keep those as a single buffer, as it's transfered as such between DDS and Zenoh.
-    header: [u8; 16],
-    // the sequence number is subject to endianness, we need to keep a flag for it
-    is_little_endian: bool,
+    // Request identity is numeric. CDR byte order belongs to each message,
+    // and can differ between the request, reply and Zenoh attachment.
+    client_id: u64,
+    sequence_number: u64,
 }
 
 impl CddsRequestHeader {
-    pub fn create(client_id: u64, seq_num: u64, is_little_endian: bool) -> CddsRequestHeader {
-        let mut header = [0u8; 16];
-        if is_little_endian {
-            header[..8].copy_from_slice(&client_id.to_le_bytes());
-            header[8..].copy_from_slice(&seq_num.to_le_bytes())
+    pub fn create(client_id: u64, sequence_number: u64) -> Self {
+        Self {
+            client_id,
+            sequence_number,
+        }
+    }
+
+    pub fn from_slice(header: [u8; 16], is_little_endian: bool) -> Self {
+        let decode = if is_little_endian {
+            u64::from_le_bytes
         } else {
-            header[..8].copy_from_slice(&client_id.to_be_bytes());
-            header[8..].copy_from_slice(&seq_num.to_be_bytes())
-        }
-        CddsRequestHeader {
-            header,
-            is_little_endian,
-        }
+            u64::from_be_bytes
+        };
+        Self::create(
+            decode(header[..8].try_into().unwrap()),
+            decode(header[8..].try_into().unwrap()),
+        )
     }
 
-    pub fn from_slice(header: [u8; 16], is_little_endian: bool) -> CddsRequestHeader {
-        CddsRequestHeader {
-            header,
-            is_little_endian,
-        }
+    pub fn to_bytes(self, is_little_endian: bool) -> [u8; 16] {
+        let encode = if is_little_endian {
+            u64::to_le_bytes
+        } else {
+            u64::to_be_bytes
+        };
+        let mut header = [0u8; 16];
+        header[..8].copy_from_slice(&encode(self.client_id));
+        header[8..].copy_from_slice(&encode(self.sequence_number));
+        header
     }
 
-    pub fn is_little_endian(&self) -> bool {
-        self.is_little_endian
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.header
-    }
-
-    pub fn as_attachment(&self) -> ZBytes {
-        // concat header + endianness flag
+    pub fn as_attachment(&self, is_little_endian: bool) -> ZBytes {
+        // Preserve the existing rqh + 16-byte header + byte-order flag format.
         let mut buf = [0u8; 17];
-        buf[0..16].copy_from_slice(&self.header);
-        buf[16] = self.is_little_endian as u8;
-
+        buf[..16].copy_from_slice(&self.to_bytes(is_little_endian));
+        buf[16] = u8::from(is_little_endian);
         let mut writer = ZBytes::writer();
         writer.append(ZBytes::from(ATTACHMENT_KEY_REQUEST_HEADER));
         writer.append(ZBytes::from(buf));
@@ -263,10 +262,7 @@ impl TryFrom<&ZBytes> for CddsRequestHeader {
                 let header: [u8; 16] = buf[0..16]
                     .try_into()
                     .expect("Shouldn't happen: buf is 17 bytes");
-                Ok(CddsRequestHeader {
-                    header,
-                    is_little_endian: buf[16] != 0,
-                })
+                Ok(CddsRequestHeader::from_slice(header, buf[16] != 0))
             } else {
                 bail!("Attachment 'header' is not 16 bytes: {buf:02x?}")
             }
@@ -278,26 +274,45 @@ impl TryFrom<&ZBytes> for CddsRequestHeader {
 
 impl std::fmt::Display for CddsRequestHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // a request header is made of 8 bytes client guid + 8 bytes sequence number
-        // display as such for easier understanding
-        write!(f, "(")?;
-        for i in &self.header[0..8] {
-            write!(f, "{i:02x}")?;
+        write!(f, "({:016x},{})", self.client_id, self.sequence_number)
+    }
+}
+
+#[cfg(test)]
+mod request_header_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_keeps_the_wire_format_and_message_headers_follow_payload_byte_order() {
+        let id = CddsRequestHeader::create(0x0123456789abcdef, 0xfedcba9876543210);
+        let encodings = [
+            (
+                true,
+                [
+                    0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x10, 0x32, 0x54, 0x76, 0x98,
+                    0xba, 0xdc, 0xfe,
+                ],
+            ),
+            (
+                false,
+                [
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76,
+                    0x54, 0x32, 0x10,
+                ],
+            ),
+        ];
+        for (little, bytes) in encodings {
+            assert_eq!(id.to_bytes(little), bytes);
+            let attachment = id.as_attachment(little);
+            let mut expected = b"rqh".to_vec();
+            expected.extend_from_slice(&bytes);
+            expected.push(u8::from(little));
+            assert_eq!(attachment.to_bytes().as_ref(), expected);
+            let decoded = CddsRequestHeader::try_from(&attachment).unwrap();
+            assert_eq!(decoded, id);
+            assert_eq!(decoded.to_bytes(!little), id.to_bytes(!little));
         }
-        let seq_num = if self.is_little_endian {
-            u64::from_le_bytes(
-                self.header[8..]
-                    .try_into()
-                    .expect("Shouldn't happen: self.header is 16 bytes"),
-            )
-        } else {
-            u64::from_be_bytes(
-                self.header[8..]
-                    .try_into()
-                    .expect("Shouldn't happen: self.header is 16 bytes"),
-            )
-        };
-        write!(f, ",{seq_num})",)
+        assert!(CddsRequestHeader::try_from(&ZBytes::from(&b"rqh\0"[..])).is_err());
     }
 }
 

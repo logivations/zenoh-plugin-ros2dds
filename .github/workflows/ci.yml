@@ -172,6 +172,45 @@ jobs:
       # Note that we limit only one test item tested at the same time to avoid the confliction between bridges
       run: "source /opt/ros/jazzy/setup.bash && cd zenoh-test-ros2dds && cargo test --verbose"
 
+    - name: Install lifecycle lab dependencies
+      shell: bash
+      run: |
+        sudo apt-get -y install python3-venv ros-jazzy-rmw-cyclonedds-cpp ros-jazzy-example-interfaces
+        python3 -m venv --system-site-packages /tmp/lifecycle-venv
+        /tmp/lifecycle-venv/bin/pip install eclipse-zenoh==1.10.1
+
+    - name: Lifecycle unit tests and Clippy (locked default and hooks)
+      shell: bash
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        cargo clippy --locked -p zenoh-plugin-ros2dds --all-targets -- -D warnings
+        cargo test --locked -p zenoh-plugin-ros2dds --lib
+        cargo clippy --locked -p zenoh-plugin-ros2dds --all-targets --features lifecycle-test-hooks -- -D warnings
+        cargo test --locked -p zenoh-plugin-ros2dds --lib --features lifecycle-test-hooks
+
+    - name: Full-binary lifecycle regressions (default and hooks)
+      shell: bash
+      timeout-minutes: 15
+      env:
+        BRIDGE_BUILD_ID: ${{ github.sha }}
+      run: |
+        source /opt/ros/jazzy/setup.bash
+        cargo build --locked -p zenoh-bridge-ros2dds
+        if grep -aq 'LAB-ONLY lifecycle fault' target/debug/zenoh-bridge-ros2dds; then
+          echo 'Fault injection found in default binary' >&2
+          exit 1
+        fi
+        /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/default
+        cargo build --locked -p zenoh-bridge-ros2dds --features lifecycle-test-hooks
+        grep -aq 'LAB-ONLY lifecycle fault' target/debug/zenoh-bridge-ros2dds
+        /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/hooks --faults
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: lifecycle-results
+        path: lifecycle-results/
+
   markdown_lint:
     runs-on: ubuntu-latest
     steps:

@@ -42,12 +42,11 @@ fn test_ros_client_zenoh_service() {
 
     let (sender, receiver) = std::sync::mpsc::channel();
 
-    rt.block_on(async {
+    rt.spawn(async move {
         common::init_env();
         // Create zenoh-bridge-ros2dds
         tokio::spawn(common::create_bridge());
 
-        let a = 1;
         let b = 2;
 
         // Zenoh service
@@ -60,7 +59,13 @@ fn test_ros_client_zenoh_service() {
                 let response = AddTwoIntsReply {
                     sum: request.a + request.b,
                 };
-                let data = cdr::serialize::<_, _, cdr::CdrLe>(&response, cdr::Infinite).unwrap();
+                // The reply may use a different CDR byte order than the ROS
+                // request. The bridge must encode its request ID accordingly.
+                let data = if request.a == 1 {
+                    cdr::serialize::<_, _, cdr::CdrLe>(&response, cdr::Infinite).unwrap()
+                } else {
+                    cdr::serialize::<_, _, cdr::CdrBe>(&response, cdr::Infinite).unwrap()
+                };
                 query.reply(TEST_SERVICE_R2Z, data).wait().unwrap();
             })
             .await
@@ -85,9 +90,11 @@ fn test_ros_client_zenoh_service() {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Send the request and then process the response
-        let my_req = r2r::example_interfaces::srv::AddTwoInts::Request { a, b };
-        let resp = client.request(&my_req).unwrap().await.unwrap();
-        assert_eq!(resp.sum, a + b);
+        for a in [1, 2] {
+            let my_req = r2r::example_interfaces::srv::AddTwoInts::Request { a, b };
+            let resp = client.request(&my_req).unwrap().await.unwrap();
+            assert_eq!(resp.sum, a + b);
+        }
 
         // Tell the main test thread, we're completed
         sender.send(()).unwrap();
