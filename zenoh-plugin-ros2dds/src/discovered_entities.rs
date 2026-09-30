@@ -27,7 +27,7 @@ use zenoh::{
 };
 
 use crate::{
-    dds_discovery::{DdsEntity, DdsParticipant},
+    dds_discovery::{DDSDiscoveryEvent, DdsEntity, DdsParticipant},
     events::ROS2DiscoveryEvent,
     gid::Gid,
     node_info::*,
@@ -132,8 +132,7 @@ impl DiscoveredEntities {
         events
     }
 
-    #[inline]
-    pub fn add_writer(&mut self, writer: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+    fn store_writer(&mut self, writer: DdsEntity) -> Gid {
         let participant = writer.participant_key;
         self.admin_space.insert(
             keformat!(
@@ -146,7 +145,7 @@ impl DiscoveredEntities {
             EntityRef::Writer(writer.key),
         );
         self.writers.insert(writer.key, writer);
-        self.reconcile_participant(participant)
+        participant
     }
 
     #[inline]
@@ -154,27 +153,21 @@ impl DiscoveredEntities {
         self.writers.get(gid)
     }
 
-    #[inline]
-    pub fn remove_writer(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
-        match self.writers.remove(gid) {
-            Some(writer) => {
-                self.admin_space.remove(
-                    &keformat!(
-                        ke_admin_writer::formatter(),
-                        pgid = writer.participant_key,
-                        wgid = writer.key,
-                        topic = &writer.topic_name
-                    )
-                    .unwrap(),
-                );
-                self.reconcile_participant(writer.participant_key)
-            }
-            None => Vec::new(),
-        }
+    fn forget_writer(&mut self, gid: &Gid) -> Option<Gid> {
+        let writer = self.writers.remove(gid)?;
+        self.admin_space.remove(
+            &keformat!(
+                ke_admin_writer::formatter(),
+                pgid = writer.participant_key,
+                wgid = writer.key,
+                topic = &writer.topic_name
+            )
+            .unwrap(),
+        );
+        Some(writer.participant_key)
     }
 
-    #[inline]
-    pub fn add_reader(&mut self, reader: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+    fn store_reader(&mut self, reader: DdsEntity) -> Gid {
         let participant = reader.participant_key;
         self.admin_space.insert(
             keformat!(
@@ -187,7 +180,7 @@ impl DiscoveredEntities {
             EntityRef::Reader(reader.key),
         );
         self.readers.insert(reader.key, reader);
-        self.reconcile_participant(participant)
+        participant
     }
 
     #[inline]
@@ -195,22 +188,68 @@ impl DiscoveredEntities {
         self.readers.get(gid)
     }
 
-    #[inline]
-    pub fn remove_reader(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
-        match self.readers.remove(gid) {
-            Some(reader) => {
-                self.admin_space.remove(
-                    &keformat!(
-                        ke_admin_reader::formatter(),
-                        pgid = reader.participant_key,
-                        wgid = reader.key,
-                        topic = &reader.topic_name
-                    )
-                    .unwrap(),
-                );
-                self.reconcile_participant(reader.participant_key)
+    fn forget_reader(&mut self, gid: &Gid) -> Option<Gid> {
+        let reader = self.readers.remove(gid)?;
+        self.admin_space.remove(
+            &keformat!(
+                ke_admin_reader::formatter(),
+                pgid = reader.participant_key,
+                wgid = reader.key,
+                topic = &reader.topic_name
+            )
+            .unwrap(),
+        );
+        Some(reader.participant_key)
+    }
+
+    /// Apply a burst of DDS discovery events and reconcile each touched participant
+    /// once. A composed ROS container can own thousands of endpoints and create
+    /// hundreds at once (a behavior tree instantiating its clients); reconciling
+    /// after every endpoint made such a burst quadratic and pinned a core for
+    /// seconds. Reconciliation derives nodes from the current snapshots, so one
+    /// pass reaches the same state and only skips deltas the burst superseded.
+    pub fn apply_dds_events(
+        &mut self,
+        events: impl IntoIterator<Item = DDSDiscoveryEvent>,
+    ) -> Vec<ROS2DiscoveryEvent> {
+        let mut out = Vec::new();
+        let mut touched: Vec<Gid> = Vec::new();
+        for event in events {
+            let participant = match event {
+                DDSDiscoveryEvent::DiscoveredPublication { entity } => {
+                    Some(self.store_writer(entity))
+                }
+                DDSDiscoveryEvent::UndiscoveredPublication { key } => self.forget_writer(&key),
+                DDSDiscoveryEvent::DiscoveredSubscription { entity } => {
+                    Some(self.store_reader(entity))
+                }
+                DDSDiscoveryEvent::UndiscoveredSubscription { key } => self.forget_reader(&key),
+                // Participant events keep their order relative to the endpoint
+                // events before them.
+                DDSDiscoveryEvent::DiscoveredParticipant { entity } => {
+                    self.reconcile_touched(&mut touched, &mut out);
+                    out.extend(self.add_participant(entity));
+                    None
+                }
+                DDSDiscoveryEvent::UndiscoveredParticipant { key } => {
+                    self.reconcile_touched(&mut touched, &mut out);
+                    out.extend(self.remove_participant(&key));
+                    None
+                }
+            };
+            if let Some(participant) = participant {
+                if !touched.contains(&participant) {
+                    touched.push(participant);
+                }
             }
-            None => Vec::new(),
+        }
+        self.reconcile_touched(&mut touched, &mut out);
+        out
+    }
+
+    fn reconcile_touched(&mut self, touched: &mut Vec<Gid>, out: &mut Vec<ROS2DiscoveryEvent>) {
+        for participant in touched.drain(..) {
+            out.extend(self.reconcile_participant(participant));
         }
     }
 
@@ -437,6 +476,22 @@ mod lifecycle_tests {
     use super::*;
     use crate::ros_discovery::NodeEntitiesInfo;
     use cyclors::qos::Qos;
+    // Single-event bursts, as the discovery loop sees isolated events.
+    impl DiscoveredEntities {
+        fn add_writer(&mut self, entity: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+            self.apply_dds_events([DDSDiscoveryEvent::DiscoveredPublication { entity }])
+        }
+        fn remove_writer(&mut self, key: &Gid) -> Vec<ROS2DiscoveryEvent> {
+            self.apply_dds_events([DDSDiscoveryEvent::UndiscoveredPublication { key: *key }])
+        }
+        fn add_reader(&mut self, entity: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+            self.apply_dds_events([DDSDiscoveryEvent::DiscoveredSubscription { entity }])
+        }
+        fn remove_reader(&mut self, key: &Gid) -> Vec<ROS2DiscoveryEvent> {
+            self.apply_dds_events([DDSDiscoveryEvent::UndiscoveredSubscription { key: *key }])
+        }
+    }
+
     fn gid(n: u8) -> Gid {
         Gid::from([n; 16])
     }
@@ -586,6 +641,41 @@ mod lifecycle_tests {
             count += 1;
         });
         assert_eq!(count, 120);
+    }
+
+    #[test]
+    fn batched_endpoint_events_converge_in_all_120_discovery_orders() {
+        // Consecutive DDS events arrive as one burst, as the discovery loop drains them.
+        permutations(&mut [0, 1, 2, 3, 4], 0, &mut |order| {
+            let mut d = initial();
+            let mut burst = Vec::new();
+            for op in order {
+                match op {
+                    0 => {
+                        d.apply_dds_events(std::mem::take(&mut burst));
+                        d.update_participant_info(graph(1, 13, 14));
+                    }
+                    1 => burst.push(DDSDiscoveryEvent::DiscoveredSubscription {
+                        entity: entity(1, 13, false),
+                    }),
+                    2 => burst.push(DDSDiscoveryEvent::DiscoveredPublication {
+                        entity: entity(1, 14, true),
+                    }),
+                    3 => burst.push(DDSDiscoveryEvent::UndiscoveredSubscription { key: gid(11) }),
+                    4 => burst.push(DDSDiscoveryEvent::UndiscoveredPublication { key: gid(12) }),
+                    _ => unreachable!(),
+                }
+            }
+            d.apply_dds_events(burst);
+            assert!(complete(&d), "order: {order:?}");
+            let service = &d.nodes_info[&gid(1)]["/camera"].service_srv["/get_frame"];
+            assert_eq!(service.entities.req_reader, gid(13));
+            assert_eq!(service.entities.rep_writer, gid(14));
+            assert!(
+                d.update_participant_info(graph(1, 13, 14)).is_empty(),
+                "non-idempotent snapshot"
+            );
+        });
     }
 
     #[test]
