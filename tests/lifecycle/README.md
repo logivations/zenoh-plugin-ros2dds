@@ -39,3 +39,17 @@ a natural production trigger for cleanup failure.
 These bounded regressions complement the real-DDS unit tests and ordinary ROS
 service/action/topic integration tests. They are not a multi-day soak, physical
 Jetson qualification or proof that admin accounting alone detects orphan resources.
+
+
+For a release-mode discovery CPU comparison (no DDS/network timing), run:
+
+```sh
+cargo test --locked --release -p zenoh-plugin-ros2dds --lib discovery_churn_benchmark -- --ignored --nocapture
+```
+
+It sends endpoints **after** their ROS graph, both into empty participants and
+participants already containing up to 1,850 services, and measures individual
+additions and disposals. Run it on the same host/toolchain against the baseline;
+wall-clock thresholds are intentionally not asserted in shared CI. Complete-binary
+CPU measurements must also cover paced node teardown and measure settled idle
+separately: including `destroy_node()` in an idle interval mislabels teardown CPU.

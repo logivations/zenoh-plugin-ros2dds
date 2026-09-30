@@ -73,11 +73,7 @@ impl DiscoveryMgr {
             loop {
                 select!(
                     evt = dds_disco_rcv.recv_async() => {
-                        // Take the whole queued burst so each participant reconciles once.
-                        let burst: Vec<_> = std::iter::once(evt.unwrap())
-                            .chain(dds_disco_rcv.drain())
-                            .collect();
-                        let events = zwrite!(discovered_entities).apply_dds_events(burst);
+                        let events = zwrite!(discovered_entities).apply_dds_event(evt.unwrap());
                         for event in events {
                             if let Err(error) = evt_sender.try_send(event) {
                                 tracing::error!("Internal error: failed to send discovery event: {error}");

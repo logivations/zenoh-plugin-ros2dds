@@ -413,6 +413,26 @@ impl std::fmt::Debug for NodeInfo {
     }
 }
 
+// Services and actions have the same removal contract, with different DDS
+// components. Only clone the affected complete interface for its withdrawal.
+macro_rules! remove_component {
+    ($node:ident, $field:ident, $gid:ident, $removed:ident, [$($($component:ident).+),+]) => {
+        for value in $node.$field.values_mut() {
+            if ![$(value.entities.$($component).+),+].contains($gid) {
+                continue;
+            }
+            let previous = value.is_complete().then(|| value.clone());
+            for component in [$(&mut value.entities.$($component).+),+] {
+                if component == $gid {
+                    *component = Gid::NOT_DISCOVERED;
+                }
+            }
+            return previous.map(|previous| $removed(
+                $node.participant, $node.fullname().to_owned(), previous));
+        }
+    };
+}
+
 impl NodeInfo {
     pub fn create(
         node_namespace: String,
@@ -1891,6 +1911,89 @@ impl NodeInfo {
         self.undiscovered_writer.resize(0, Gid::NOT_DISCOVERED);
 
         events
+    }
+
+    // The upstream removal paths discarded the entire service/action on one
+    // endpoint disposal. Keep its other components so an old endpoint cannot
+    // erase a replacement that DDS has already discovered.
+    pub fn remove_reader(&mut self, gid: &Gid) -> Option<ROS2DiscoveryEvent> {
+        use ROS2DiscoveryEvent::*;
+        if let Some(name) = self.msg_sub.iter_mut().find_map(|(name, value)| {
+            (value.readers.remove(gid) && value.readers.is_empty()).then(|| name.clone())
+        }) {
+            return Some(UndiscoveredMsgSub(
+                self.participant,
+                self.fullname().to_owned(),
+                self.msg_sub.remove(&name).unwrap(),
+            ));
+        }
+        remove_component!(self, service_srv, gid, UndiscoveredServiceSrv, [req_reader]);
+        remove_component!(self, service_cli, gid, UndiscoveredServiceCli, [rep_reader]);
+        remove_component!(
+            self,
+            action_srv,
+            gid,
+            UndiscoveredActionSrv,
+            [
+                send_goal.req_reader,
+                cancel_goal.req_reader,
+                get_result.req_reader
+            ]
+        );
+        remove_component!(
+            self,
+            action_cli,
+            gid,
+            UndiscoveredActionCli,
+            [
+                send_goal.rep_reader,
+                cancel_goal.rep_reader,
+                get_result.rep_reader,
+                status_reader,
+                feedback_reader
+            ]
+        );
+        None
+    }
+
+    pub fn remove_writer(&mut self, gid: &Gid) -> Option<ROS2DiscoveryEvent> {
+        use ROS2DiscoveryEvent::*;
+        if let Some(name) = self.msg_pub.iter_mut().find_map(|(name, value)| {
+            (value.writers.remove(gid) && value.writers.is_empty()).then(|| name.clone())
+        }) {
+            return Some(UndiscoveredMsgPub(
+                self.participant,
+                self.fullname().to_owned(),
+                self.msg_pub.remove(&name).unwrap(),
+            ));
+        }
+        remove_component!(self, service_srv, gid, UndiscoveredServiceSrv, [rep_writer]);
+        remove_component!(self, service_cli, gid, UndiscoveredServiceCli, [req_writer]);
+        remove_component!(
+            self,
+            action_srv,
+            gid,
+            UndiscoveredActionSrv,
+            [
+                send_goal.rep_writer,
+                cancel_goal.rep_writer,
+                get_result.rep_writer,
+                status_writer,
+                feedback_writer
+            ]
+        );
+        remove_component!(
+            self,
+            action_cli,
+            gid,
+            UndiscoveredActionCli,
+            [
+                send_goal.req_writer,
+                cancel_goal.req_writer,
+                get_result.req_writer
+            ]
+        );
+        None
     }
 
     /// Emit changes between two derived snapshots. Endpoint replacement updates

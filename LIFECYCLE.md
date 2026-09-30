@@ -25,8 +25,11 @@ response) runs outside DDS access guards, including failed writes, replacement
 and callbacks rejected after retirement.
 
 Local nodes are identified by participant GID and node name. Discovery derives
-interfaces from the current ROS membership snapshot and current DDS endpoints;
-a delayed disposal cannot remove a replacement participant or endpoint. Retention
+interfaces from the current ROS membership snapshot and current DDS endpoints.
+ROS graph updates reconcile membership; individual DDS events update only the
+affected interface, preserving upstream incremental discovery. Removal clears
+only that component and retains any surviving endpoint for the same interface.
+A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
 
 DDS writes cap reliability max_blocking_time at the DDS default 100 ms (a stricter
