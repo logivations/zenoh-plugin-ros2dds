@@ -216,7 +216,6 @@ impl RouteServiceSrv {
                 tracing::debug!(route = %self, expired, "Incoming service queries expired");
             }
         }
-        let route_id = self.to_string();
         // A retained server route exposes a local client pair even before a
         // local server appears, so DDS discovery can converge in either order.
         self.lifecycle.set_desired(true);
@@ -225,12 +224,12 @@ impl RouteServiceSrv {
                 &self.ros2_name,
                 &self.ros2_type,
                 &self.zenoh_key_expr,
-                &route_id,
                 &self.context,
                 &self.type_info,
             )
         }) {
-            self.lifecycle.log_activation_failure(&route_id, &error);
+            self.lifecycle
+                .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
             && self.proxy.is_some()
@@ -239,7 +238,7 @@ impl RouteServiceSrv {
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {
-                tracing::error!("{route_id}: announcement failed: {error}");
+                tracing::error!("{self}: announcement failed: {error}");
             }
         }
     }
@@ -337,7 +336,6 @@ fn create_proxy(
     ros2_name: &str,
     ros2_type: &str,
     zenoh_key_expr: &OwnedKeyExpr,
-    route_id: &str,
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
 ) -> Result<ServiceServerProxy, String> {
@@ -354,7 +352,7 @@ fn create_proxy(
     let client_guid = get_instance_handle(req_writer.entity())?;
     let queries_in_progress = Arc::new(PendingQueries::default());
     let pending = queries_in_progress.clone();
-    let route_id = route_id.to_owned();
+    let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
     let key = zenoh_key_expr.clone();
     let rep_reader = DdsEndpoint::reader(
         context.participant,

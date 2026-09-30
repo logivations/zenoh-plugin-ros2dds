@@ -196,12 +196,10 @@ impl RouteServiceCli {
     }
 
     pub(crate) async fn reconcile(&mut self) {
-        let route_id = self.to_string();
         let result = self.lifecycle.reconcile(&mut self.proxy, || {
             create_proxy(
                 &self.ros2_name,
                 &self.ros2_type,
-                &route_id,
                 &self.context,
                 &self.type_info,
                 &self._zenoh_querier,
@@ -209,7 +207,8 @@ impl RouteServiceCli {
             )
         });
         if let Err(error) = result {
-            self.lifecycle.log_activation_failure(&route_id, &error);
+            self.lifecycle
+                .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
             && !is_service_for_action(&self.ros2_name)
@@ -218,7 +217,7 @@ impl RouteServiceCli {
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {
-                tracing::error!("{route_id}: announcement failed: {error}");
+                tracing::error!("{self}: announcement failed: {error}");
             }
         }
     }
@@ -301,7 +300,6 @@ fn serialize_proxy<S: serde::Serializer>(
 fn create_proxy(
     ros2_name: &str,
     ros2_type: &str,
-    route_id: &str,
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
     querier: &Arc<Querier<'static>>,
@@ -319,7 +317,10 @@ fn create_proxy(
     )?;
     let access = rep_writer.access();
     let querier = querier.clone();
-    let route_id = route_id.to_owned();
+    let route_id = format!(
+        "Route Service Client (ROS:{ros2_name} <-> Zenoh:{})",
+        querier.key_expr()
+    );
     let req_reader = DdsEndpoint::reader(
         context.participant,
         format!("rq{ros2_name}Request"),
