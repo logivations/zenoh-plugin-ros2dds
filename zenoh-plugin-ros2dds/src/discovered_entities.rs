@@ -188,19 +188,23 @@ impl DiscoveredEntities {
             // A node may own several endpoints for the same interface. Select a
             // surviving counterpart BEFORE removing this one, so losing one of
             // several service clients cannot retire their shared route.
+            let replacements: Vec<_> = self
+                .writers
+                .values()
+                .filter(|candidate| {
+                    candidate.participant_key == entity.participant_key
+                        && candidate.topic_name == entity.topic_name
+                })
+                .collect();
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.writer_gid_seq;
                 if membership.contains(gid) {
                     let Some(node) = nodes.get_mut(name) else {
                         continue;
                     };
-                    if let Some(replacement) = membership
+                    if let Some(replacement) = replacements
                         .iter()
-                        .filter_map(|candidate| self.writers.get(candidate))
-                        .filter(|candidate| {
-                            candidate.participant_key == entity.participant_key
-                                && candidate.topic_name == entity.topic_name
-                        })
+                        .filter(|candidate| membership.contains(&candidate.key))
                         .max_by_key(|candidate| candidate.key)
                     {
                         events.extend(node.update_with_writer(replacement));
@@ -269,19 +273,23 @@ impl DiscoveredEntities {
             // A node may own several endpoints for the same interface. Select a
             // surviving counterpart BEFORE removing this one, so losing one of
             // several service clients cannot retire their shared route.
+            let replacements: Vec<_> = self
+                .readers
+                .values()
+                .filter(|candidate| {
+                    candidate.participant_key == entity.participant_key
+                        && candidate.topic_name == entity.topic_name
+                })
+                .collect();
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.reader_gid_seq;
                 if membership.contains(gid) {
                     let Some(node) = nodes.get_mut(name) else {
                         continue;
                     };
-                    if let Some(replacement) = membership
+                    if let Some(replacement) = replacements
                         .iter()
-                        .filter_map(|candidate| self.readers.get(candidate))
-                        .filter(|candidate| {
-                            candidate.participant_key == entity.participant_key
-                                && candidate.topic_name == entity.topic_name
-                        })
+                        .filter(|candidate| membership.contains(&candidate.key))
                         .max_by_key(|candidate| candidate.key)
                     {
                         events.extend(node.update_with_reader(replacement));
