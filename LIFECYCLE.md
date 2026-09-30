@@ -32,9 +32,10 @@ only that component and retains any surviving endpoint for the same interface.
 A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
 
-DDS writes cap reliability max_blocking_time at the DDS default 100 ms (a stricter
-limit remains). Overloaded writes fail explicitly rather than preventing resource
-retirement indefinitely. That attempted data delivery is lost on write failure;
+DDS writes replace an infinite reliability max_blocking_time with the DDS default
+100 ms; finite application values are preserved. Retirement can wait for that
+configured finite timeout. Overloaded writes fail explicitly rather than preventing
+resource retirement indefinitely. That attempted data delivery is lost on write failure;
 this is an intentional overload behavior change, not a delivery guarantee. Counters
 and route logs expose the failures. This does not change reliability matching. ROS graph
 publication uses an unlocked snapshot and retries failure without losing concurrent
