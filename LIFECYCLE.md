@@ -32,6 +32,13 @@ only that component and retains any surviving endpoint for the same interface.
 A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
 
+Known discovery limit: overlapping nodes with the same full name inside one DDS
+participant can lose bridge routes while their local DDS services still answer.
+The existing graph deserializer overwrites duplicate-name entries; the native RMW
+graph also associates/removes nodes by name. Immediate same-context replacement
+can overlap native cleanup. Node-instance identity/input handling remains unresolved
+for this case; the passing distinct-participant restart tests do not qualify it.
+
 DDS writes replace an infinite reliability max_blocking_time with the DDS default
 100 ms; finite application values are preserved. Retirement can wait for that
 configured finite timeout. Overloaded writes fail explicitly rather than preventing
