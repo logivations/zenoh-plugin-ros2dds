@@ -133,67 +133,66 @@ impl DiscoveredEntities {
     }
 
     #[inline]
+    fn add_writer(&mut self, writer: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+        self.admin_space.insert(
+            keformat!(
+                ke_admin_writer::formatter(),
+                pgid = writer.participant_key,
+                wgid = writer.key,
+                topic = &writer.topic_name
+            )
+            .unwrap(),
+            EntityRef::Writer(writer.key),
+        );
+        let mut events = Vec::new();
+        if let Some(nodes) = self.nodes_info.get_mut(&writer.participant_key) {
+            for node in nodes.values_mut() {
+                if let Some(index) = node
+                    .undiscovered_writer
+                    .iter()
+                    .position(|gid| *gid == writer.key)
+                {
+                    node.undiscovered_writer.remove(index);
+                    events.extend(node.update_with_writer(&writer));
+                }
+            }
+        }
+        self.writers.insert(writer.key, writer);
+        events
+    }
+
+    #[inline]
     pub fn get_writer(&self, gid: &Gid) -> Option<&DdsEntity> {
         self.writers.get(gid)
     }
 
     #[inline]
-    fn add_writer(&mut self, entity: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
-        self.admin_space.insert(
-            keformat!(
-                ke_admin_writer::formatter(),
-                pgid = entity.participant_key,
-                wgid = entity.key,
-                topic = &entity.topic_name
-            )
-            .unwrap(),
-            EntityRef::Writer(entity.key),
-        );
-        let mut events = Vec::new();
-        if let Some(nodes) = self.nodes_info.get_mut(&entity.participant_key) {
-            for node in nodes.values_mut() {
-                if let Some(index) = node
-                    .undiscovered_writer
-                    .iter()
-                    .position(|gid| *gid == entity.key)
-                {
-                    node.undiscovered_writer.remove(index);
-                    events.extend(node.update_with_writer(&entity));
-                }
-            }
-        }
-        self.writers.insert(entity.key, entity);
-        events
-    }
-
-    #[inline]
     fn remove_writer(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
-        let Some(entity) = self.writers.remove(gid) else {
+        let Some(writer) = self.writers.remove(gid) else {
             return Vec::new();
         };
         self.admin_space.remove(
             &keformat!(
                 ke_admin_writer::formatter(),
-                pgid = entity.participant_key,
-                wgid = entity.key,
-                topic = &entity.topic_name
+                pgid = writer.participant_key,
+                wgid = writer.key,
+                topic = &writer.topic_name
             )
             .unwrap(),
         );
         let mut events = Vec::new();
         if let (Some(graph), Some(nodes)) = (
-            self.ros_participant_info.get(&entity.participant_key),
-            self.nodes_info.get_mut(&entity.participant_key),
+            self.ros_participant_info.get(&writer.participant_key),
+            self.nodes_info.get_mut(&writer.participant_key),
         ) {
-            // A node may own several endpoints for the same interface. Select a
-            // surviving counterpart BEFORE removing this one, so losing one of
-            // several service clients cannot retire their shared route.
+            // The endpoint is already out of the global map, so this holds
+            // only survivors on the same topic within the same participant.
             let replacements: Vec<_> = self
                 .writers
                 .values()
                 .filter(|candidate| {
-                    candidate.participant_key == entity.participant_key
-                        && candidate.topic_name == entity.topic_name
+                    candidate.participant_key == writer.participant_key
+                        && candidate.topic_name == writer.topic_name
                 })
                 .collect();
             for (name, ros_node) in &graph.node_entities_info_seq {
@@ -202,18 +201,55 @@ impl DiscoveredEntities {
                     let Some(node) = nodes.get_mut(name) else {
                         continue;
                     };
-                    if let Some(replacement) = replacements
-                        .iter()
-                        .filter(|candidate| membership.contains(&candidate.key))
-                        .max_by_key(|candidate| candidate.key)
-                    {
-                        events.extend(node.update_with_writer(replacement));
+                    // Swap a tracked endpoint for its best survivor instead of
+                    // withdrawing the shared interface; an untracked endpoint
+                    // must not rewrite a live interface it never backed.
+                    let (tracked, withdrawal) = node.remove_writer(gid);
+                    if tracked {
+                        match replacements
+                            .iter()
+                            .filter(|candidate| membership.contains(&candidate.key))
+                            .max_by_key(|candidate| candidate.key)
+                        {
+                            Some(replacement) => {
+                                events.extend(node.update_with_writer(replacement))
+                            }
+                            None => events.extend(withdrawal),
+                        }
                     }
-                    events.extend(node.remove_writer(gid));
                     node.undiscovered_writer.push(*gid);
                 }
             }
         }
+        events
+    }
+
+    #[inline]
+    fn add_reader(&mut self, reader: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+        self.admin_space.insert(
+            keformat!(
+                ke_admin_reader::formatter(),
+                pgid = reader.participant_key,
+                wgid = reader.key,
+                topic = &reader.topic_name
+            )
+            .unwrap(),
+            EntityRef::Reader(reader.key),
+        );
+        let mut events = Vec::new();
+        if let Some(nodes) = self.nodes_info.get_mut(&reader.participant_key) {
+            for node in nodes.values_mut() {
+                if let Some(index) = node
+                    .undiscovered_reader
+                    .iter()
+                    .position(|gid| *gid == reader.key)
+                {
+                    node.undiscovered_reader.remove(index);
+                    events.extend(node.update_with_reader(&reader));
+                }
+            }
+        }
+        self.readers.insert(reader.key, reader);
         events
     }
 
@@ -223,62 +259,32 @@ impl DiscoveredEntities {
     }
 
     #[inline]
-    fn add_reader(&mut self, entity: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
-        self.admin_space.insert(
-            keformat!(
-                ke_admin_reader::formatter(),
-                pgid = entity.participant_key,
-                wgid = entity.key,
-                topic = &entity.topic_name
-            )
-            .unwrap(),
-            EntityRef::Reader(entity.key),
-        );
-        let mut events = Vec::new();
-        if let Some(nodes) = self.nodes_info.get_mut(&entity.participant_key) {
-            for node in nodes.values_mut() {
-                if let Some(index) = node
-                    .undiscovered_reader
-                    .iter()
-                    .position(|gid| *gid == entity.key)
-                {
-                    node.undiscovered_reader.remove(index);
-                    events.extend(node.update_with_reader(&entity));
-                }
-            }
-        }
-        self.readers.insert(entity.key, entity);
-        events
-    }
-
-    #[inline]
     fn remove_reader(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
-        let Some(entity) = self.readers.remove(gid) else {
+        let Some(reader) = self.readers.remove(gid) else {
             return Vec::new();
         };
         self.admin_space.remove(
             &keformat!(
                 ke_admin_reader::formatter(),
-                pgid = entity.participant_key,
-                wgid = entity.key,
-                topic = &entity.topic_name
+                pgid = reader.participant_key,
+                wgid = reader.key,
+                topic = &reader.topic_name
             )
             .unwrap(),
         );
         let mut events = Vec::new();
         if let (Some(graph), Some(nodes)) = (
-            self.ros_participant_info.get(&entity.participant_key),
-            self.nodes_info.get_mut(&entity.participant_key),
+            self.ros_participant_info.get(&reader.participant_key),
+            self.nodes_info.get_mut(&reader.participant_key),
         ) {
-            // A node may own several endpoints for the same interface. Select a
-            // surviving counterpart BEFORE removing this one, so losing one of
-            // several service clients cannot retire their shared route.
+            // The endpoint is already out of the global map, so this holds
+            // only survivors on the same topic within the same participant.
             let replacements: Vec<_> = self
                 .readers
                 .values()
                 .filter(|candidate| {
-                    candidate.participant_key == entity.participant_key
-                        && candidate.topic_name == entity.topic_name
+                    candidate.participant_key == reader.participant_key
+                        && candidate.topic_name == reader.topic_name
                 })
                 .collect();
             for (name, ros_node) in &graph.node_entities_info_seq {
@@ -287,14 +293,22 @@ impl DiscoveredEntities {
                     let Some(node) = nodes.get_mut(name) else {
                         continue;
                     };
-                    if let Some(replacement) = replacements
-                        .iter()
-                        .filter(|candidate| membership.contains(&candidate.key))
-                        .max_by_key(|candidate| candidate.key)
-                    {
-                        events.extend(node.update_with_reader(replacement));
+                    // Swap a tracked endpoint for its best survivor instead of
+                    // withdrawing the shared interface; an untracked endpoint
+                    // must not rewrite a live interface it never backed.
+                    let (tracked, withdrawal) = node.remove_reader(gid);
+                    if tracked {
+                        match replacements
+                            .iter()
+                            .filter(|candidate| membership.contains(&candidate.key))
+                            .max_by_key(|candidate| candidate.key)
+                        {
+                            Some(replacement) => {
+                                events.extend(node.update_with_reader(replacement))
+                            }
+                            None => events.extend(withdrawal),
+                        }
                     }
-                    events.extend(node.remove_reader(gid));
                     node.undiscovered_reader.push(*gid);
                 }
             }
@@ -302,9 +316,11 @@ impl DiscoveredEntities {
         events
     }
 
-    /// Update only the affected interface, as upstream does. ROS graph
-    /// snapshots reconcile membership; DDS events must not reconstruct
-    /// unrelated routes, even when the events arrive one at a time.
+    /// Update only the affected interface, as the eclipse-zenoh upstream
+    /// does. ROS graph snapshots reconcile membership; DDS events must not
+    /// reconstruct unrelated routes, even when the events arrive one at a
+    /// time. One removal emits either the survivor swap or the withdrawal
+    /// for an interface, never both.
     pub fn apply_dds_event(&mut self, event: DDSDiscoveryEvent) -> Vec<ROS2DiscoveryEvent> {
         match event {
             DDSDiscoveryEvent::DiscoveredPublication { entity } => self.add_writer(entity),
@@ -327,8 +343,12 @@ impl DiscoveredEntities {
 
     /// ROS graph membership and DDS endpoint metadata can arrive in either order.
     /// Derive this participant's nodes from their latest intersection, then emit
-    /// the difference. Never incrementally delete a whole pair from one endpoint
-    /// event, and never carry endpoints absent from the current ROS snapshot.
+    /// the difference. This reconcile path never carries endpoints absent from
+    /// the current ROS snapshot; incremental endpoint events are handled by
+    /// `remove_reader`/`remove_writer`, which withdraw an interface only when
+    /// its last tracked endpoint is gone. Within one returned batch, discoveries
+    /// for current nodes precede withdrawals of vanished nodes, so a route
+    /// shared by interface name survives a node rename.
     fn reconcile_participant(&mut self, participant: Gid) -> Vec<ROS2DiscoveryEvent> {
         if !self.participants.contains_key(&participant) {
             return Vec::new();
@@ -761,30 +781,159 @@ mod lifecycle_tests {
                 endpoints.extend(replacements.clone());
                 let mut d = discover_interface(&endpoints);
                 // Snapshot construction selects the higher GIDs. Remove those:
-                // the still-present lower GIDs must keep the interface complete.
+                // each disposal must swap in the surviving lower GID with
+                // exactly one re-announcement and no withdrawal.
                 for (writer, endpoint) in replacements {
                     let events = remove_endpoint(&mut d, writer, &endpoint.key);
                     assert!(
-                        events.iter().all(|event| matches!(
-                            event,
-                            ROS2DiscoveryEvent::DiscoveredServiceSrv(..)
-                                | ROS2DiscoveryEvent::DiscoveredServiceCli(..)
-                                | ROS2DiscoveryEvent::DiscoveredActionSrv(..)
-                                | ROS2DiscoveryEvent::DiscoveredActionCli(..)
-                        )),
-                        "unexpected withdrawal: {events:?}"
+                        matches!(
+                            events.as_slice(),
+                            [ROS2DiscoveryEvent::DiscoveredServiceSrv(..)]
+                                | [ROS2DiscoveryEvent::DiscoveredServiceCli(..)]
+                                | [ROS2DiscoveryEvent::DiscoveredActionSrv(..)]
+                                | [ROS2DiscoveryEvent::DiscoveredActionCli(..)]
+                        ),
+                        "expected one swap announcement for {}: {events:?}",
+                        endpoint.topic_name
                     );
                 }
+                // Removing the survivors withdraws the route exactly once, and
+                // the fully cleared interface entry is dropped from the node.
+                let mut withdrawals = 0;
                 for (writer, endpoint) in interface_endpoints(action, client, 0) {
-                    remove_endpoint(&mut d, writer, &endpoint.key);
+                    let events = remove_endpoint(&mut d, writer, &endpoint.key);
+                    withdrawals += events.len();
+                    assert!(
+                        events.iter().all(|event| matches!(
+                            event,
+                            ROS2DiscoveryEvent::UndiscoveredServiceSrv(..)
+                                | ROS2DiscoveryEvent::UndiscoveredServiceCli(..)
+                                | ROS2DiscoveryEvent::UndiscoveredActionSrv(..)
+                                | ROS2DiscoveryEvent::UndiscoveredActionCli(..)
+                        )),
+                        "unexpected event: {events:?}"
+                    );
                 }
+                assert_eq!(withdrawals, 1);
                 let node = &d.nodes_info[&gid(1)]["/camera"];
-                assert!(node.service_srv.values().all(|s| !s.is_complete()));
-                assert!(node.service_cli.values().all(|s| !s.is_complete()));
-                assert!(node.action_srv.values().all(|s| !s.is_complete()));
-                assert!(node.action_cli.values().all(|s| !s.is_complete()));
+                assert!(node.service_srv.is_empty());
+                assert!(node.service_cli.is_empty());
+                assert!(node.action_srv.is_empty());
+                assert!(node.action_cli.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn disposing_an_untracked_endpoint_does_not_rewrite_the_interface() {
+        for action in [false, true] {
+            for client in [false, true] {
+                let mut endpoints = interface_endpoints(action, client, 0);
+                endpoints.extend(interface_endpoints(action, client, 1));
+                let mut d = discover_interface(&endpoints);
+                // Snapshot selection references the higher copy-1 GIDs, so the
+                // copy-0 endpoints back no interface component. Disposing them
+                // must be silent and leave the live interface untouched.
+                for (writer, endpoint) in interface_endpoints(action, client, 0) {
+                    let events = remove_endpoint(&mut d, writer, &endpoint.key);
+                    assert!(
+                        events.is_empty(),
+                        "untracked disposal of {} rewrote the interface: {events:?}",
+                        endpoint.topic_name
+                    );
+                }
+                let node = &d.nodes_info[&gid(1)]["/camera"];
+                let complete = node.service_srv.values().filter(|s| s.is_complete()).count()
+                    + node.service_cli.values().filter(|s| s.is_complete()).count()
+                    + node.action_srv.values().filter(|s| s.is_complete()).count()
+                    + node.action_cli.values().filter(|s| s.is_complete()).count();
+                assert_eq!(complete, 1);
+            }
+        }
+    }
+
+    fn topic_entity(id: u8, writer: bool) -> DdsEntity {
+        let mut endpoint = entity(1, id, writer);
+        endpoint.topic_name = "rt/image".into();
+        endpoint.type_name = "sensor_msgs::msg::dds_::Image_".into();
+        endpoint
+    }
+
+    #[test]
+    fn topic_route_survives_until_its_last_endpoint_is_disposed() {
+        let mut d = DiscoveredEntities::default();
+        d.add_participant(DdsParticipant {
+            key: gid(1),
+            qos: Qos::default(),
+        });
+        let mut info = graph(1, 0, 0);
+        let node = info.node_entities_info_seq.get_mut("/camera").unwrap();
+        for id in [31, 32] {
+            node.writer_gid_seq.insert(gid(id));
+        }
+        for id in [41, 42] {
+            node.reader_gid_seq.insert(gid(id));
+        }
+        for id in [31, 32] {
+            assert!(d.add_writer(topic_entity(id, true)).is_empty());
+        }
+        for id in [41, 42] {
+            assert!(d.add_reader(topic_entity(id, false)).is_empty());
+        }
+        assert_eq!(d.update_participant_info(info).len(), 2);
+        // Disposing one of two endpoints keeps the route and stays silent.
+        assert!(d.remove_writer(&gid(31)).is_empty());
+        assert!(d.remove_reader(&gid(41)).is_empty());
+        // Disposing the last endpoint withdraws the route, and only then.
+        let events = d.remove_writer(&gid(32));
+        assert!(
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredMsgPub(..)]),
+            "{events:?}"
+        );
+        let events = d.remove_reader(&gid(42));
+        assert!(
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredMsgSub(..)]),
+            "{events:?}"
+        );
+        let node = &d.nodes_info[&gid(1)]["/camera"];
+        assert!(node.msg_pub.is_empty() && node.msg_sub.is_empty());
+        // A returning endpoint re-announces without a new ROS snapshot.
+        let events = d.add_writer(topic_entity(32, true));
+        assert!(
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredMsgPub(..)]),
+            "{events:?}"
+        );
+        let events = d.add_reader(topic_entity(42, false));
+        assert!(
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredMsgSub(..)]),
+            "{events:?}"
+        );
+        let node = &d.nodes_info[&gid(1)]["/camera"];
+        assert_eq!(node.undiscovered_writer, [gid(31)]);
+        assert_eq!(node.undiscovered_reader, [gid(41)]);
+    }
+
+    #[test]
+    fn node_rename_discovers_the_replacement_before_withdrawing_its_predecessor() {
+        let mut d = initial();
+        let mut info = ParticipantEntitiesInfo::new(gid(1));
+        let mut node = NodeEntitiesInfo::new("/".into(), "camera2".into());
+        node.reader_gid_seq.insert(gid(11));
+        node.writer_gid_seq.insert(gid(12));
+        info.node_entities_info_seq.insert(node.full_name(), node);
+        // The route is keyed by interface name: its new owner must be
+        // announced before the vanished node's withdrawal can empty it.
+        let events = d.update_participant_info(info);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ROS2DiscoveryEvent::DiscoveredServiceSrv(_, discovered, _),
+                    ROS2DiscoveryEvent::UndiscoveredServiceSrv(_, withdrawn, _),
+                ] if discovered.as_str() == "/camera2" && withdrawn.as_str() == "/camera"
+            ),
+            "{events:?}"
+        );
     }
 
     fn permutations(items: &mut [u8], start: usize, run: &mut impl FnMut(&[u8])) {
