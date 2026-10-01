@@ -1,6 +1,6 @@
 # Lifecycle patch on 1.10.1
 
-Base: `d8269b5bbca6bfadae61f830bfdbcf17a0a7b7cd`. Cargo.lock is unchanged.
+Plugin base: `d8269b5bbca6bfadae61f830bfdbcf17a0a7b7cd` (1.10.1).
 This branch targets the standalone bridge. Dynamic plugin hot-unload is outside
 its support contract.
 
@@ -98,6 +98,12 @@ Transient `activation failed:` messages belong to the owner's existing retry pat
 external log-string watchdogs must not kill this process during that backoff.
 
 ## Provenance
+
+The existing Zenoh dependencies share one pinned 1.10.1 core commit from the
+[literal matching patch](https://github.com/logivations/zenoh/pull/1). It uses
+the existing child hash lookup for literal resource keys, avoiding repeated
+full-tree walks when correctly retired Queriers are recreated. Wildcard matching
+retains the upstream traversal, and resource ownership is unchanged.
 
 The participant identity and CString fixes preserve the isolated upstream #705
 changes (`33e0078eb42aae13510836947467ecc46a5df9eb` and
