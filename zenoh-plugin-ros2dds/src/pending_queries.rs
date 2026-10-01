@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Logivations
 // SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
 
-//! A query cannot outlive its retention deadline or the route that accepted it.
+//! Expire only deadlines advertised by the caller; legacy/native deadlines are unknown.
+//! Retirement releases every pending query, including those with no known deadline.
 //! Query destruction can send a Zenoh response-final: always drop outside the lock.
 use crate::ros2_utils::CddsRequestHeader;
 use std::{
@@ -18,7 +19,7 @@ pub(crate) const RETENTION_PARAMETER: &str = "__ros2dds_timeout_ms";
 
 #[derive(Default)]
 pub(crate) struct PendingQueries {
-    entries: Mutex<HashMap<CddsRequestHeader, (Instant, Query)>>,
+    entries: Mutex<HashMap<CddsRequestHeader, (Option<Instant>, Query)>>,
     expired: AtomicU64,
 }
 impl PendingQueries {
@@ -27,7 +28,7 @@ impl PendingQueries {
         &self,
         id: CddsRequestHeader,
         query: Query,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Option<Query> {
         self.entries
             .lock()
@@ -47,7 +48,11 @@ impl PendingQueries {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             let ids: Vec<_> = entries
                 .iter()
-                .filter_map(|(id, (deadline, _))| (*deadline <= now).then_some(*id))
+                .filter_map(|(id, (deadline, _))| {
+                    deadline
+                        .is_some_and(|deadline| deadline <= now)
+                        .then_some(*id)
+                })
                 .collect();
             ids.into_iter()
                 .filter_map(|id| entries.remove(&id))
@@ -58,6 +63,16 @@ impl PendingQueries {
         drop(expired);
         count
     }
+    /// Fence request access first so queued callbacks cannot insert again.
+    pub(crate) fn clear(&self) {
+        let entries = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *entries)
+        };
+        // A queued callback can retain this map after the route retires. Empty
+        // it explicitly, without sending response-finals under the map lock.
+        drop(entries);
+    }
     pub(crate) fn counts(&self) -> (usize, u64) {
         (
             self.entries.lock().unwrap_or_else(|e| e.into_inner()).len(),
@@ -66,12 +81,19 @@ impl PendingQueries {
     }
 }
 
-pub(crate) fn deadline(parameter: Option<&str>, fallback: Duration, now: Instant) -> Instant {
-    let retention = parameter
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(fallback);
-    now.checked_add(retention).unwrap_or_else(|| now + fallback)
+pub(crate) fn deadline(
+    parameter: Option<&str>,
+    now: Instant,
+) -> Result<Option<Instant>, &'static str> {
+    let Some(parameter) = parameter else {
+        return Ok(None);
+    };
+    let millis = parameter
+        .parse::<u64>()
+        .map_err(|_| "expected milliseconds as an unsigned 64-bit integer")?;
+    now.checked_add(Duration::from_millis(millis))
+        .map(Some)
+        .ok_or("deadline exceeds the monotonic clock range")
 }
 
 #[cfg(test)]
@@ -95,34 +117,59 @@ mod tests {
             ],
             false,
         );
-        drop(pending.insert(le, Query::empty(), Instant::now() + Duration::from_secs(1)));
+        drop(pending.insert(
+            le,
+            Query::empty(),
+            Some(Instant::now() + Duration::from_secs(1)),
+        ));
         assert!(pending.take(&be).is_some());
         assert_eq!(pending.counts(), (0, 0));
     }
 
     #[test]
-    fn only_expired_requests_are_released_without_another_message() {
-        let pending = PendingQueries::default();
+    fn only_advertised_deadlines_expire_and_retirement_releases_unknown_deadlines() {
+        use std::sync::Arc;
+
+        let pending = Arc::new(PendingQueries::default());
+        let queued_callback = pending.clone();
         let now = Instant::now();
         let first = CddsRequestHeader::create(1, 1);
         let second = CddsRequestHeader::create(1, 2);
-        drop(pending.insert(first, Query::empty(), now + Duration::from_secs(1)));
-        drop(pending.insert(second, Query::empty(), now + Duration::from_secs(300)));
+        let legacy = CddsRequestHeader::create(1, 3);
+        drop(pending.insert(first, Query::empty(), Some(now + Duration::from_secs(1))));
+        drop(pending.insert(second, Query::empty(), Some(now + Duration::from_secs(300))));
+        drop(pending.insert(legacy, Query::empty(), None));
         pending.expire(now + Duration::from_secs(2));
-        assert_eq!(pending.counts(), (1, 1));
+        assert_eq!(pending.counts(), (2, 1));
         assert!(pending.take(&first).is_none());
         assert!(pending.take(&second).is_some());
-        assert_eq!(pending.counts(), (0, 1));
+        pending.expire(now + Duration::from_secs(86400));
+        assert_eq!(pending.counts(), (1, 1));
+        pending.clear();
+        drop(pending);
+        assert_eq!(queued_callback.counts(), (0, 1));
+        assert!(queued_callback.take(&legacy).is_none());
     }
     #[test]
-    fn peer_timeout_and_legacy_fallback_have_explicit_retention() {
+    fn deadlines_are_either_unknown_explicit_or_invalid_without_a_fallback() {
         let now = Instant::now();
-        let fallback = Duration::from_secs(60);
-        assert_eq!(deadline(None, fallback, now), now + fallback);
-        assert_eq!(deadline(Some("bad"), fallback, now), now + fallback);
+        assert_eq!(deadline(None, now), Ok(None));
+        assert_eq!(deadline(Some("0"), now), Ok(Some(now)));
         assert_eq!(
-            deadline(Some("300000"), fallback, now),
-            now + Duration::from_secs(300)
+            deadline(Some("300000"), now),
+            Ok(Some(now + Duration::from_secs(300)))
         );
+        for parameter in ["", "bad", "-1", "18446744073709551616"] {
+            assert!(deadline(Some(parameter), now).is_err(), "{parameter}");
+        }
+        // A valid u64 may exceed Instant's range on some platforms. It must
+        // either retain its advertised value or fail, never use another timeout.
+        match now.checked_add(Duration::from_millis(u64::MAX)) {
+            Some(expected) => assert_eq!(
+                deadline(Some("18446744073709551615"), now),
+                Ok(Some(expected))
+            ),
+            None => assert!(deadline(Some("18446744073709551615"), now).is_err()),
+        }
     }
 }

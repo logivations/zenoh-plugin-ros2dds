@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use serde::Serialize;
@@ -156,10 +156,6 @@ impl RouteServiceSrv {
         let route_id: String = self.to_string();
         let client_guid = proxy.client_guid;
         let req_writer = proxy.req_writer.access();
-        let retention = self
-            .context
-            .config
-            .get_incoming_query_retention(&self.ros2_name);
         let queryable = Some(
             self.context
                 .zsession
@@ -172,7 +168,6 @@ impl RouteServiceSrv {
                         &route_id,
                         client_guid,
                         &req_writer,
-                        retention,
                     )
                 })
                 .await
@@ -309,6 +304,7 @@ struct ServiceServerProxy {
 impl Drop for ServiceServerProxy {
     fn drop(&mut self) {
         self.req_writer.fence();
+        self.queries_in_progress.clear();
         DdsEndpoint::withdraw_pair(&mut self.rep_reader, &mut self.req_writer);
     }
 }
@@ -386,8 +382,21 @@ fn route_zenoh_request_to_dds(
     route_id: &str,
     client_guid: u64,
     req_writer: &DdsAccess,
-    retention: Duration,
 ) {
+    let deadline = match pending_queries::deadline(
+        query.parameters().get(RETENTION_PARAMETER),
+        Instant::now(),
+    ) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            let message = format!("Invalid {RETENTION_PARAMETER}: {error}");
+            tracing::warn!("{route_id}: {message}");
+            if let Err(error) = query.reply_err(message).wait() {
+                tracing::warn!("{route_id}: failed to reply to invalid request: {error}");
+            }
+            return;
+        }
+    };
     // Empty service requests may contain only the four-byte CDR header.
     let is_little_endian = query
         .payload()
@@ -444,11 +453,6 @@ fn route_zenoh_request_to_dds(
         );
     }
 
-    let deadline = pending_queries::deadline(
-        query.parameters().get(RETENTION_PARAMETER),
-        retention,
-        Instant::now(),
-    );
     let completed = req_writer.with(|writer| {
         let replaced = queries_in_progress.insert(request_id, query, deadline);
         let failed = if let Err(e) = dds_write(writer, dds_req_buf) {
