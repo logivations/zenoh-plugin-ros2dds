@@ -24,7 +24,12 @@ Use a fresh output directory for each run. Processes are stopped on success and
 failure. Default builds must have no `LAB-ONLY lifecycle fault` marker; the hooks
 build must contain it. Hooks are only for tests and must never be packaged.
 
-Both modes require 24/24 real service replies, one independently observed DDS
+Repeat `run.py` with `--camera-mode client` and a fresh output directory for both
+builds. CI runs both topologies: peer/peer as on AMRs, and a client camera connected
+to a peer server as in the camera configuration. Client interest forwarding and
+reconnection must work even when the peer-only case passes.
+
+Both builds require 24/24 real service replies, one independently observed DDS
 request reader/reply writer per service and no duplicate detections after each
 transition. They cover LE/BE request and response correlation, header-only
 requests, same-name node replacement, remote ROS route return while a native

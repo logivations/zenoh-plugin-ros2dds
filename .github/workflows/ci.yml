@@ -201,11 +201,13 @@ jobs:
           exit 1
         fi
         /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/default
+        /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/client --camera-mode client
         /tmp/lifecycle-venv/bin/python tests/lifecycle/request_deadlines.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/deadlines
         /tmp/lifecycle-venv/bin/python tests/lifecycle/type_transition.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/type-transition
         cargo build --locked -p zenoh-bridge-ros2dds --features lifecycle-test-hooks
         grep -aq 'LAB-ONLY lifecycle fault' target/debug/zenoh-bridge-ros2dds
         /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/hooks --faults
+        /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/hooks-client --camera-mode client --faults
         /tmp/lifecycle-venv/bin/python tests/lifecycle/scheduler_retry.py --bridge target/debug/zenoh-bridge-ros2dds --output lifecycle-results/retry
 
     - uses: actions/upload-artifact@v4

@@ -29,7 +29,7 @@ def eventually(check, timeout=20):
 
 
 class Lab:
-    def __init__(self, binary, output):
+    def __init__(self, binary, output, camera_mode="peer"):
         self.binary = str(binary.resolve())
         self.output = output.resolve()
         self.output.mkdir(parents=True, exist_ok=True)
@@ -51,7 +51,7 @@ class Lab:
         self.environment["CYCLONEDDS_URI"] = str(xml)
         for side, domain in [("server", 181), ("camera", 182)]:
             config = {
-                "mode": "peer",
+                "mode": "peer" if side == "server" else camera_mode,
                 "scouting": {"multicast": {"enabled": False}},
                 "transport": {"link": {"tx": {"lease": 10000}}},
                 "plugins": {
@@ -256,8 +256,9 @@ def main():
     parser.add_argument("--bridge", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--faults", action="store_true")
+    parser.add_argument("--camera-mode", choices=("peer", "client"), default="peer")
     args = parser.parse_args()
-    lab = Lab(args.bridge, args.output)
+    lab = Lab(args.bridge, args.output, args.camera_mode)
     try:
         lab.bridge("server")
         lab.bridge("camera")
