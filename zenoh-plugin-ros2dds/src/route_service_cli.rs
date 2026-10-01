@@ -136,7 +136,8 @@ impl RouteServiceCli {
                 .map_err(|e| format!("Failed create Querier for key {zenoh_key_expr}: {e}",))?,
         );
 
-        let lifecycle = RouteLifecycle::new();
+        let lifecycle = RouteLifecycle::new(context.maintenance.clone());
+        let announcement_retry = Retry::new(context.maintenance.clone());
         let observe = lifecycle.observer(context.matching_changed.clone());
         let matching_listener = zenoh_querier
             .matching_listener()
@@ -153,7 +154,7 @@ impl RouteServiceCli {
             queries_timeout,
             proxy: None,
             lifecycle,
-            announcement_retry: Retry::new(),
+            announcement_retry,
             matching_listener: Some(matching_listener),
             type_info,
             liveliness_token: None,
@@ -213,7 +214,7 @@ impl RouteServiceCli {
         if !self.local_nodes.is_empty()
             && self.liveliness_token.is_none()
             && !is_service_for_action(&self.ros2_name)
-            && self.announcement_retry.ready()
+            && self.announcement_retry.ready_or_schedule()
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {

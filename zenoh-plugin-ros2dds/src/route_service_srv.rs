@@ -122,20 +122,26 @@ impl RouteServiceSrv {
         let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
         tracing::debug!("{route_id}: creation with type {ros2_type}");
 
-        Ok(RouteServiceSrv {
+        let lifecycle = RouteLifecycle::new(context.maintenance.clone());
+        let announcement_retry = Retry::new(context.maintenance.clone());
+        let mut route = RouteServiceSrv {
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             context,
             zenoh_queryable: None,
             proxy: None,
-            lifecycle: RouteLifecycle::new(),
-            announcement_retry: Retry::new(),
+            lifecycle,
+            announcement_retry,
             type_info: type_info.clone(),
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
-        })
+        };
+        // A remote-only route must expose its DDS pair without another event.
+        // Creation failure remains owned and schedules a retry.
+        route.reconcile().await;
+        Ok(route)
     }
 
     // Announce the route over Zenoh via a LivelinessToken
@@ -229,7 +235,7 @@ impl RouteServiceSrv {
         if !self.local_nodes.is_empty()
             && self.proxy.is_some()
             && self.zenoh_queryable.is_none()
-            && self.announcement_retry.ready()
+            && self.announcement_retry.ready_or_schedule()
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {
@@ -346,7 +352,7 @@ fn create_proxy(
         qos.clone(),
     )?;
     let client_guid = get_instance_handle(req_writer.entity())?;
-    let queries_in_progress = Arc::new(PendingQueries::default());
+    let queries_in_progress = Arc::new(PendingQueries::new(context.maintenance.clone()));
     let pending = queries_in_progress.clone();
     let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
     let key = zenoh_key_expr.clone();

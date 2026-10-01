@@ -14,7 +14,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::{atomic::Ordering, Arc, RwLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cyclors::{
@@ -39,6 +39,7 @@ use crate::{
     ros_discovery::RosDiscoveryInfoMgr,
     route_action_cli::RouteActionCli,
     route_action_srv::RouteActionSrv,
+    route_lifecycle::Maintenance,
     route_publisher::RoutePublisher,
     route_service_cli::RouteServiceCli,
     route_service_srv::RouteServiceSrv,
@@ -84,6 +85,7 @@ pub struct Context {
     // ros_discovery_info read/write manager
     pub(crate) ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
     pub(crate) matching_changed: Arc<tokio::sync::Notify>,
+    pub(crate) maintenance: Arc<Maintenance>,
 }
 
 pub struct RoutesMgr {
@@ -121,6 +123,7 @@ impl RoutesMgr {
             discovered_entities,
             ros_discovery_mgr,
             matching_changed: Arc::new(tokio::sync::Notify::new()),
+            maintenance: Arc::new(Maintenance::default()),
         };
 
         RoutesMgr {
@@ -147,9 +150,18 @@ impl RoutesMgr {
         self.context.matching_changed.clone()
     }
 
+    pub(crate) fn maintenance(&self) -> Arc<Maintenance> {
+        self.context.maintenance.clone()
+    }
+
+    pub(crate) fn maintenance_not_before(&self) -> Instant {
+        // Keep the former 250 ms retry/expiry scan bound without idle polling.
+        // Short RPC deadlines must not turn one scan per request into O(routes).
+        self.last_reconciled + Duration::from_millis(250)
+    }
+
     pub(crate) async fn reconcile(&mut self) {
-        #[cfg(feature = "lifecycle-test-hooks")]
-        self.inject_test_fault();
+        self.context.maintenance.begin_reconcile();
         for route in self.routes_publishers.values_mut() {
             route.reconcile().await;
         }
@@ -173,7 +185,7 @@ impl RoutesMgr {
     }
 
     #[cfg(feature = "lifecycle-test-hooks")]
-    fn inject_test_fault(&mut self) {
+    pub(crate) fn inject_test_fault(&mut self) {
         use crate::{
             dds_endpoint::{self, DdsEndpoint},
             lifecycle_test_hooks::{self, Command},
@@ -1022,7 +1034,7 @@ mod tests {
     use cyclors::{dds_create_domain, dds_create_participant};
 
     #[test]
-    fn action_retirement_removes_the_route_and_its_admin_entry() {
+    fn remote_action_creates_discovery_endpoints_without_a_tick_and_retires_cleanly() {
         let _serial = DDS_TEST.lock().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -1053,6 +1065,11 @@ mod tests {
             ] {
                 manager.on_ros_announcement_event(announce).await.unwrap();
                 assert!(manager.admin_space.contains_key(&(prefix / &zenoh_key_expr)));
+                // No matching callback or maintenance tick is required for the
+                // remote-only discovery writers / request-reply pairs.
+                let endpoints: usize = manager.routes_action_cli.values().map(RouteActionCli::endpoint_count).sum::<usize>()
+                    + manager.routes_action_srv.values().map(RouteActionSrv::endpoint_count).sum::<usize>();
+                assert_eq!(endpoints, if prefix == *KE_PREFIX_ROUTE_ACTION_CLI { 2 } else { 6 });
                 manager.on_ros_announcement_event(retire).await.unwrap();
                 assert!(manager.admin_space.is_empty());
                 assert!(manager.routes_action_cli.is_empty() && manager.routes_action_srv.is_empty());

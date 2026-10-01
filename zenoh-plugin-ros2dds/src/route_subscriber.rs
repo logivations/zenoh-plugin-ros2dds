@@ -135,15 +135,17 @@ impl RouteSubscriber {
             writer_qos.reliability = None;
         }
 
-        Ok(RouteSubscriber {
+        let lifecycle = RouteLifecycle::new(context.maintenance.clone());
+        let announcement_retry = Retry::new(context.maintenance.clone());
+        let mut route = RouteSubscriber {
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             context,
             zenoh_subscriber: None,
             dds_writer: None,
-            lifecycle: RouteLifecycle::new(),
-            announcement_retry: Retry::new(),
+            lifecycle,
+            announcement_retry,
             writer_qos,
             discovered_reader_qos: None,
             transient_local,
@@ -152,7 +154,11 @@ impl RouteSubscriber {
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
-        })
+        };
+        // Remote-only routes also need their DDS endpoint immediately. A failed
+        // creation remains owned and schedules its retry without a polling tick.
+        route.reconcile().await;
+        Ok(route)
     }
 
     // Announce the route over Zenoh via a LivelinessToken
@@ -253,7 +259,7 @@ impl RouteSubscriber {
         if !self.local_nodes.is_empty()
             && self.dds_writer.is_some()
             && self.zenoh_subscriber.is_none()
-            && self.announcement_retry.ready()
+            && self.announcement_retry.ready_or_schedule()
         {
             if let Some(qos) = self.discovered_reader_qos.clone() {
                 let result = self.announce_route(&qos).await;

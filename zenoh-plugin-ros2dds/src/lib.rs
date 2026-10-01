@@ -492,12 +492,27 @@ impl ROS2PluginRuntime {
         );
 
         let matching_changed = routes_mgr.matching_changed();
-        let mut retry_tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let maintenance = routes_mgr.maintenance();
+        #[cfg(feature = "lifecycle-test-hooks")]
+        let mut fault_tick = {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick
+        };
         loop {
+            let maintenance_not_before = routes_mgr.maintenance_not_before();
             select!(
                 _ = matching_changed.notified().fuse() => { routes_mgr.reconcile().await; },
-                _ = retry_tick.tick().fuse() => { routes_mgr.reconcile().await; },
+                _ = maintenance.wait(maintenance_not_before).fuse() => { routes_mgr.reconcile().await; },
+                _ = async {
+                    #[cfg(feature = "lifecycle-test-hooks")]
+                    fault_tick.tick().await;
+                    #[cfg(not(feature = "lifecycle-test-hooks"))]
+                    std::future::pending::<()>().await;
+                }.fuse() => {
+                    #[cfg(feature = "lifecycle-test-hooks")]
+                    routes_mgr.inject_test_fault();
+                },
                 evt = discovery_rcv.recv_async() => {
                     match evt {
                         Ok(evt) => {
