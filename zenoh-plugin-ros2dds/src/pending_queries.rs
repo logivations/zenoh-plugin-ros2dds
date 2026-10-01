@@ -4,7 +4,6 @@
 //! Expire only deadlines advertised by the caller; legacy/native deadlines are unknown.
 //! Retirement releases every pending query, including those with no known deadline.
 //! Query destruction can send a Zenoh response-final: always drop outside the lock.
-use crate::{ros2_utils::CddsRequestHeader, route_lifecycle::Maintenance};
 use std::{
     collections::HashMap,
     sync::{
@@ -13,7 +12,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
 use zenoh::query::Query;
+
+use crate::{ros2_utils::CddsRequestHeader, route_lifecycle::Maintenance};
 
 pub(crate) const RETENTION_PARAMETER: &str = "__ros2dds_timeout_ms";
 

@@ -5,11 +5,13 @@
 //! The route manager owns resources and calls `reconcile`. Each route allocates
 //! its own observation cell: an old listener can never address a replacement.
 
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
-use std::time::{Duration, Instant};
 
 use serde::{Serialize, Serializer};
 use tokio::sync::Notify;
@@ -217,9 +219,11 @@ impl RouteLifecycle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use futures::{poll, FutureExt};
     use std::sync::atomic::AtomicUsize;
+
+    use futures::{poll, FutureExt};
+
+    use super::*;
 
     async fn due(maintenance: &Maintenance) {
         tokio::time::timeout(Duration::from_secs(1), maintenance.wait(Instant::now()))

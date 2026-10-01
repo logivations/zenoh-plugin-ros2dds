@@ -1021,11 +1021,10 @@ impl RoutesMgr {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::dds_endpoint::DDS_TEST;
-    use crate::dds_utils::delete_dds_entity;
-    use crate::gid::Gid;
     use cyclors::{dds_create_domain, dds_create_participant};
+
+    use super::*;
+    use crate::{dds_endpoint::DDS_TEST, dds_utils::delete_dds_entity, gid::Gid};
 
     #[test]
     fn remote_action_creates_discovery_endpoints_without_a_tick_and_retires_cleanly() {

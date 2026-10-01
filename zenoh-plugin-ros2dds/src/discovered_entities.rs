@@ -779,9 +779,10 @@ fn remove_null_qos_values(
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use cyclors::qos::Qos;
+
     use super::*;
     use crate::ros_discovery::NodeEntitiesInfo;
-    use cyclors::qos::Qos;
     fn gid(n: u8) -> Gid {
         Gid::from([n; 16])
     }
@@ -1742,11 +1743,12 @@ mod lifecycle_tests {
 
 #[cfg(test)]
 mod cpu_benchmark {
-    use super::*;
-    use crate::dds_discovery::DDSDiscoveryEvent;
-    use crate::ros_discovery::NodeEntitiesInfo;
-    use cyclors::qos::Qos;
     use std::time::Instant;
+
+    use cyclors::qos::Qos;
+
+    use super::*;
+    use crate::{dds_discovery::DDSDiscoveryEvent, ros_discovery::NodeEntitiesInfo};
 
     fn id(n: usize) -> Gid {
         let mut bytes = [0; 16];
@@ -1857,9 +1859,10 @@ mod cpu_benchmark {
 mod survivor_shape_benchmark {
     use std::{hint::black_box, time::Instant};
 
+    use cyclors::qos::Qos;
+
     use super::*;
     use crate::ros_discovery::NodeEntitiesInfo;
-    use cyclors::qos::Qos;
 
     const NODE: &str = "/dense_node";
     const SERVICE: &str = "/dense";
