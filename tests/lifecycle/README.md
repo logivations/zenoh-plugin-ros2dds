@@ -80,3 +80,15 @@ Run it on the same host/toolchain against the baseline;
 wall-clock thresholds are intentionally not asserted in shared CI. Complete-binary
 CPU measurements must also cover paced node teardown and measure settled idle
 separately: including `destroy_node()` in an idle interval mislabels teardown CPU.
+
+Also compare the dense-survivor and repeated-metadata workloads:
+
+```sh
+cargo test --locked --release -p zenoh-plugin-ros2dds --lib survivor_shape_benchmark -- --ignored --nocapture
+```
+
+The dense case removes the currently selected endpoint at every step and checks
+the exact replacement and final withdrawal. The update case changes canonical
+QoS metadata without changing identity and checks the final values. These cover
+costs that a many-topic creation benchmark cannot reveal. Record both creation
+and disposal costs and retain raw repeated results; no timing threshold runs in CI.

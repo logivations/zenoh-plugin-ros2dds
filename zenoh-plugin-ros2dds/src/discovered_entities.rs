@@ -13,7 +13,7 @@
 //
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::{self, Debug},
 };
 
@@ -56,28 +56,39 @@ pub struct DiscoveredEntities {
 #[derive(Default)]
 struct Endpoints {
     entities: HashMap<Gid, DdsEntity>,
-    topics: HashMap<Gid, HashMap<String, HashSet<Gid>>>,
+    topics: HashMap<Gid, HashMap<String, BTreeSet<Gid>>>,
+}
+
+enum EndpointUpdate<'a> {
+    Metadata,
+    Identity {
+        current: &'a DdsEntity,
+        previous: Option<(Gid, String)>,
+    },
 }
 
 impl Endpoints {
-    fn insert(&mut self, entity: DdsEntity) {
+    fn insert(&mut self, entity: DdsEntity) -> EndpointUpdate<'_> {
         let key = entity.key;
         if let Some(previous) = self.entities.get_mut(&key) {
             if previous.participant_key == entity.participant_key
                 && previous.topic_name == entity.topic_name
             {
                 *previous = entity;
-                return;
+                return EndpointUpdate::Metadata;
             }
         }
-        self.remove(&key);
+        let previous = self
+            .remove(&key)
+            .map(|previous| (previous.participant_key, previous.topic_name));
         self.topics
             .entry(entity.participant_key)
             .or_default()
             .entry(entity.topic_name.clone())
             .or_default()
             .insert(key);
-        self.entities.insert(key, entity);
+        let current = self.entities.entry(key).or_insert(entity);
+        EndpointUpdate::Identity { current, previous }
     }
 
     fn remove(&mut self, key: &Gid) -> Option<DdsEntity> {
@@ -102,13 +113,37 @@ impl Endpoints {
         }
     }
 
-    fn on_topic(&self, participant: &Gid, topic: &str) -> impl Iterator<Item = &DdsEntity> {
+    fn on_topic(
+        &self,
+        participant: &Gid,
+        topic: &str,
+    ) -> impl DoubleEndedIterator<Item = &DdsEntity> {
         self.topics
             .get(participant)
             .and_then(|topics| topics.get(topic))
             .into_iter()
             .flatten()
             .map(|key| &self.entities[key])
+    }
+
+    fn replacement(&self, removed: &DdsEntity, membership: &HashSet<Gid>) -> Option<&DdsEntity> {
+        let mut fallback = None;
+        // Reverse GID order preserves max(type_matches, GID), but a compatible
+        // survivor needs no inspection of the rest of a densely shared topic.
+        for candidate in self
+            .on_topic(&removed.participant_key, &removed.topic_name)
+            .rev()
+        {
+            if membership.contains(&candidate.key) {
+                if candidate.type_name == removed.type_name {
+                    return Some(candidate);
+                }
+                if fallback.is_none() {
+                    fallback = Some(candidate);
+                }
+            }
+        }
+        fallback
     }
 
     fn get(&self, key: &Gid) -> Option<&DdsEntity> {
@@ -209,16 +244,6 @@ impl DiscoveredEntities {
 
     #[inline]
     fn add_writer(&mut self, writer: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
-        self.admin_space.insert(
-            keformat!(
-                ke_admin_writer::formatter(),
-                pgid = writer.participant_key,
-                wgid = writer.key,
-                topic = &writer.topic_name
-            )
-            .unwrap(),
-            EntityRef::Writer(writer.key),
-        );
         let mut events = Vec::new();
         if let Some(nodes) = self.nodes_info.get_mut(&writer.participant_key) {
             for node in nodes.values_mut() {
@@ -232,7 +257,29 @@ impl DiscoveredEntities {
                 }
             }
         }
-        self.writers.insert(writer);
+        if let EndpointUpdate::Identity { current, previous } = self.writers.insert(writer) {
+            if let Some((participant, topic)) = previous {
+                self.admin_space.remove(
+                    &keformat!(
+                        ke_admin_writer::formatter(),
+                        pgid = participant,
+                        wgid = current.key,
+                        topic = topic
+                    )
+                    .unwrap(),
+                );
+            }
+            self.admin_space.insert(
+                keformat!(
+                    ke_admin_writer::formatter(),
+                    pgid = current.participant_key,
+                    wgid = current.key,
+                    topic = &current.topic_name
+                )
+                .unwrap(),
+                EntityRef::Writer(current.key),
+            );
+        }
         events
     }
 
@@ -271,13 +318,7 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_writer(gid);
                     if tracked {
-                        match self
-                            .writers
-                            .on_topic(&writer.participant_key, &writer.topic_name)
-                            .filter(|candidate| membership.contains(&candidate.key))
-                            .max_by_key(|candidate| {
-                                (candidate.type_name == writer.type_name, candidate.key)
-                            }) {
+                        match self.writers.replacement(&writer, membership) {
                             Some(replacement) => push_replacement_events(
                                 &mut events,
                                 withdrawal,
@@ -295,16 +336,6 @@ impl DiscoveredEntities {
 
     #[inline]
     fn add_reader(&mut self, reader: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
-        self.admin_space.insert(
-            keformat!(
-                ke_admin_reader::formatter(),
-                pgid = reader.participant_key,
-                wgid = reader.key,
-                topic = &reader.topic_name
-            )
-            .unwrap(),
-            EntityRef::Reader(reader.key),
-        );
         let mut events = Vec::new();
         if let Some(nodes) = self.nodes_info.get_mut(&reader.participant_key) {
             for node in nodes.values_mut() {
@@ -318,7 +349,29 @@ impl DiscoveredEntities {
                 }
             }
         }
-        self.readers.insert(reader);
+        if let EndpointUpdate::Identity { current, previous } = self.readers.insert(reader) {
+            if let Some((participant, topic)) = previous {
+                self.admin_space.remove(
+                    &keformat!(
+                        ke_admin_reader::formatter(),
+                        pgid = participant,
+                        wgid = current.key,
+                        topic = topic
+                    )
+                    .unwrap(),
+                );
+            }
+            self.admin_space.insert(
+                keformat!(
+                    ke_admin_reader::formatter(),
+                    pgid = current.participant_key,
+                    wgid = current.key,
+                    topic = &current.topic_name
+                )
+                .unwrap(),
+                EntityRef::Reader(current.key),
+            );
+        }
         events
     }
 
@@ -357,13 +410,7 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_reader(gid);
                     if tracked {
-                        match self
-                            .readers
-                            .on_topic(&reader.participant_key, &reader.topic_name)
-                            .filter(|candidate| membership.contains(&candidate.key))
-                            .max_by_key(|candidate| {
-                                (candidate.type_name == reader.type_name, candidate.key)
-                            }) {
+                        match self.readers.replacement(&reader, membership) {
                             Some(replacement) => push_replacement_events(
                                 &mut events,
                                 withdrawal,
@@ -854,6 +901,91 @@ mod lifecycle_tests {
         assert!(endpoints.remove(&gid(20)).is_none());
         assert!(endpoints.entities.is_empty());
         assert!(endpoints.topics.is_empty());
+    }
+
+    #[test]
+    fn ordered_survivor_preserves_compatible_type_then_highest_member_gid() {
+        let mut endpoints = Endpoints::default();
+        let removed = entity(1, 10, true);
+        for id in [24, 21, 23, 20, 22] {
+            let mut candidate = entity(1, id, true);
+            if id % 2 == 0 {
+                candidate.type_name = "other::srv::dds_::Response_".into();
+            }
+            endpoints.insert(candidate);
+        }
+        endpoints.insert(entity(2, 30, true));
+        let mut other_topic = entity(1, 31, true);
+        other_topic.topic_name = "rr/otherReply".into();
+        endpoints.insert(other_topic);
+
+        // Every subset includes the empty case, an ineligible highest GID,
+        // same-type preference over a higher different type, and fallback.
+        for subset in 0u8..32 {
+            let mut membership: HashSet<_> = (20..25)
+                .filter(|id| subset & (1 << (id - 20)) != 0)
+                .map(gid)
+                .collect();
+            membership.extend([gid(30), gid(31)]);
+            let expected = endpoints
+                .entities
+                .values()
+                .filter(|candidate| {
+                    candidate.participant_key == removed.participant_key
+                        && candidate.topic_name == removed.topic_name
+                        && membership.contains(&candidate.key)
+                })
+                .max_by_key(|candidate| (candidate.type_name == removed.type_name, candidate.key))
+                .map(|candidate| candidate.key);
+            assert_eq!(
+                endpoints
+                    .replacement(&removed, &membership)
+                    .map(|candidate| candidate.key),
+                expected,
+                "membership subset {subset}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_admin_identity_follows_canonical_metadata() {
+        for writer in [false, true] {
+            let mut discovered = DiscoveredEntities::default();
+            let mut endpoint = entity(1, 20, writer);
+            let update = |discovered: &mut DiscoveredEntities, endpoint| {
+                if writer {
+                    discovered.add_writer(endpoint)
+                } else {
+                    discovered.add_reader(endpoint)
+                }
+            };
+            assert!(update(&mut discovered, endpoint.clone()).is_empty());
+            let old_admin_key = discovered.admin_space.keys().next().unwrap().clone();
+
+            endpoint.qos.user_data = Some(vec![1, 2, 3]);
+            assert!(update(&mut discovered, endpoint.clone()).is_empty());
+            assert_eq!(discovered.admin_space.len(), 1);
+            assert!(discovered.admin_space.contains_key(&old_admin_key));
+            let metadata = if writer {
+                discovered.get_writer(&endpoint.key)
+            } else {
+                discovered.get_reader(&endpoint.key)
+            }
+            .unwrap();
+            assert_eq!(metadata.qos.user_data, Some(vec![1, 2, 3]));
+
+            endpoint.participant_key = gid(2);
+            endpoint.topic_name = "rr/movedReply".into();
+            assert!(update(&mut discovered, endpoint).is_empty());
+            assert_eq!(discovered.admin_space.len(), 1);
+            assert!(!discovered.admin_space.contains_key(&old_admin_key));
+            discovered.remove_participant(&gid(1));
+            assert_eq!(discovered.admin_space.len(), 1);
+            discovered.remove_participant(&gid(2));
+            assert!(discovered.admin_space.is_empty());
+            assert_eq!(discovered.readers.len(), 0);
+            assert_eq!(discovered.writers.len(), 0);
+        }
     }
 
     fn interface_endpoints(action: bool, client: bool, copy: u8) -> Vec<(bool, DdsEntity)> {
@@ -1673,6 +1805,271 @@ mod cpu_benchmark {
                         .sum();
                     assert_eq!(complete, base);
                     println!("BENCH {{\"nodes\":{nodes},\"base_services\":{base},\"added_services\":{added},\"repeat\":{repeat},\"add_us\":{elapsed_us},\"remove_us\":{remove_us},\"emitted\":{emitted},\"complete\":{complete}}}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod survivor_shape_benchmark {
+    use std::{hint::black_box, time::Instant};
+
+    use super::*;
+    use crate::ros_discovery::NodeEntitiesInfo;
+    use cyclors::qos::Qos;
+
+    const NODE: &str = "/dense_node";
+    const SERVICE: &str = "/dense";
+    const REPEATS: usize = 7;
+    const UPDATES: usize = 65_536;
+
+    fn participant() -> Gid {
+        let mut bytes = [0x42; 16];
+        bytes[12..].copy_from_slice(&[0, 0, 1, 0xc1]);
+        Gid::from(bytes)
+    }
+
+    // DDS-like common participant prefix and monotonically ordered entity IDs.
+    // Big-endian rank is essential: numerical descending removal must match Gid::Ord.
+    fn endpoint_gid(rank: usize, writer: bool) -> Gid {
+        let mut bytes = [0x42; 16];
+        bytes[12..15].copy_from_slice(&((rank + 1) as u32).to_be_bytes()[1..]);
+        bytes[15] = if writer { 3 } else { 4 };
+        Gid::from(bytes)
+    }
+
+    fn endpoint(rank: usize, writer: bool) -> DdsEntity {
+        DdsEntity {
+            key: endpoint_gid(rank, writer),
+            participant_key: participant(),
+            topic_name: if writer {
+                "rq/denseRequest"
+            } else {
+                "rr/denseReply"
+            }
+            .into(),
+            type_name: if writer {
+                "example_interfaces::srv::dds_::AddTwoInts_Request_"
+            } else {
+                "example_interfaces::srv::dds_::AddTwoInts_Response_"
+            }
+            .into(),
+            _type_info: None,
+            keyless: true,
+            qos: Qos::default(),
+        }
+    }
+
+    fn discovery(entity: DdsEntity, writer: bool) -> DDSDiscoveryEvent {
+        if writer {
+            DDSDiscoveryEvent::DiscoveredPublication { entity }
+        } else {
+            DDSDiscoveryEvent::DiscoveredSubscription { entity }
+        }
+    }
+
+    fn disposal(key: Gid, writer: bool) -> DDSDiscoveryEvent {
+        if writer {
+            DDSDiscoveryEvent::UndiscoveredPublication { key }
+        } else {
+            DDSDiscoveryEvent::UndiscoveredSubscription { key }
+        }
+    }
+
+    fn component(entities: &ServiceCliEntities, writer: bool) -> Gid {
+        if writer {
+            entities.req_writer
+        } else {
+            entities.rep_reader
+        }
+    }
+
+    fn selected(d: &DiscoveredEntities, writer: bool) -> Gid {
+        component(
+            &d.nodes_info[&participant()][NODE].service_cli[SERVICE].entities,
+            writer,
+        )
+    }
+
+    fn fixture(endpoints: usize) -> DiscoveredEntities {
+        let mut d = DiscoveredEntities::default();
+        assert!(d
+            .apply_dds_event(DDSDiscoveryEvent::DiscoveredParticipant {
+                entity: DdsParticipant {
+                    key: participant(),
+                    qos: Qos::default()
+                },
+            })
+            .is_empty());
+        let mut graph = ParticipantEntitiesInfo::new(participant());
+        let mut node = NodeEntitiesInfo::new("/".into(), "dense_node".into());
+        for rank in 0..endpoints {
+            for writer in [false, true] {
+                let entity = endpoint(rank, writer);
+                if writer {
+                    node.writer_gid_seq.insert(entity.key);
+                } else {
+                    node.reader_gid_seq.insert(entity.key);
+                }
+                assert!(d.apply_dds_event(discovery(entity, writer)).is_empty());
+            }
+        }
+        graph.node_entities_info_seq.insert(NODE.to_owned(), node);
+        assert!(matches!(
+            d.update_participant_info(graph).as_slice(),
+            [ROS2DiscoveryEvent::DiscoveredServiceCli(..)]
+        ));
+        assert_eq!(selected(&d, true), endpoint_gid(endpoints - 1, true));
+        assert_eq!(selected(&d, false), endpoint_gid(endpoints - 1, false));
+        assert_eq!(d.writers.len(), endpoints);
+        assert_eq!(d.readers.len(), endpoints);
+        d
+    }
+
+    fn canonical(d: &DiscoveredEntities, rank: usize, writer: bool) -> &DdsEntity {
+        if writer {
+            d.get_writer(&endpoint_gid(rank, writer)).unwrap()
+        } else {
+            d.get_reader(&endpoint_gid(rank, writer)).unwrap()
+        }
+    }
+
+    #[test]
+    #[ignore = "matched release microbenchmark; root coordinates immutable ELF comparisons"]
+    fn dense_selected_disposal() {
+        for endpoints in [1, 8, 64, 512, 2048] {
+            for writer in [false, true] {
+                for repeat in 0..REPEATS {
+                    let mut d = fixture(endpoints);
+                    let start = Instant::now();
+                    let mut replacements = 0;
+                    let mut withdrawals = 0;
+                    for rank in (0..endpoints).rev() {
+                        // This check stays in the measured loop for both variants:
+                        // every removal must exercise the selected-survivor path.
+                        let key = endpoint_gid(rank, writer);
+                        assert_eq!(selected(&d, writer), key);
+                        let events = black_box(d.apply_dds_event(disposal(key, writer)));
+                        if rank > 0 {
+                            let expected = endpoint_gid(rank - 1, writer);
+                            assert!(
+                                matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredServiceCli(p, node, service)]
+                                if *p == participant() && node == NODE && service.name == SERVICE
+                                && service.is_complete() && component(&service.entities, writer) == expected)
+                            );
+                            assert_eq!(selected(&d, writer), expected);
+                            replacements += 1;
+                        } else {
+                            assert!(
+                                matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredServiceCli(p, node, service)]
+                                if *p == participant() && node == NODE && service.name == SERVICE)
+                            );
+                            assert_eq!(selected(&d, writer), Gid::NOT_DISCOVERED);
+                            withdrawals += 1;
+                        }
+                    }
+                    let elapsed_ns = start.elapsed().as_nanos();
+                    assert_eq!(replacements, endpoints - 1);
+                    assert_eq!(withdrawals, 1);
+                    assert_eq!(
+                        if writer {
+                            d.writers.len()
+                        } else {
+                            d.readers.len()
+                        },
+                        0
+                    );
+                    assert_eq!(
+                        if writer {
+                            d.readers.len()
+                        } else {
+                            d.writers.len()
+                        },
+                        endpoints
+                    );
+                    assert!(!d.nodes_info[&participant()][NODE].service_cli[SERVICE].is_complete());
+                    println!(
+                        "SURVIVOR_BENCH {}",
+                        serde_json::json!({
+                            "kind":"dense_selected_disposal", "manifest_dir":env!("CARGO_MANIFEST_DIR"),
+                            "endpoints_per_direction":endpoints, "writer":writer, "repeat":repeat,
+                            "elapsed_ns":elapsed_ns, "ns_per_removal":elapsed_ns as f64/endpoints as f64,
+                            "replacements":replacements, "withdrawals":withdrawals,
+                            "oracle":"actual selected GID checked before and after every measured removal",
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "matched release microbenchmark; root coordinates immutable ELF comparisons"]
+    fn duplicate_metadata_updates() {
+        for endpoints in [1, 64, 2048] {
+            for writer in [false, true] {
+                for round_robin in [false, true] {
+                    if round_robin && endpoints != 2048 {
+                        continue;
+                    }
+                    for repeat in 0..REPEATS {
+                        let mut d = fixture(endpoints);
+                        // Owned DDS samples are prepared outside the measured API calls.
+                        let input = (0..UPDATES)
+                            .map(|update| {
+                                let rank = if round_robin {
+                                    update % endpoints
+                                } else {
+                                    endpoints - 1
+                                };
+                                let mut entity = endpoint(rank, writer);
+                                entity.qos.user_data = Some((update as u64).to_be_bytes().to_vec());
+                                discovery(entity, writer)
+                            })
+                            .collect::<Vec<_>>();
+                        let start = Instant::now();
+                        let mut emitted = 0;
+                        for event in input {
+                            emitted += black_box(d.apply_dds_event(black_box(event))).len();
+                        }
+                        let elapsed_ns = start.elapsed().as_nanos();
+                        assert_eq!(emitted, 0);
+                        assert_eq!(d.writers.len(), endpoints);
+                        assert_eq!(d.readers.len(), endpoints);
+                        assert_eq!(d.admin_space.len(), 2 * endpoints + 2);
+                        assert_eq!(selected(&d, true), endpoint_gid(endpoints - 1, true));
+                        assert_eq!(selected(&d, false), endpoint_gid(endpoints - 1, false));
+                        assert!(
+                            d.nodes_info[&participant()][NODE].service_cli[SERVICE].is_complete()
+                        );
+                        let ranks = if round_robin {
+                            0..endpoints
+                        } else {
+                            endpoints - 1..endpoints
+                        };
+                        for rank in ranks {
+                            let last_update = if round_robin {
+                                UPDATES - endpoints + rank
+                            } else {
+                                UPDATES - 1
+                            };
+                            assert_eq!(
+                                canonical(&d, rank, writer).qos.user_data.as_deref(),
+                                Some((last_update as u64).to_be_bytes().as_slice())
+                            );
+                        }
+                        println!(
+                            "SURVIVOR_BENCH {}",
+                            serde_json::json!({
+                                "kind":"duplicate_metadata_updates", "manifest_dir":env!("CARGO_MANIFEST_DIR"),
+                                "endpoints_per_direction":endpoints, "writer":writer, "repeat":repeat,
+                                "round_robin":round_robin, "updates":UPDATES, "emitted":emitted,
+                                "elapsed_ns":elapsed_ns, "ns_per_update":elapsed_ns as f64/UPDATES as f64,
+                                "metadata":"canonical QoS user_data checked against final per-GID update sequence",
+                            })
+                        );
+                    }
                 }
             }
         }
