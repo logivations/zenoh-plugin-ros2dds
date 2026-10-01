@@ -100,10 +100,14 @@ external log-string watchdogs must not kill this process during that backoff.
 ## Provenance
 
 The existing Zenoh dependencies share one pinned 1.10.1 core commit from the
-[literal matching patch](https://github.com/logivations/zenoh/pull/1). It uses
+[core patch](https://github.com/logivations/zenoh/pull/1). It uses
 the existing child hash lookup for literal resource keys, avoiding repeated
 full-tree walks when correctly retired Queriers are recreated. Wildcard matching
-retains the upstream traversal, and resource ownership is unchanged.
+retains the upstream traversal. Cleanup compares resource identities without
+temporary strong owners and checks remaining interest owners only when an
+upstream destination needs a Final. Future ownership uses resource/options;
+requesting an initial snapshot does not create a separate ownership group.
+Current-query completion remains separate. No new ownership index or task is added.
 
 The participant identity and CString fixes preserve the isolated upstream #705
 changes (`33e0078eb42aae13510836947467ecc46a5df9eb` and
