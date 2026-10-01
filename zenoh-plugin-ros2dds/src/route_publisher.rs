@@ -272,8 +272,8 @@ impl RoutePublisher {
                 .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
-            && !is_message_for_action(&self.ros2_name)
             && self.liveliness_token.is_none()
+            && !is_message_for_action(&self.ros2_name)
             && self.announcement_retry.ready()
         {
             if let Some(qos) = self.discovered_writer_qos.clone() {

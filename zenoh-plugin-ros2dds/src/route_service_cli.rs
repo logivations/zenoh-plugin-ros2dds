@@ -211,8 +211,8 @@ impl RouteServiceCli {
                 .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
-            && !is_service_for_action(&self.ros2_name)
             && self.liveliness_token.is_none()
+            && !is_service_for_action(&self.ros2_name)
             && self.announcement_retry.ready()
         {
             let result = self.announce_route().await;

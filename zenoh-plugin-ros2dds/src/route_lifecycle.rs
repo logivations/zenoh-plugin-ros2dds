@@ -117,6 +117,11 @@ impl RouteLifecycle {
         actual: &mut Option<T>,
         create: impl FnOnce() -> Result<T, String>,
     ) -> Result<(), String> {
+        // Stable routes need neither a clock read nor another retry-state write.
+        // A withdrawn failed activation must still clear its previous backoff.
+        if self.retry.consecutive_failures == 0 && self.desired() == actual.is_some() {
+            return Ok(());
+        }
         self.reconcile_at(actual, Instant::now(), create)
     }
 
@@ -236,5 +241,30 @@ mod tests {
         assert!(actual.is_some());
         assert!(owner.retry.last_error.is_none());
         assert_eq!(owner.retry.activation_failures, 1);
+    }
+
+    #[test]
+    fn withdrawn_failed_activation_clears_backoff_before_matching_returns() {
+        let mut owner = RouteLifecycle::new();
+        let mut actual = None;
+        owner.set_desired(true);
+        owner
+            .reconcile::<()>(&mut actual, || Err("creation failed".into()))
+            .unwrap_err();
+        assert_eq!(owner.retry.consecutive_failures, 1);
+
+        owner.set_desired(false);
+        owner
+            .reconcile(&mut actual, || panic!("creation without demand"))
+            .unwrap();
+        assert_eq!(owner.retry.consecutive_failures, 0);
+        assert!(owner.retry.last_error.is_none());
+
+        owner.set_desired(true);
+        owner.reconcile(&mut actual, || Ok(())).unwrap();
+        assert!(
+            actual.is_some(),
+            "withdrawn failure must not delay new demand"
+        );
     }
 }
