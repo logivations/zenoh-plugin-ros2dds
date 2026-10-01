@@ -29,7 +29,11 @@ request reader/reply writer per service and no duplicate detections after each
 transition. They cover LE/BE request and response correlation, header-only
 requests, same-name node replacement, remote ROS route return while a native
 queryable keeps matching true (D3), and repeated client creation/removal with no
-server (historical #382/#533).
+server (historical #382/#533). The D3 queryable receives requests but never
+replies, so it cannot mask failure of the real ROS service. Endpoint arrays must
+contain all 24 services; an empty observation cannot count as healthy. Recovery
+requires three distinct fresh successful probe rows, including new requests
+after the transition, rather than one previously in-flight response batch.
 
 Default mode exceeds DDS and Zenoh leases on each bridge, then requires recovery
 without restarting either. Hooks mode fails each of the eight pair construction

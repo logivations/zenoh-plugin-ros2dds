@@ -153,21 +153,27 @@ class Lab:
 
     def healthy(self):
         after = time.time()
+        consecutive = 0
+        last_wall = None
 
         def ready():
+            nonlocal consecutive, last_wall
             for name, process in self.processes.items():
                 assert process.poll() is None, f"{name} exited; see {name}.log"
             row = self.latest_probe()
-            if row:
-                return (
-                    row["wall"] >= after
+            if row and row["wall"] >= after and row["wall"] != last_wall:
+                last_wall = row["wall"]
+                healthy = (
+                    time.time() - row["wall"] < 3
                     and row["ready"] == row["ok"] == 24
                     and row["bad"] == 0
                     and row["duplicates"] == 0
                     and row["detections"] > 0
+                    and len(row["readers"]) == len(row["writers"]) == 24
                     and all(n == 1 for n in row["readers"] + row["writers"])
                 )
-            return False
+                consecutive = consecutive + 1 if healthy else 0
+            return consecutive >= 3
 
         eventually(ready)
         for side in ("server", "camera"):
@@ -294,20 +300,30 @@ def main():
             lab.healthy()
             print("PASS: same-name replacement after delayed dispose", flush=True)
 
+            native_queries = 0
+
+            def keep_matching(_query):
+                nonlocal native_queries
+                native_queries += 1
+                # Only the ROS service may satisfy the probe's response oracle.
+
             native = session.declare_queryable(
-                "test/frame_0",
-                lambda q: q.reply("test/frame_0", b"\0\1\0\0" + struct.pack("<q", 3)),
+                "test/frame_0", keep_matching, complete=False
             )
             try:
+                lab.healthy()
+                assert native_queries > 0, "Native queryable never received a request"
                 lab.stop("ros-camera")
                 eventually(
                     lambda: not any(
-                        r.get("is_active")
+                        r["is_active"]
                         for r in lab.admin("camera", "route/service/srv/**")
                     )
                 )
+                before_return = native_queries
                 lab.node("camera")
                 lab.healthy()
+                assert native_queries > before_return
             finally:
                 native.undeclare()
             lab.healthy()
