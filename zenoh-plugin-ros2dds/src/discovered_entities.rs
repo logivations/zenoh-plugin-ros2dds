@@ -67,6 +67,11 @@ enum EndpointUpdate<'a> {
     },
 }
 
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    static SURVIVOR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Endpoints {
     fn insert(&mut self, entity: DdsEntity) -> EndpointUpdate<'_> {
         let key = entity.key;
@@ -113,6 +118,7 @@ impl Endpoints {
         }
     }
 
+    #[cfg(test)]
     fn on_topic(
         &self,
         participant: &Gid,
@@ -127,19 +133,45 @@ impl Endpoints {
     }
 
     fn replacement(&self, removed: &DdsEntity, membership: &HashSet<Gid>) -> Option<&DdsEntity> {
+        let topic = self
+            .topics
+            .get(&removed.participant_key)?
+            .get(&removed.topic_name)?;
+        // HashSet iteration scans capacity. Interleave the searches only when
+        // the membership table is smaller than the topic bucket.
+        let mut members = (topic.len() > membership.capacity()).then(|| membership.iter());
+        let mut best_member: Option<&DdsEntity> = None;
         let mut fallback = None;
-        // Reverse GID order preserves max(type_matches, GID), but a compatible
-        // survivor needs no inspection of the rest of a densely shared topic.
-        for candidate in self
-            .on_topic(&removed.participant_key, &removed.topic_name)
-            .rev()
-        {
-            if membership.contains(&candidate.key) {
+        for key in topic.iter().rev() {
+            #[cfg(all(test, debug_assertions))]
+            SURVIVOR_VISITS.with(|visits| visits.set(visits.get() + 1));
+            // Ordered search goes first: a compatible survivor is immediately
+            // definitive, even when its node owns only part of a shared topic.
+            if membership.contains(key) {
+                let candidate = &self.entities[key];
                 if candidate.type_name == removed.type_name {
                     return Some(candidate);
                 }
                 if fallback.is_none() {
                     fallback = Some(candidate);
+                }
+            }
+            if let Some(members) = members.as_mut() {
+                let Some(key) = members.next() else {
+                    return best_member;
+                };
+                #[cfg(all(test, debug_assertions))]
+                SURVIVOR_VISITS.with(|visits| visits.set(visits.get() + 1));
+                if let Some(candidate) = self.entities.get(key).filter(|candidate| {
+                    candidate.participant_key == removed.participant_key
+                        && candidate.topic_name == removed.topic_name
+                }) {
+                    if best_member.is_none_or(|best| {
+                        (candidate.type_name == removed.type_name, candidate.key)
+                            > (best.type_name == removed.type_name, best.key)
+                    }) {
+                        best_member = Some(candidate);
+                    }
                 }
             }
         }
@@ -905,45 +937,55 @@ mod lifecycle_tests {
 
     #[test]
     fn ordered_survivor_preserves_compatible_type_then_highest_member_gid() {
-        let mut endpoints = Endpoints::default();
-        let removed = entity(1, 10, true);
-        for id in [24, 21, 23, 20, 22] {
-            let mut candidate = entity(1, id, true);
-            if id % 2 == 0 {
-                candidate.type_name = "other::srv::dds_::Response_".into();
+        for unrelated in [0, 64] {
+            let mut endpoints = Endpoints::default();
+            let removed = entity(1, 10, true);
+            for id in [24, 21, 23, 20, 22] {
+                let mut candidate = entity(1, id, true);
+                if id % 2 == 0 {
+                    candidate.type_name = "other::srv::dds_::Response_".into();
+                }
+                endpoints.insert(candidate);
             }
-            endpoints.insert(candidate);
-        }
-        endpoints.insert(entity(2, 30, true));
-        let mut other_topic = entity(1, 31, true);
-        other_topic.topic_name = "rr/otherReply".into();
-        endpoints.insert(other_topic);
+            endpoints.insert(entity(2, 30, true));
+            let mut other_topic = entity(1, 31, true);
+            other_topic.topic_name = "rr/otherReply".into();
+            endpoints.insert(other_topic);
+            for id in 32..32 + unrelated {
+                endpoints.insert(entity(1, id, true));
+            }
 
-        // Every subset includes the empty case, an ineligible highest GID,
-        // same-type preference over a higher different type, and fallback.
-        for subset in 0u8..32 {
-            let mut membership: HashSet<_> = (20..25)
-                .filter(|id| subset & (1 << (id - 20)) != 0)
-                .map(gid)
-                .collect();
-            membership.extend([gid(30), gid(31)]);
-            let expected = endpoints
-                .entities
-                .values()
-                .filter(|candidate| {
-                    candidate.participant_key == removed.participant_key
-                        && candidate.topic_name == removed.topic_name
-                        && membership.contains(&candidate.key)
-                })
-                .max_by_key(|candidate| (candidate.type_name == removed.type_name, candidate.key))
-                .map(|candidate| candidate.key);
-            assert_eq!(
-                endpoints
-                    .replacement(&removed, &membership)
-                    .map(|candidate| candidate.key),
-                expected,
-                "membership subset {subset}"
-            );
+            // Exercise both search directions, including absent metadata,
+            // ineligible high GIDs, compatible preference, and type fallback.
+            for subset in 0u8..32 {
+                let mut membership: HashSet<_> = (20..25)
+                    .filter(|id| subset & (1 << (id - 20)) != 0)
+                    .map(gid)
+                    .collect();
+                membership.extend([gid(30), gid(31), gid(255)]);
+                if subset % 2 == 0 {
+                    membership.reserve(128);
+                }
+                let expected = endpoints
+                    .entities
+                    .values()
+                    .filter(|candidate| {
+                        candidate.participant_key == removed.participant_key
+                            && candidate.topic_name == removed.topic_name
+                            && membership.contains(&candidate.key)
+                    })
+                    .max_by_key(|candidate| {
+                        (candidate.type_name == removed.type_name, candidate.key)
+                    })
+                    .map(|candidate| candidate.key);
+                assert_eq!(
+                    endpoints
+                        .replacement(&removed, &membership)
+                        .map(|candidate| candidate.key),
+                    expected,
+                    "membership subset {subset}, unrelated endpoints {unrelated}"
+                );
+            }
         }
     }
 
@@ -1886,13 +1928,30 @@ mod survivor_shape_benchmark {
     }
 
     fn selected(d: &DiscoveredEntities, writer: bool) -> Gid {
+        selected_for(d, NODE, writer)
+    }
+
+    fn selected_for(d: &DiscoveredEntities, node: &str, writer: bool) -> Gid {
         component(
-            &d.nodes_info[&participant()][NODE].service_cli[SERVICE].entities,
+            &d.nodes_info[&participant()][node].service_cli[SERVICE].entities,
             writer,
         )
     }
 
+    fn node_name(index: usize) -> String {
+        if index == 0 {
+            NODE.to_owned()
+        } else {
+            format!("{NODE}_{index}")
+        }
+    }
+
     fn fixture(endpoints: usize) -> DiscoveredEntities {
+        fixture_for_nodes(1, endpoints)
+    }
+
+    fn fixture_for_nodes(nodes: usize, per_node: usize) -> DiscoveredEntities {
+        let endpoints = nodes * per_node;
         let mut d = DiscoveredEntities::default();
         assert!(d
             .apply_dds_event(DDSDiscoveryEvent::DiscoveredParticipant {
@@ -1903,25 +1962,35 @@ mod survivor_shape_benchmark {
             })
             .is_empty());
         let mut graph = ParticipantEntitiesInfo::new(participant());
-        let mut node = NodeEntitiesInfo::new("/".into(), "dense_node".into());
-        for rank in 0..endpoints {
-            for writer in [false, true] {
-                let entity = endpoint(rank, writer);
-                if writer {
-                    node.writer_gid_seq.insert(entity.key);
-                } else {
-                    node.reader_gid_seq.insert(entity.key);
+        for index in 0..nodes {
+            let name = node_name(index);
+            let mut node = NodeEntitiesInfo::new("/".into(), name[1..].into());
+            for rank in index * per_node..(index + 1) * per_node {
+                for writer in [false, true] {
+                    let entity = endpoint(rank, writer);
+                    if writer {
+                        node.writer_gid_seq.insert(entity.key);
+                    } else {
+                        node.reader_gid_seq.insert(entity.key);
+                    }
+                    assert!(d.apply_dds_event(discovery(entity, writer)).is_empty());
                 }
-                assert!(d.apply_dds_event(discovery(entity, writer)).is_empty());
+            }
+            graph.node_entities_info_seq.insert(name, node);
+        }
+        let events = d.update_participant_info(graph);
+        assert_eq!(events.len(), nodes);
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, ROS2DiscoveryEvent::DiscoveredServiceCli(..))));
+        for index in 0..nodes {
+            for writer in [false, true] {
+                assert_eq!(
+                    selected_for(&d, &node_name(index), writer),
+                    endpoint_gid((index + 1) * per_node - 1, writer)
+                );
             }
         }
-        graph.node_entities_info_seq.insert(NODE.to_owned(), node);
-        assert!(matches!(
-            d.update_participant_info(graph).as_slice(),
-            [ROS2DiscoveryEvent::DiscoveredServiceCli(..)]
-        ));
-        assert_eq!(selected(&d, true), endpoint_gid(endpoints - 1, true));
-        assert_eq!(selected(&d, false), endpoint_gid(endpoints - 1, false));
         assert_eq!(d.writers.len(), endpoints);
         assert_eq!(d.readers.len(), endpoints);
         d
@@ -1935,13 +2004,95 @@ mod survivor_shape_benchmark {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn sparse_node_survivor_search_has_linear_candidate_work() {
+        const NODES: usize = 64;
+        for writer in [false, true] {
+            let mut d = fixture_for_nodes(NODES, 1);
+            let membership = &d.ros_participant_info[&participant()].node_entities_info_seq[NODE];
+            let capacity = if writer {
+                membership.writer_gid_seq.capacity()
+            } else {
+                membership.reader_gid_seq.capacity()
+            };
+            SURVIVOR_VISITS.with(|visits| visits.set(0));
+            for rank in (0..NODES).rev() {
+                let key = endpoint_gid(rank, writer);
+                let name = node_name(rank);
+                assert_eq!(selected_for(&d, &name, writer), key);
+                let events = d.apply_dds_event(disposal(key, writer));
+                assert!(
+                    matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredServiceCli(p, node, service)]
+                    if *p == participant() && node == &name && service.name == SERVICE)
+                );
+                assert_eq!(selected_for(&d, &name, writer), Gid::NOT_DISCOVERED);
+                assert!(if writer {
+                    d.get_writer(&key)
+                } else {
+                    d.get_reader(&key)
+                }
+                .is_none());
+            }
+            let visits = SURVIVOR_VISITS.with(|visits| visits.get());
+            // At most capacity ordered entries plus one finishing step, each
+            // paired with at most one membership entry. This is a work bound,
+            // not a timing threshold; the graph-node walk is not counted.
+            assert!(visits <= NODES * (2 * capacity + 1),
+                "writer={writer}: {visits} candidate visits for {NODES} singleton nodes with capacity {capacity}");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dense_subset_survivor_keeps_the_immediate_ordered_match() {
+        for writer in [false, true] {
+            let mut d = fixture_for_nodes(4, 512);
+            let name = node_name(3);
+            let key = endpoint_gid(2047, writer);
+            let expected = endpoint_gid(2046, writer);
+            assert_eq!(selected_for(&d, &name, writer), key);
+            SURVIVOR_VISITS.with(|visits| visits.set(0));
+            let events = d.apply_dds_event(disposal(key, writer));
+            assert!(
+                matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredServiceCli(p, node, service)]
+                if *p == participant() && node == &name && service.name == SERVICE
+                && service.is_complete() && component(&service.entities, writer) == expected)
+            );
+            assert_eq!(selected_for(&d, &name, writer), expected);
+            assert!(if writer {
+                d.get_writer(&key)
+            } else {
+                d.get_reader(&key)
+            }
+            .is_none());
+            let visits = SURVIVOR_VISITS.with(|visits| visits.get());
+            assert!(visits <= 1, "writer={writer}: compatible highest remaining topic member must win before unordered traversal");
+        }
+    }
+
     #[test]
     #[ignore = "matched release microbenchmark; root coordinates immutable ELF comparisons"]
     fn dense_selected_disposal() {
-        for endpoints in [1, 8, 64, 512, 2048] {
+        for (nodes, per_node) in [
+            (1, 1),
+            (1, 8),
+            (1, 64),
+            (1, 512),
+            (1, 2048),
+            (4, 512),
+            (64, 1),
+            (512, 1),
+            (2048, 1),
+            (64, 4),
+            (512, 4),
+            (2048, 4),
+        ] {
+            let endpoints = nodes * per_node;
+            let names: Vec<_> = (0..nodes).map(node_name).collect();
             for writer in [false, true] {
                 for repeat in 0..REPEATS {
-                    let mut d = fixture(endpoints);
+                    let mut d = fixture_for_nodes(nodes, per_node);
                     let start = Instant::now();
                     let mut replacements = 0;
                     let mut withdrawals = 0;
@@ -1949,29 +2100,36 @@ mod survivor_shape_benchmark {
                         // This check stays in the measured loop for both variants:
                         // every removal must exercise the selected-survivor path.
                         let key = endpoint_gid(rank, writer);
-                        assert_eq!(selected(&d, writer), key);
+                        let name = &names[rank / per_node];
+                        assert_eq!(selected_for(&d, name, writer), key);
                         let events = black_box(d.apply_dds_event(disposal(key, writer)));
-                        if rank > 0 {
+                        assert!(if writer {
+                            d.get_writer(&key)
+                        } else {
+                            d.get_reader(&key)
+                        }
+                        .is_none());
+                        if rank % per_node > 0 {
                             let expected = endpoint_gid(rank - 1, writer);
                             assert!(
                                 matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredServiceCli(p, node, service)]
-                                if *p == participant() && node == NODE && service.name == SERVICE
+                                if *p == participant() && node == name && service.name == SERVICE
                                 && service.is_complete() && component(&service.entities, writer) == expected)
                             );
-                            assert_eq!(selected(&d, writer), expected);
+                            assert_eq!(selected_for(&d, name, writer), expected);
                             replacements += 1;
                         } else {
                             assert!(
                                 matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredServiceCli(p, node, service)]
-                                if *p == participant() && node == NODE && service.name == SERVICE)
+                                if *p == participant() && node == name && service.name == SERVICE)
                             );
-                            assert_eq!(selected(&d, writer), Gid::NOT_DISCOVERED);
+                            assert_eq!(selected_for(&d, name, writer), Gid::NOT_DISCOVERED);
                             withdrawals += 1;
                         }
                     }
                     let elapsed_ns = start.elapsed().as_nanos();
-                    assert_eq!(replacements, endpoints - 1);
-                    assert_eq!(withdrawals, 1);
+                    assert_eq!(replacements, endpoints - nodes);
+                    assert_eq!(withdrawals, nodes);
                     assert_eq!(
                         if writer {
                             d.writers.len()
@@ -1988,12 +2146,15 @@ mod survivor_shape_benchmark {
                         },
                         endpoints
                     );
-                    assert!(!d.nodes_info[&participant()][NODE].service_cli[SERVICE].is_complete());
+                    assert!(d.nodes_info[&participant()]
+                        .values()
+                        .all(|node| !node.service_cli[SERVICE].is_complete()));
                     println!(
                         "SURVIVOR_BENCH {}",
                         serde_json::json!({
                             "kind":"dense_selected_disposal", "manifest_dir":env!("CARGO_MANIFEST_DIR"),
-                            "endpoints_per_direction":endpoints, "writer":writer, "repeat":repeat,
+                            "endpoints_per_direction":endpoints, "nodes":nodes, "endpoints_per_node":per_node,
+                            "writer":writer, "repeat":repeat,
                             "elapsed_ns":elapsed_ns, "ns_per_removal":elapsed_ns as f64/endpoints as f64,
                             "replacements":replacements, "withdrawals":withdrawals,
                             "oracle":"actual selected GID checked before and after every measured removal",

@@ -88,7 +88,10 @@ cargo test --locked --release -p zenoh-plugin-ros2dds --lib survivor_shape_bench
 ```
 
 The dense case removes the currently selected endpoint at every step and checks
-the exact replacement and final withdrawal. The update case changes canonical
+the exact replacement and final withdrawal, including many nodes sharing a topic
+and nodes owning a dense subset of its endpoints. Debug unit tests also bound
+the actual search work; their counters are absent from release benchmarks.
+The update case changes canonical
 QoS metadata without changing identity and checks the final values. These cover
 costs that a many-topic creation benchmark cannot reveal. Record both creation
 and disposal costs and retain raw repeated results; no timing threshold runs in CI.
