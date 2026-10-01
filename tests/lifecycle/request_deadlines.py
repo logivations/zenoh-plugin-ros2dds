@@ -125,8 +125,11 @@ def check_deadlines(lab):
 
             # A caller with no advertised deadline must remain pending past the
             # receiver's outgoing timeout, then finish when its route retires.
+            caller_timeout = 15
+            completion_bound = 2
+            caller_started = time.monotonic()
             receiver = session.get(
-                "test/deadline", payload=b"\0\1\0\0" + struct.pack("<qq", 30, 99), timeout=15,
+                "test/deadline", payload=b"\0\1\0\0" + struct.pack("<qq", 30, 99), timeout=caller_timeout,
             )
             eventually(lambda: service_event("request", 99))
             time.sleep(1.5)
@@ -134,8 +137,25 @@ def check_deadlines(lab):
             started = time.monotonic()
             lab.stop("deadline-service", signal.SIGKILL)
             eventually(lambda: route() is None)
-            assert list(receiver) == [], "Retired route returned a reply"
+
+            def retired_query_completed():
+                try:
+                    reply = receiver.try_recv()
+                except zenoh.ZError:
+                    # Zenoh 1.10.1's handler reports its closed reply channel
+                    # with ZError; a pending empty channel returns None.
+                    return True
+                assert reply is None, "Retired route returned a reply"
+                return False
+
+            # This bound is below the caller's remaining deadline, so expiry
+            # at the caller cannot masquerade as route-retirement cleanup.
+            assert time.monotonic() - caller_started < caller_timeout - completion_bound, \
+                "Insufficient caller budget to verify retirement"
+            route_removed_at = time.monotonic()
+            eventually(retired_query_completed, timeout=completion_bound)
             results.append({"case": "retirement_unknown_deadline", "elapsed_s": time.monotonic() - started,
+                            "completion_after_route_removed_s": time.monotonic() - route_removed_at,
                             "pending_before_retirement": 1, "route_removed": True, "values": []})
             (lab.output / "deadline-results.json").write_text(json.dumps(results, indent=2))
             print("PASS: incoming deadline compatibility, explicit expiry/rejection and retirement", flush=True)
