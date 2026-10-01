@@ -209,11 +209,14 @@ impl DiscoveredEntities {
                         match replacements
                             .iter()
                             .filter(|candidate| membership.contains(&candidate.key))
-                            .max_by_key(|candidate| candidate.key)
-                        {
-                            Some(replacement) => {
-                                events.extend(node.update_with_writer(replacement))
-                            }
+                            .max_by_key(|candidate| {
+                                (candidate.type_name == writer.type_name, candidate.key)
+                            }) {
+                            Some(replacement) => push_replacement_events(
+                                &mut events,
+                                withdrawal,
+                                node.update_with_writer(replacement),
+                            ),
                             None => events.extend(withdrawal),
                         }
                     }
@@ -301,11 +304,14 @@ impl DiscoveredEntities {
                         match replacements
                             .iter()
                             .filter(|candidate| membership.contains(&candidate.key))
-                            .max_by_key(|candidate| candidate.key)
-                        {
-                            Some(replacement) => {
-                                events.extend(node.update_with_reader(replacement))
-                            }
+                            .max_by_key(|candidate| {
+                                (candidate.type_name == reader.type_name, candidate.key)
+                            }) {
+                            Some(replacement) => push_replacement_events(
+                                &mut events,
+                                withdrawal,
+                                node.update_with_reader(replacement),
+                            ),
                             None => events.extend(withdrawal),
                         }
                     }
@@ -319,8 +325,8 @@ impl DiscoveredEntities {
     /// Update only the affected interface, as the eclipse-zenoh upstream
     /// does. ROS graph snapshots reconcile membership; DDS events must not
     /// reconstruct unrelated routes, even when the events arrive one at a
-    /// time. One removal emits either the survivor swap or the withdrawal
-    /// for an interface, never both.
+    /// time. A compatible survivor preserves the interface; a type change
+    /// withdraws the old interface before announcing its replacement.
     pub fn apply_dds_event(&mut self, event: DDSDiscoveryEvent) -> Vec<ROS2DiscoveryEvent> {
         match event {
             DDSDiscoveryEvent::DiscoveredPublication { entity } => self.add_writer(entity),
@@ -346,9 +352,9 @@ impl DiscoveredEntities {
     /// the difference. This reconcile path never carries endpoints absent from
     /// the current ROS snapshot; incremental endpoint events are handled by
     /// `remove_reader`/`remove_writer`, which withdraw an interface only when
-    /// its last tracked endpoint is gone. Within one returned batch, discoveries
-    /// for current nodes precede withdrawals of vanished nodes, so a route
-    /// shared by interface name survives a node rename.
+    /// its last tracked endpoint is gone. Within one returned batch, same-type
+    /// discoveries precede withdrawals across all nodes, so transferring an
+    /// interface preserves its route. Type changes withdraw the old route first.
     fn reconcile_participant(&mut self, participant: Gid) -> Vec<ROS2DiscoveryEvent> {
         if !self.participants.contains_key(&participant) {
             return Vec::new();
@@ -432,7 +438,7 @@ impl DiscoveredEntities {
             events.extend(node.remove_all_entities());
         }
         self.nodes_info.insert(participant, current);
-        events
+        order_participant_events(events)
     }
 
     fn get_entity_json_value(
@@ -531,6 +537,87 @@ impl DiscoveredEntities {
             }
         }
     }
+}
+
+// Routes are shared by interface family/name, but their DDS resources also
+// depend on type. A same-topic survivor alone does not establish compatibility.
+fn interface_signature(event: &ROS2DiscoveryEvent) -> (u8, &str, &str) {
+    use ROS2DiscoveryEvent::*;
+    match event {
+        DiscoveredMsgPub(_, _, v) | UndiscoveredMsgPub(_, _, v) => (0, &v.name, &v.typ),
+        DiscoveredMsgSub(_, _, v) | UndiscoveredMsgSub(_, _, v) => (1, &v.name, &v.typ),
+        DiscoveredServiceSrv(_, _, v) | UndiscoveredServiceSrv(_, _, v) => (2, &v.name, &v.typ),
+        DiscoveredServiceCli(_, _, v) | UndiscoveredServiceCli(_, _, v) => (3, &v.name, &v.typ),
+        DiscoveredActionSrv(_, _, v) | UndiscoveredActionSrv(_, _, v) => (4, &v.name, &v.typ),
+        DiscoveredActionCli(_, _, v) | UndiscoveredActionCli(_, _, v) => (5, &v.name, &v.typ),
+    }
+}
+
+fn is_discovery(event: &ROS2DiscoveryEvent) -> bool {
+    use ROS2DiscoveryEvent::*;
+    matches!(
+        event,
+        DiscoveredMsgPub(..)
+            | DiscoveredMsgSub(..)
+            | DiscoveredServiceSrv(..)
+            | DiscoveredServiceCli(..)
+            | DiscoveredActionSrv(..)
+            | DiscoveredActionCli(..)
+    )
+}
+
+fn push_replacement_events(
+    events: &mut Vec<ROS2DiscoveryEvent>,
+    withdrawal: Option<ROS2DiscoveryEvent>,
+    replacement: Option<ROS2DiscoveryEvent>,
+) {
+    events.extend(withdrawal.filter(|old| {
+        replacement.as_ref().map(interface_signature) != Some(interface_signature(old))
+    }));
+    events.extend(replacement);
+}
+
+fn order_participant_events(events: Vec<ROS2DiscoveryEvent>) -> Vec<ROS2DiscoveryEvent> {
+    if !events.iter().any(is_discovery) || events.iter().all(is_discovery) {
+        return events;
+    }
+    // Determine ordering across the whole participant, not one node at a time.
+    // Borrow signatures only during classification; no persistent routing index
+    // or cloned interface state is needed.
+    let mut additions = HashMap::new();
+    for event in events.iter().filter(|event| is_discovery(event)) {
+        let (family, name, typ) = interface_signature(event);
+        additions
+            .entry((family, name))
+            .and_modify(|(first_type, mixed)| *mixed |= *first_type != typ)
+            .or_insert((typ, false));
+    }
+    let phases: Vec<_> = events
+        .iter()
+        .map(|event| {
+            if is_discovery(event) {
+                1
+            } else {
+                let (family, name, typ) = interface_signature(event);
+                if additions
+                    .get(&(family, name))
+                    .is_some_and(|(new_type, mixed)| *mixed || *new_type != typ)
+                {
+                    0 // Retire incompatible DDS resources before recreation.
+                } else {
+                    2 // Keep the route alive during same-type owner transfers.
+                }
+            }
+        })
+        .collect();
+    let mut ordered = [Vec::new(), Vec::new(), Vec::new()];
+    for (event, phase) in events.into_iter().zip(phases) {
+        ordered[phase].push(event);
+    }
+    let [mut replacements, additions, withdrawals] = ordered;
+    replacements.extend(additions);
+    replacements.extend(withdrawals);
+    replacements
 }
 
 // Remove any null QoS values from a serde_json::Value
@@ -843,8 +930,16 @@ mod lifecycle_tests {
                     );
                 }
                 let node = &d.nodes_info[&gid(1)]["/camera"];
-                let complete = node.service_srv.values().filter(|s| s.is_complete()).count()
-                    + node.service_cli.values().filter(|s| s.is_complete()).count()
+                let complete = node
+                    .service_srv
+                    .values()
+                    .filter(|s| s.is_complete())
+                    .count()
+                    + node
+                        .service_cli
+                        .values()
+                        .filter(|s| s.is_complete())
+                        .count()
                     + node.action_srv.values().filter(|s| s.is_complete()).count()
                     + node.action_cli.values().filter(|s| s.is_complete()).count();
                 assert_eq!(complete, 1);
@@ -857,6 +952,287 @@ mod lifecycle_tests {
         endpoint.topic_name = "rt/image".into();
         endpoint.type_name = "sensor_msgs::msg::dds_::Image_".into();
         endpoint
+    }
+
+    fn event_details(event: &ROS2DiscoveryEvent) -> (bool, Gid, &str, &str, &str) {
+        use ROS2DiscoveryEvent::*;
+        match event {
+            DiscoveredMsgPub(p, n, v) => (true, *p, n, &v.name, &v.typ),
+            UndiscoveredMsgPub(p, n, v) => (false, *p, n, &v.name, &v.typ),
+            DiscoveredMsgSub(p, n, v) => (true, *p, n, &v.name, &v.typ),
+            UndiscoveredMsgSub(p, n, v) => (false, *p, n, &v.name, &v.typ),
+            DiscoveredServiceSrv(p, n, v) => (true, *p, n, &v.name, &v.typ),
+            UndiscoveredServiceSrv(p, n, v) => (false, *p, n, &v.name, &v.typ),
+            DiscoveredServiceCli(p, n, v) => (true, *p, n, &v.name, &v.typ),
+            UndiscoveredServiceCli(p, n, v) => (false, *p, n, &v.name, &v.typ),
+            DiscoveredActionSrv(p, n, v) => (true, *p, n, &v.name, &v.typ),
+            UndiscoveredActionSrv(p, n, v) => (false, *p, n, &v.name, &v.typ),
+            DiscoveredActionCli(p, n, v) => (true, *p, n, &v.name, &v.typ),
+            UndiscoveredActionCli(p, n, v) => (false, *p, n, &v.name, &v.typ),
+        }
+    }
+
+    fn discovered_components(event: &ROS2DiscoveryEvent) -> Vec<Gid> {
+        use ROS2DiscoveryEvent::*;
+        match event {
+            DiscoveredServiceSrv(_, _, v) => vec![v.entities.req_reader, v.entities.rep_writer],
+            DiscoveredServiceCli(_, _, v) => vec![v.entities.req_writer, v.entities.rep_reader],
+            DiscoveredActionSrv(_, _, v) => vec![
+                v.entities.send_goal.req_reader,
+                v.entities.send_goal.rep_writer,
+                v.entities.cancel_goal.req_reader,
+                v.entities.cancel_goal.rep_writer,
+                v.entities.get_result.req_reader,
+                v.entities.get_result.rep_writer,
+                v.entities.feedback_writer,
+                v.entities.status_writer,
+            ],
+            DiscoveredActionCli(_, _, v) => vec![
+                v.entities.send_goal.req_writer,
+                v.entities.send_goal.rep_reader,
+                v.entities.cancel_goal.req_writer,
+                v.entities.cancel_goal.rep_reader,
+                v.entities.get_result.req_writer,
+                v.entities.get_result.rep_reader,
+                v.entities.feedback_reader,
+                v.entities.status_reader,
+            ],
+            _ => panic!("expected a complete service/action discovery: {event:?}"),
+        }
+    }
+
+    fn changed_type(mut endpoints: Vec<(bool, DdsEntity)>) -> Vec<(bool, DdsEntity)> {
+        for (_, endpoint) in &mut endpoints {
+            endpoint.type_name = endpoint
+                .type_name
+                .replace("AddTwoInts", "SetBool")
+                .replace("Fibonacci", "OtherAction")
+                .replace(
+                    "sensor_msgs::msg::dds_::Image_",
+                    "std_msgs::msg::dds_::String_",
+                );
+        }
+        endpoints
+    }
+
+    #[test]
+    fn incompatible_topic_survivor_withdraws_before_rediscovery() {
+        for writer in [false, true] {
+            let old = topic_entity(11, writer);
+            let new = changed_type(vec![(writer, topic_entity(12, writer))])
+                .pop()
+                .unwrap()
+                .1;
+            let mut d = discover_interface(&[(writer, old.clone())]);
+            assert!(add_endpoint(&mut d, writer, new.clone()).is_empty());
+            let mut info = d.ros_participant_info[&gid(1)].clone();
+            let node = info.node_entities_info_seq.get_mut("/camera").unwrap();
+            if writer {
+                node.writer_gid_seq.insert(new.key);
+            } else {
+                node.reader_gid_seq.insert(new.key);
+            }
+            // Both types are present in one real ROS node. The second type is
+            // ignored until the final endpoint of the original type disappears.
+            assert!(d.update_participant_info(info.clone()).is_empty());
+            let events = remove_endpoint(&mut d, writer, &old.key);
+            assert_eq!(
+                events.iter().map(event_details).collect::<Vec<_>>(),
+                [
+                    (false, gid(1), "/camera", "/image", "sensor_msgs/msg/Image"),
+                    (true, gid(1), "/camera", "/image", "std_msgs/msg/String"),
+                ],
+                "writer={writer}: {events:?}"
+            );
+            let node = info.node_entities_info_seq.get_mut("/camera").unwrap();
+            if writer {
+                node.writer_gid_seq.remove(&old.key);
+                assert_eq!(
+                    d.nodes_info[&gid(1)]["/camera"].msg_pub["/image"].writers,
+                    [new.key].into()
+                );
+            } else {
+                node.reader_gid_seq.remove(&old.key);
+                assert_eq!(
+                    d.nodes_info[&gid(1)]["/camera"].msg_sub["/image"].readers,
+                    [new.key].into()
+                );
+            }
+            assert!(d.update_participant_info(info).is_empty());
+        }
+    }
+
+    #[test]
+    fn incompatible_service_and_action_survivors_withdraw_the_old_type() {
+        for action in [false, true] {
+            for client in [false, true] {
+                let old = interface_endpoints(action, client, 1);
+                let new = changed_type(interface_endpoints(action, client, 0));
+                for (index, (writer, endpoint)) in old.iter().enumerate() {
+                    if endpoint.type_name == new[index].1.type_name {
+                        continue; // Action status/cancel components have a shared type.
+                    }
+                    let mut endpoints = new.clone();
+                    endpoints.extend(old.clone());
+                    let mut d = discover_interface(&endpoints);
+                    let events = remove_endpoint(&mut d, *writer, &endpoint.key);
+                    let old_type = if action {
+                        "example_interfaces/action/Fibonacci"
+                    } else {
+                        "example_interfaces/srv/AddTwoInts"
+                    };
+                    let new_type = if action {
+                        "example_interfaces/action/OtherAction"
+                    } else {
+                        "example_interfaces/srv/SetBool"
+                    };
+                    assert_eq!(
+                        events.iter().map(event_details).collect::<Vec<_>>(),
+                        [
+                            (false, gid(1), "/camera", "/test", old_type),
+                            (true, gid(1), "/camera", "/test", new_type),
+                        ],
+                        "action={action}, client={client}, component={index}: {events:?}"
+                    );
+                    let mut expected: Vec<_> = old.iter().map(|(_, e)| e.key).collect();
+                    expected[index] = new[index].1.key;
+                    assert_eq!(discovered_components(&events[1]), expected);
+                    // A different-type handover must not erase the other
+                    // already-known components while retiring the old route.
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compatible_service_and_action_survivors_take_precedence_over_other_types() {
+        for action in [false, true] {
+            for client in [false, true] {
+                let compatible = interface_endpoints(action, client, 0);
+                let incompatible = changed_type(interface_endpoints(action, client, 1));
+                let selected = interface_endpoints(action, client, 2);
+                for (index, (writer, endpoint)) in selected.iter().enumerate() {
+                    if endpoint.type_name == incompatible[index].1.type_name {
+                        continue;
+                    }
+                    let mut endpoints = compatible.clone();
+                    endpoints.push(incompatible[index].clone());
+                    endpoints.extend(selected.clone());
+                    let mut d = discover_interface(&endpoints);
+                    let events = remove_endpoint(&mut d, *writer, &endpoint.key);
+                    let typ = if action {
+                        "example_interfaces/action/Fibonacci"
+                    } else {
+                        "example_interfaces/srv/AddTwoInts"
+                    };
+                    assert_eq!(
+                        events.iter().map(event_details).collect::<Vec<_>>(),
+                        [(true, gid(1), "/camera", "/test", typ)],
+                        "action={action}, client={client}, component={index}: {events:?}"
+                    );
+                    let mut expected: Vec<_> = selected.iter().map(|(_, e)| e.key).collect();
+                    expected[index] = compatible[index].1.key;
+                    assert_eq!(discovered_components(&events[0]), expected);
+                    // The actual retained component, not just the advertised
+                    // type, must come from the compatible endpoint.
+                }
+            }
+        }
+    }
+
+    fn participant_handoff(
+        old: Vec<(bool, DdsEntity)>,
+        new: Vec<(bool, DdsEntity)>,
+        type_change: bool,
+    ) {
+        let mut d = DiscoveredEntities::default();
+        d.add_participant(DdsParticipant {
+            key: gid(1),
+            qos: Qos::default(),
+        });
+        for (writer, endpoint) in old.iter().chain(&new) {
+            add_endpoint(&mut d, *writer, endpoint.clone());
+        }
+        let mut next = ParticipantEntitiesInfo::new(gid(1));
+        for name in ["one", "two"] {
+            let node = NodeEntitiesInfo::new("/".into(), name.into());
+            next.node_entities_info_seq.insert(node.full_name(), node);
+        }
+        // Assign the old owner to the actual first iterated node. Updating only
+        // values below preserves that iteration order, making c04 fail without
+        // relying on a particular randomized HashMap seed.
+        let names: Vec<_> = next.node_entities_info_seq.keys().cloned().collect();
+        let old_name = &names[0];
+        let new_name = &names[1];
+        let mut previous = next.clone();
+        for (info, name, endpoints) in
+            [(&mut previous, old_name, &old), (&mut next, new_name, &new)]
+        {
+            let node = info.node_entities_info_seq.get_mut(name).unwrap();
+            for (writer, endpoint) in endpoints {
+                if *writer {
+                    node.writer_gid_seq.insert(endpoint.key);
+                } else {
+                    node.reader_gid_seq.insert(endpoint.key);
+                }
+            }
+        }
+        let initial = d.update_participant_info(previous);
+        assert_eq!(initial.len(), 1);
+        let old_type = event_details(&initial[0]).4;
+        let events = d.update_participant_info(next.clone());
+        assert_eq!(events.len(), 2, "{events:?}");
+        let details: Vec<_> = events.iter().map(event_details).collect();
+        let (withdrawal, addition) = if type_change { (0, 1) } else { (1, 0) };
+        assert_eq!(details[withdrawal].0, false, "{events:?}");
+        assert_eq!(details[withdrawal].1, gid(1));
+        assert_eq!(details[withdrawal].2, old_name);
+        assert_eq!(details[withdrawal].4, old_type);
+        assert_eq!(details[addition].0, true, "{events:?}");
+        assert_eq!(details[addition].1, gid(1));
+        assert_eq!(details[addition].2, new_name);
+        assert_eq!(details[addition].4 == old_type, !type_change);
+        assert!(d.update_participant_info(next).is_empty());
+    }
+
+    #[test]
+    fn transfers_between_existing_nodes_preserve_same_type_routes() {
+        for writer in [false, true] {
+            participant_handoff(
+                vec![(writer, topic_entity(11, writer))],
+                vec![(writer, topic_entity(12, writer))],
+                false,
+            );
+        }
+        for action in [false, true] {
+            for client in [false, true] {
+                participant_handoff(
+                    interface_endpoints(action, client, 0),
+                    interface_endpoints(action, client, 1),
+                    false,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type_changes_between_nodes_withdraw_before_discovery() {
+        for writer in [false, true] {
+            participant_handoff(
+                vec![(writer, topic_entity(11, writer))],
+                changed_type(vec![(writer, topic_entity(12, writer))]),
+                true,
+            );
+        }
+        for action in [false, true] {
+            for client in [false, true] {
+                participant_handoff(
+                    interface_endpoints(action, client, 0),
+                    changed_type(interface_endpoints(action, client, 1)),
+                    true,
+                );
+            }
+        }
     }
 
     #[test]
@@ -887,12 +1263,18 @@ mod lifecycle_tests {
         // Disposing the last endpoint withdraws the route, and only then.
         let events = d.remove_writer(&gid(32));
         assert!(
-            matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredMsgPub(..)]),
+            matches!(
+                events.as_slice(),
+                [ROS2DiscoveryEvent::UndiscoveredMsgPub(..)]
+            ),
             "{events:?}"
         );
         let events = d.remove_reader(&gid(42));
         assert!(
-            matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredMsgSub(..)]),
+            matches!(
+                events.as_slice(),
+                [ROS2DiscoveryEvent::UndiscoveredMsgSub(..)]
+            ),
             "{events:?}"
         );
         let node = &d.nodes_info[&gid(1)]["/camera"];
@@ -900,12 +1282,18 @@ mod lifecycle_tests {
         // A returning endpoint re-announces without a new ROS snapshot.
         let events = d.add_writer(topic_entity(32, true));
         assert!(
-            matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredMsgPub(..)]),
+            matches!(
+                events.as_slice(),
+                [ROS2DiscoveryEvent::DiscoveredMsgPub(..)]
+            ),
             "{events:?}"
         );
         let events = d.add_reader(topic_entity(42, false));
         assert!(
-            matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredMsgSub(..)]),
+            matches!(
+                events.as_slice(),
+                [ROS2DiscoveryEvent::DiscoveredMsgSub(..)]
+            ),
             "{events:?}"
         );
         let node = &d.nodes_info[&gid(1)]["/camera"];

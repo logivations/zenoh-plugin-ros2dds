@@ -28,9 +28,12 @@ Local nodes are identified by participant GID and node name. Discovery derives
 interfaces from the current ROS membership snapshot and current DDS endpoints.
 ROS graph updates reconcile membership; individual DDS events update only the
 affected interface, preserving the eclipse-zenoh upstream's incremental
-discovery. Removal clears only that component, swaps in a surviving same-topic
-endpoint from the same node's membership, and drops an interface entry once
-every component is gone. A disposal that no interface component references
+discovery. Removal clears only that component and prefers a surviving same-type
+endpoint from the same node's membership. A compatible survivor preserves the
+route; a different-type survivor withdraws the old interface before rediscovery.
+An interface entry is dropped once every component is gone. Same-type transfers
+between nodes in one participant snapshot add the new owner before removing the
+old owner, while type changes retire incompatible resources first. A disposal that no interface component references
 leaves the derived state untouched, so it cannot rewrite a live interface.
 A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
@@ -120,6 +123,8 @@ lease recovery, each construction failure and cleanup quarantine/recovery.
 Physical workload and sustained soak checks remain required. A build is not a rollout gate.
 
 Mixed 1.10.1/patched bridges retain wire compatibility, but the unpatched owner keeps
-its defects. Rollout must preserve the existing ROS type/QoS contract. Changing the
-type of an already retained route and dynamic plugin hot-unload are not covered.
+its defects. Last-endpoint replacement by a different type is covered by discovery
+and complete-binary regressions. Concurrent incompatible interfaces still share
+one name-keyed route; this does not add per-type routes, general QoS migration or
+dynamic plugin hot-unload.
 Physical hardware, real workload and shadow-health validation precede fleet rollout.
