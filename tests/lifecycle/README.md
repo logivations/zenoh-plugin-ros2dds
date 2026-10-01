@@ -40,7 +40,6 @@ These bounded regressions complement the real-DDS unit tests and ordinary ROS
 service/action/topic integration tests. They are not a multi-day soak, physical
 Jetson qualification or proof that admin accounting alone detects orphan resources.
 
-
 For a release-mode discovery CPU comparison (no DDS/network timing), run:
 
 ```sh

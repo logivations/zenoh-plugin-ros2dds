@@ -27,8 +27,11 @@ and callbacks rejected after retirement.
 Local nodes are identified by participant GID and node name. Discovery derives
 interfaces from the current ROS membership snapshot and current DDS endpoints.
 ROS graph updates reconcile membership; individual DDS events update only the
-affected interface, preserving upstream incremental discovery. Removal clears
-only that component and retains any surviving endpoint for the same interface.
+affected interface, preserving the eclipse-zenoh upstream's incremental
+discovery. Removal clears only that component, swaps in a surviving same-topic
+endpoint from the same node's membership, and drops an interface entry once
+every component is gone. A disposal that no interface component references
+leaves the derived state untouched, so it cannot rewrite a live interface.
 A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
 
@@ -41,7 +44,9 @@ for this case; the passing distinct-participant restart tests do not qualify it.
 
 DDS writes replace an infinite reliability max_blocking_time with the DDS default
 100 ms; finite application values are preserved. Retirement can wait for that
-configured finite timeout. Overloaded writes fail explicitly rather than preventing
+configured finite timeout; preserving a timeout above one second is logged at
+writer creation, and a retirement fence that waits longer than a second on an
+in-flight operation logs the wait. Overloaded writes fail explicitly rather than preventing
 resource retirement indefinitely. That attempted data delivery is lost on write failure;
 this is an intentional overload behavior change, not a delivery guarantee. Counters
 and route logs expose the failures. This does not change reliability matching. ROS graph
