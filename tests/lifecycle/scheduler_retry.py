@@ -48,7 +48,8 @@ def check_retry(lab):
 
     def health():
         try:
-            return lab.health("server")
+            rows = lab.admin("server")
+            return rows[0] if rows else None
         except OSError:
             return None
 
