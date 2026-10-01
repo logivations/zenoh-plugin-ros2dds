@@ -729,7 +729,9 @@ pub fn serialize_duration_as_f32<S>(d: &Duration, serializer: S) -> Result<S::Ok
 where
     S: Serializer,
 {
-    serializer.serialize_f32(d.as_secs_f32())
+    // Preserve the number produced by the former admin Value pipeline, which
+    // widens f32 with the default serde_json features.
+    serde_json::Value::from(d.as_secs_f32()).serialize(serializer)
 }
 
 #[cfg(test)]
