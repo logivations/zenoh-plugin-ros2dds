@@ -67,7 +67,11 @@ pub struct RouteServiceCli {
     #[serde(skip)]
     context: Context,
     #[serde(skip)]
-    _zenoh_querier: Arc<Querier<'static>>,
+    zenoh_querier: Arc<Querier<'static>>,
+    // TypeInfo for re-creation of the DDS entities (if available). Any
+    // re-activation always re-uses the type/QoS this route was created with.
+    #[serde(skip)]
+    type_info: Option<Arc<TypeInfo>>,
     // Keep the listener scoped to the route instead of detaching it in the
     // background, where it can survive route removal.
     #[serde(skip)]
@@ -163,6 +167,7 @@ impl RouteServiceCli {
                 let ros2_type = ros2_type.clone();
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
+                let type_info = type_info.clone();
 
                 move |status| {
                     // Activation/deactivation happens inside the liveness
@@ -171,6 +176,17 @@ impl RouteServiceCli {
                     let handled = liveness.if_live(|| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
                         if status.matching() {
+                            // Idempotent: add_remote_route()/add_local_node()
+                            // may have re-activated the route before this edge
+                            // was delivered. The route's entity config is
+                            // immutable (same name/type/QoS), so existing
+                            // entities are always the right ones; re-creating
+                            // them would orphan their predecessors' gid
+                            // entries in ros_discovery_info.
+                            if req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                                tracing::debug!("{route_id}: already activated");
+                                return;
+                            }
                             if let Err(e) = activate(
                                 &rep_writer,
                                 &req_reader,
@@ -207,7 +223,8 @@ impl RouteServiceCli {
             ros2_type,
             zenoh_key_expr,
             context,
-            _zenoh_querier: zenoh_querier,
+            zenoh_querier,
+            type_info,
             matching_listener: Some(matching_listener),
             liveness,
             queries_timeout,
@@ -263,11 +280,48 @@ impl RouteServiceCli {
         );
     }
 
+    // Re-create the DDS entities of this route from its own stored
+    // configuration (same service name and type) if they are currently
+    // deactivated. No-op when already active or after route retirement.
+    fn activate_if_deactivated(&mut self) {
+        let liveness = self.liveness.clone();
+        liveness.if_live(|| {
+            // re-check under the lock: a concurrent matching callback may
+            // have just activated the route
+            if self.req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                return;
+            }
+            let route_id = self.to_string();
+            tracing::debug!("{route_id}: re-activate");
+            if let Err(e) = activate(
+                &self.rep_writer,
+                &self.req_reader,
+                &self.ros2_name,
+                &self.ros2_type,
+                &route_id,
+                &self.context,
+                &self.type_info,
+                &self.zenoh_querier,
+            ) {
+                tracing::error!("{route_id}: failed to re-activate DDS Reader/Writer: {e}");
+            }
+        });
+    }
+
     #[inline]
     pub fn add_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr: &keyexpr) {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
+        // The route may have been deactivated by remove_remote_route() while
+        // the Querier stayed matched the whole time (e.g. another Queryable
+        // serves the same key expression, or the remote Queryable returned
+        // before the retirement event was processed). In that case no
+        // MatchingStatus transition will ever fire again: re-activate the
+        // DDS entities here if a local node still needs them.
+        if self.is_serving_local_node() {
+            self.activate_if_deactivated();
+        }
     }
 
     #[inline]
@@ -295,6 +349,11 @@ impl RouteServiceCli {
             if let Err(e) = self.announce_route().await {
                 tracing::error!("{self}: announcement failed: {e}");
             }
+        }
+        // Symmetric to add_remote_route(): local demand may appear while the
+        // route is wedged deactivated with the Querier already matched.
+        if self.is_serving_remote_route() {
+            self.activate_if_deactivated();
         }
     }
 
