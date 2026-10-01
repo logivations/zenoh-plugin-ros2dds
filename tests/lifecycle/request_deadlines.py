@@ -79,11 +79,13 @@ def check_deadlines(lab):
             "scouting": {"multicast": {"enabled": False}},
         }))
         with zenoh.open(config) as session:
+            last_explicit_deadline = time.monotonic()
             cases = [
                 ("fast_unknown_deadline", None, 0, "reply"),
                 ("slow_unknown_deadline", None, 2, "reply"),
                 ("slow_explicit_deadline", "5000", 2, "reply"),
                 ("explicit_expiry", "500", 2, "expire"),
+                ("fast_after_expiry", None, 0, "reply"),
                 ("malformed_deadline", "invalid", 0, "error"),
                 ("overflow_deadline", "18446744073709551616", 0, "error"),
             ]
@@ -93,6 +95,8 @@ def check_deadlines(lab):
                     selector += "?__ros2dds_timeout_ms=" + timeout
                 before = route()["expired_queries"]
                 started = time.monotonic()
+                if timeout is not None and expected != "error":
+                    last_explicit_deadline = max(last_explicit_deadline, started + int(timeout) / 1000)
                 replies = list(session.get(
                     selector, payload=b"\0\1\0\0" + struct.pack("<qq", delay, request_id), timeout=5,
                 ))
@@ -122,6 +126,25 @@ def check_deadlines(lab):
                     assert not service_event("request", request_id), "Invalid request reached DDS"
                 if expected != "error":
                     eventually(lambda: service_event("reply", request_id))
+
+            # Completed queries may leave one scheduled hint. Observe idle only
+            # after every advertised deadline plus a full scan grace has elapsed.
+            time.sleep(max(0, last_explicit_deadline + 1 - time.monotonic()))
+            samples = []
+            generation = route()["lifecycle"]["generation"]
+            for _ in range(4):
+                current, health = route(), lab.health("server")
+                assert current["is_active"] and current["pending_queries"] == 0, current
+                assert current["lifecycle"]["generation"] == generation
+                assert health["owned_dds_endpoints"] == health["live_dds_endpoints"] == 2, health
+                samples.append({"wall": time.time(), "health": health})
+                if len(samples) < 4:
+                    time.sleep(1)
+            results.append({"case": "idle_live_route", "samples": samples})
+            (lab.output / "deadline-results.json").write_text(json.dumps(results, indent=2))
+            assert len({sample["health"]["reconciliation_sequence"] for sample in samples}) == 1, samples
+            assert len({sample["health"]["zid"] for sample in samples}) == 1, samples
+            print("PASS: live service route has zero maintenance scans during three idle seconds", flush=True)
 
             # A caller with no advertised deadline must remain pending past the
             # receiver's outgoing timeout, then finish when its route retires.

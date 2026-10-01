@@ -17,6 +17,7 @@ cargo build --locked -p zenoh-bridge-ros2dds
 /tmp/lifecycle-venv/bin/python tests/lifecycle/type_transition.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-type-transition
 cargo build --locked -p zenoh-bridge-ros2dds --features lifecycle-test-hooks
 /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-hooks --faults
+/tmp/lifecycle-venv/bin/python tests/lifecycle/scheduler_retry.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-retry
 ```
 
 Use a fresh output directory for each run. Processes are stopped on success and
@@ -43,10 +44,24 @@ escalation fails the test; shutdown timings are retained in `shutdowns.jsonl`.
 
 The deadline test receives a valid two-second native reply despite a one-second
 receiving bridge timeout, checks explicit expiry and malformed deadline rejection,
-and retires a route with a pending request. The type-transition test replaces an
+then requires another real reply after expiry. After all known deadlines drain,
+a live service route must show no reconciliation-sequence increments for three
+idle seconds. It also retires a route with a pending request and requires caller
+completion before the caller timeout. The type-transition test replaces an
 Image writer with a String writer in the same participant and requires both
 post-replacement String batches to arrive through a new correctly typed proxy.
 It uses domain 196 and ports 17478/18178 in the same isolated namespace.
+
+The focused retry test has one native queryable and one ROS client. It injects
+one failed endpoint creation, keeps matching unchanged, and requires two correct
+replies through the same recovered route without a bridge restart. The many-route
+fault test alone cannot prove this: other routes' matching events might cause its
+retry. As a negative control in a disposable source copy, replace only the
+`maintenance.wait(maintenance_not_before)` select arm with a permanently pending
+future; retain matching notifications and test-hook polling. The focused retry
+test must fail waiting for service readiness. Do not ship that control. A build
+with the old 250 ms polling interval must separately fail the deadline helper's
+idle-sequence assertion; this distinguishes correctness from the idle CPU fix.
 
 These bounded regressions complement the real-DDS unit tests and ordinary ROS
 service/action/topic integration tests. They are not a multi-day soak, physical
@@ -59,8 +74,9 @@ cargo test --locked --release -p zenoh-plugin-ros2dds --lib discovery_churn_benc
 ```
 
 It sends endpoints **after** their ROS graph, both into empty participants and
-participants already containing up to 1,850 services, and measures individual
-additions and disposals. Run it on the same host/toolchain against the baseline;
+participants already containing up to 9,000 services, with up to 12,000 total
+services in one or 512 nodes, and measures individual additions and disposals.
+Run it on the same host/toolchain against the baseline;
 wall-clock thresholds are intentionally not asserted in shared CI. Complete-binary
 CPU measurements must also cover paced node teardown and measure settled idle
 separately: including `destroy_node()` in an idle interval mislabels teardown CPU.
