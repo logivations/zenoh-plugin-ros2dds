@@ -10,8 +10,10 @@ has its own cell, so a queued old callback cannot mutate its replacement.
 The pinned Zenoh 1.10.1 implementation serializes matching callbacks and checks
 current matching state before delivery. Callbacks perform no DDS/session work,
 including during listener declaration/destruction (the historical #382/#533
-lock cycle). The owner reconciles on notifications and a 250 ms tick; failed
-activation retains intent and retries with 100 ms to 5 s backoff.
+lock cycle). The owner reconciles on matching notifications and when a retry or
+known request deadline is due. An idle bridge has no lifecycle polling tick.
+One shared wake hint coalesces due work, with at most one scheduled scan per
+250 ms. Failed activation retains intent and retries with 100 ms to 5 s backoff.
 
 A service owns one request/reply pair. Construction rolls back on any failure;
 ROS graph advertisement/withdrawal commits both endpoints together. Data callbacks
@@ -68,7 +70,9 @@ native Zenoh big-endian messages and header-only empty requests. The existing
 interoperability defect; an unpatched receiving bridge still has that defect.
 
 `@/<zid>/ros2/lifecycle` exposes build identity, reconciliation progress and owned
-resource/cleanup/write-failure accounting. Admin data alone cannot detect every
+resource/cleanup/write-failure accounting. `reconciliation_age_ms` measures time
+since the last needed scan; it is not a heartbeat and can grow during healthy idle.
+Admin data alone cannot detect every
 orphan or establish application health. A timeout alone does not justify a restart.
 Set BRIDGE_BUILD_ID to the exact commit when packaging. Test hooks are disabled by
 default and must not be included in deployed binaries.
