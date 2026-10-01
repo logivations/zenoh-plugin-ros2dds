@@ -1,7 +1,7 @@
 # Full-binary lifecycle regressions
 
 Run in a disposable ROS 2 Jazzy container with `rmw_cyclonedds_cpp`,
-`example_interfaces`, `std_msgs`, `std_srvs` and `eclipse-zenoh==1.10.1`.
+`example_interfaces`, `std_msgs`, `sensor_msgs`, `std_srvs` and `eclipse-zenoh==1.10.1`.
 The existing Jazzy CI job installs these dependencies and retains process logs.
 The Python driver starts the actual binary twice, with ROS service/client nodes
 and native Zenoh peers. It uses loopback, DDS domains 181/182 and ports
@@ -13,6 +13,8 @@ python3 -m venv --system-site-packages /tmp/lifecycle-venv
 /tmp/lifecycle-venv/bin/pip install eclipse-zenoh==1.10.1
 cargo build --locked -p zenoh-bridge-ros2dds
 /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-default
+/tmp/lifecycle-venv/bin/python tests/lifecycle/request_deadlines.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-deadlines
+/tmp/lifecycle-venv/bin/python tests/lifecycle/type_transition.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-type-transition
 cargo build --locked -p zenoh-bridge-ros2dds --features lifecycle-test-hooks
 /tmp/lifecycle-venv/bin/python tests/lifecycle/run.py --bridge target/debug/zenoh-bridge-ros2dds --output /tmp/lifecycle-hooks --faults
 ```
@@ -34,7 +36,17 @@ boundaries and requires automatic retry without duplicates. It deliberately
 invalidates an owned DDS reader to verify fatal cleanup quarantine, diagnostics
 and recovery by restarting only the affected server bridge. The unaffected camera
 must retain its session. This deliberate ownership violation does not establish
-a natural production trigger for cleanup failure.
+a natural production trigger for cleanup failure. The quarantine assertion is
+first checked against live pairs, then requires empty pair GUIDs, independently
+absent DDS endpoints and failed real calls before recovery. Unexpected SIGKILL
+escalation fails the test; shutdown timings are retained in `shutdowns.jsonl`.
+
+The deadline test receives a valid two-second native reply despite a one-second
+receiving bridge timeout, checks explicit expiry and malformed deadline rejection,
+and retires a route with a pending request. The type-transition test replaces an
+Image writer with a String writer in the same participant and requires both
+post-replacement String batches to arrive through a new correctly typed proxy.
+It uses domain 196 and ports 17478/18178 in the same isolated namespace.
 
 These bounded regressions complement the real-DDS unit tests and ordinary ROS
 service/action/topic integration tests. They are not a multi-day soak, physical

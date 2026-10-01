@@ -54,9 +54,12 @@ resource retirement indefinitely. That attempted data delivery is lost on write 
 this is an intentional overload behavior change, not a delivery guarantee. Counters
 and route logs expose the failures. This does not change reliability matching. ROS graph
 publication uses an unlocked snapshot and retries failure without losing concurrent
-edits. Pending incoming queries expire even when no later message arrives; patched
-callers communicate their timeout, while legacy/native callers use the receiving
-bridge's configured timeout.
+edits. Pending incoming queries with an advertised timeout expire even when no
+later message arrives. Legacy/native callers expose no deadline in the pinned
+Zenoh API: their queries remain until a reply or route retirement, as upstream
+does. The receiving bridge's outgoing timeout cannot safely limit those calls.
+Invalid explicit timeout metadata is rejected before forwarding to DDS.
+Retirement fences new requests and releases pending queries outside locks.
 
 Request correlation uses numeric client/sequence identity, independent of CDR byte
 order. Request and reply headers use their own payload's byte order, including

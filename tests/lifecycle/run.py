@@ -35,6 +35,7 @@ class Lab:
         self.output.mkdir(parents=True, exist_ok=True)
         self.processes = {}
         self.logs = []
+        self.forced_shutdowns = []
         self.environment = dict(
             os.environ,
             RMW_IMPLEMENTATION="rmw_cyclonedds_cpp",
@@ -90,12 +91,21 @@ class Lab:
 
     def stop(self, name, sig=signal.SIGINT):
         process = self.processes.pop(name)
+        started = time.monotonic()
+        forced = False
         process.send_signal(sig)
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            forced = True
+            self.forced_shutdowns.append(name)
             process.kill()
             process.wait(timeout=5)
+        with (self.output / "shutdowns.jsonl").open("a") as log:
+            log.write(json.dumps(dict(
+                name=name, signal=sig.name, forced=forced,
+                elapsed_s=time.monotonic() - started, returncode=process.returncode,
+            )) + "\n")
 
     def bridge(self, side):
         self.start(
@@ -131,18 +141,24 @@ class Lab:
     def health(self, side):
         return self.admin(side)[0]
 
+    def latest_probe(self):
+        path = self.output / "ros-probe.log"
+        if path.exists():
+            for line in reversed(path.read_text().splitlines()):
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    continue
+        return None
+
     def healthy(self):
         after = time.time()
 
         def ready():
             for name, process in self.processes.items():
                 assert process.poll() is None, f"{name} exited; see {name}.log"
-            path = self.output / "ros-probe.log"
-            for line in reversed(path.read_text().splitlines()):
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
+            row = self.latest_probe()
+            if row:
                 return (
                     row["wall"] >= after
                     and row["ready"] == row["ok"] == 24
@@ -178,6 +194,19 @@ class Lab:
             self.stop(name)
         for log in self.logs:
             log.close()
+        if sys.exc_info()[0] is None:
+            assert not self.forced_shutdowns, (
+                "Graceful shutdown required SIGKILL; see shutdowns.jsonl",
+                self.forced_shutdowns,
+            )
+
+
+def service_proxies_absent(routes):
+    """A client route serializes its pair, not an `is_active` field."""
+    expected = {f"/test/frame_{i}" for i in range(24)}
+    frames = [route for route in routes if route["ros2_name"] in expected]
+    assert {route["ros2_name"] for route in frames} == expected, routes
+    return all(route["req_reader"] == route["rep_writer"] == "" for route in frames)
 
 
 def wire_checks(lab, session):
@@ -304,6 +333,10 @@ def main():
                     )
                     assert after > before, (stage, before, after)
                 print("PASS: failure/retry at every pair creation boundary", flush=True)
+                # Positive control: the assertion must reject live proxy pairs.
+                assert not service_proxies_absent(
+                    lab.admin("server", "route/service/cli/**")
+                )
                 lab.fault("invalidate_reader", service="/test/frame_0")
                 lab.stop("ros-camera")
                 eventually(lambda: lab.health("server")["cleanup_failures"] > 0)
@@ -314,9 +347,23 @@ def main():
                 eventually(
                     lambda: len(lab.admin("server", "route/service/cli/**")) >= 24
                 )
-                assert not any(
-                    r.get("is_active")
-                    for r in lab.admin("server", "route/service/cli/**")
+                eventually(lambda: service_proxies_absent(
+                    lab.admin("server", "route/service/cli/**")
+                ))
+                # Independently observe DDS and real calls after the failed
+                # recreation, rather than treating an admin flag as health.
+                after = time.time()
+                eventually(lambda: (
+                    (row := lab.latest_probe()) is not None
+                    and row["wall"] >= after
+                    and row["ready"] == row["ok"] == 0
+                    and all(n == 0 for n in row["readers"] + row["writers"])
+                ))
+                assert all(
+                    route["lifecycle"]["desired"]
+                    and route["lifecycle"]["consecutive_failures"] > 0
+                    for route in lab.admin("server", "route/service/cli/**")
+                    if route["ros2_name"].startswith("/test/frame_")
                 )
                 lab.stop("server", signal.SIGKILL)
                 lab.bridge("server")
