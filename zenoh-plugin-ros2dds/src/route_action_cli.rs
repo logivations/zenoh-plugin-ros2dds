@@ -149,13 +149,12 @@ impl RouteActionCli {
         )
         .await?;
 
-        let announcement_retry = Retry::new(context.maintenance.clone());
         Ok(RouteActionCli {
             ros2_name,
             ros2_type,
             zenoh_key_expr_prefix,
             context,
-            announcement_retry,
+            announcement_retry: Retry::new(),
             route_send_goal,
             route_cancel_goal,
             route_get_result,
@@ -175,7 +174,7 @@ impl RouteActionCli {
         self.route_status.reconcile().await;
         if !self.local_nodes.is_empty()
             && self.liveliness_token.is_none()
-            && self.announcement_retry.ready_or_schedule()
+            && self.announcement_retry.ready()
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {

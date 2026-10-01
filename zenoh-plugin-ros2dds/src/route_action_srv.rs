@@ -135,13 +135,12 @@ impl RouteActionSrv {
         )
         .await?;
 
-        let announcement_retry = Retry::new(context.maintenance.clone());
         Ok(RouteActionSrv {
             ros2_name,
             ros2_type,
             zenoh_key_expr_prefix,
             context,
-            announcement_retry,
+            announcement_retry: Retry::new(),
             route_send_goal,
             route_cancel_goal,
             route_get_result,
@@ -164,7 +163,7 @@ impl RouteActionSrv {
             && self.route_send_goal.is_active()
             && self.route_cancel_goal.is_active()
             && self.route_get_result.is_active()
-            && self.announcement_retry.ready_or_schedule()
+            && self.announcement_retry.ready()
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {

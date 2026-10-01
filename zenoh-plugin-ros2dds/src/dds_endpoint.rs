@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
 
 //! Route-owned DDS resources. Data callbacks borrow access, never ownership.
+use cyclors::{
+    qos::{History, HistoryKind, Qos},
+    *,
+};
+use serde::{Serialize, Serializer};
 use std::{
     ffi::CStr,
     sync::{
@@ -10,12 +15,6 @@ use std::{
     },
     time::Duration,
 };
-
-use cyclors::{
-    qos::{History, HistoryKind, Qos},
-    *,
-};
-use serde::{Serialize, Serializer};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -467,9 +466,8 @@ pub(crate) mod fault {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{mpsc, Barrier};
-
     use super::*;
+    use std::sync::{mpsc, Barrier};
 
     #[test]
     fn closed_access_releases_callback_capture_outside_the_fence() {

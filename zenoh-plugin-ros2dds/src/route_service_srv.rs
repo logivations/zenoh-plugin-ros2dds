@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -122,26 +122,20 @@ impl RouteServiceSrv {
         let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
         tracing::debug!("{route_id}: creation with type {ros2_type}");
 
-        let lifecycle = RouteLifecycle::new(context.maintenance.clone());
-        let announcement_retry = Retry::new(context.maintenance.clone());
-        let mut route = RouteServiceSrv {
+        Ok(RouteServiceSrv {
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             context,
             zenoh_queryable: None,
             proxy: None,
-            lifecycle,
-            announcement_retry,
+            lifecycle: RouteLifecycle::new(),
+            announcement_retry: Retry::new(),
             type_info: type_info.clone(),
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
-        };
-        // A remote-only route must expose its DDS pair without another event.
-        // Creation failure remains owned and schedules a retry.
-        route.reconcile().await;
-        Ok(route)
+        })
     }
 
     // Announce the route over Zenoh via a LivelinessToken
@@ -162,6 +156,10 @@ impl RouteServiceSrv {
         let route_id: String = self.to_string();
         let client_guid = proxy.client_guid;
         let req_writer = proxy.req_writer.access();
+        let retention = self
+            .context
+            .config
+            .get_incoming_query_retention(&self.ros2_name);
         let queryable = Some(
             self.context
                 .zsession
@@ -174,6 +172,7 @@ impl RouteServiceSrv {
                         &route_id,
                         client_guid,
                         &req_writer,
+                        retention,
                     )
                 })
                 .await
@@ -235,7 +234,7 @@ impl RouteServiceSrv {
         if !self.local_nodes.is_empty()
             && self.proxy.is_some()
             && self.zenoh_queryable.is_none()
-            && self.announcement_retry.ready_or_schedule()
+            && self.announcement_retry.ready()
         {
             let result = self.announce_route().await;
             if let Err(error) = self.announcement_retry.record(result) {
@@ -310,7 +309,6 @@ struct ServiceServerProxy {
 impl Drop for ServiceServerProxy {
     fn drop(&mut self) {
         self.req_writer.fence();
-        self.queries_in_progress.clear();
         DdsEndpoint::withdraw_pair(&mut self.rep_reader, &mut self.req_writer);
     }
 }
@@ -352,7 +350,7 @@ fn create_proxy(
         qos.clone(),
     )?;
     let client_guid = get_instance_handle(req_writer.entity())?;
-    let queries_in_progress = Arc::new(PendingQueries::new(context.maintenance.clone()));
+    let queries_in_progress = Arc::new(PendingQueries::default());
     let pending = queries_in_progress.clone();
     let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
     let key = zenoh_key_expr.clone();
@@ -388,21 +386,8 @@ fn route_zenoh_request_to_dds(
     route_id: &str,
     client_guid: u64,
     req_writer: &DdsAccess,
+    retention: Duration,
 ) {
-    let deadline = match pending_queries::deadline(
-        query.parameters().get(RETENTION_PARAMETER),
-        Instant::now(),
-    ) {
-        Ok(deadline) => deadline,
-        Err(error) => {
-            let message = format!("Invalid {RETENTION_PARAMETER}: {error}");
-            tracing::warn!("{route_id}: {message}");
-            if let Err(error) = query.reply_err(message).wait() {
-                tracing::warn!("{route_id}: failed to reply to invalid request: {error}");
-            }
-            return;
-        }
-    };
     // Empty service requests may contain only the four-byte CDR header.
     let is_little_endian = query
         .payload()
@@ -459,6 +444,11 @@ fn route_zenoh_request_to_dds(
         );
     }
 
+    let deadline = pending_queries::deadline(
+        query.parameters().get(RETENTION_PARAMETER),
+        retention,
+        Instant::now(),
+    );
     let completed = req_writer.with(|writer| {
         let replaced = queries_in_progress.insert(request_id, query, deadline);
         let failed = if let Err(e) = dds_write(writer, dds_req_buf) {

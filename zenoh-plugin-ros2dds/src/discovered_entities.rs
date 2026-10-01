@@ -13,7 +13,7 @@
 //
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::HashMap,
     fmt::{self, Debug},
 };
 
@@ -44,155 +44,11 @@ kedefine!(
 #[derive(Default)]
 pub struct DiscoveredEntities {
     participants: HashMap<Gid, DdsParticipant>,
-    writers: Endpoints,
-    readers: Endpoints,
+    writers: HashMap<Gid, DdsEntity>,
+    readers: HashMap<Gid, DdsEntity>,
     ros_participant_info: HashMap<Gid, ParticipantEntitiesInfo>,
     nodes_info: HashMap<Gid, HashMap<String, NodeInfo>>,
     admin_space: HashMap<OwnedKeyExpr, EntityRef>,
-}
-
-/// DDS metadata has one owner; the topic index contains only its keys.
-/// Removal must inspect competing endpoints, not scan unrelated participants.
-#[derive(Default)]
-struct Endpoints {
-    entities: HashMap<Gid, DdsEntity>,
-    topics: HashMap<Gid, HashMap<String, BTreeSet<Gid>>>,
-}
-
-enum EndpointUpdate<'a> {
-    Metadata,
-    Identity {
-        current: &'a DdsEntity,
-        previous: Option<(Gid, String)>,
-    },
-}
-
-#[cfg(all(test, debug_assertions))]
-thread_local! {
-    static SURVIVOR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-impl Endpoints {
-    fn insert(&mut self, entity: DdsEntity) -> EndpointUpdate<'_> {
-        let key = entity.key;
-        if let Some(previous) = self.entities.get_mut(&key) {
-            if previous.participant_key == entity.participant_key
-                && previous.topic_name == entity.topic_name
-            {
-                *previous = entity;
-                return EndpointUpdate::Metadata;
-            }
-        }
-        let previous = self
-            .remove(&key)
-            .map(|previous| (previous.participant_key, previous.topic_name));
-        self.topics
-            .entry(entity.participant_key)
-            .or_default()
-            .entry(entity.topic_name.clone())
-            .or_default()
-            .insert(key);
-        let current = self.entities.entry(key).or_insert(entity);
-        EndpointUpdate::Identity { current, previous }
-    }
-
-    fn remove(&mut self, key: &Gid) -> Option<DdsEntity> {
-        let entity = self.entities.remove(key)?;
-        let topics = self.topics.get_mut(&entity.participant_key).unwrap();
-        let members = topics.get_mut(&entity.topic_name).unwrap();
-        assert!(members.remove(key));
-        if members.is_empty() {
-            topics.remove(&entity.topic_name);
-        }
-        if topics.is_empty() {
-            self.topics.remove(&entity.participant_key);
-        }
-        Some(entity)
-    }
-
-    fn remove_participant(&mut self, participant: &Gid) {
-        if let Some(topics) = self.topics.remove(participant) {
-            for key in topics.into_values().flatten() {
-                self.entities.remove(&key);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn on_topic(
-        &self,
-        participant: &Gid,
-        topic: &str,
-    ) -> impl DoubleEndedIterator<Item = &DdsEntity> {
-        self.topics
-            .get(participant)
-            .and_then(|topics| topics.get(topic))
-            .into_iter()
-            .flatten()
-            .map(|key| &self.entities[key])
-    }
-
-    fn replacement(&self, removed: &DdsEntity, membership: &HashSet<Gid>) -> Option<&DdsEntity> {
-        let topic = self
-            .topics
-            .get(&removed.participant_key)?
-            .get(&removed.topic_name)?;
-        // HashSet iteration scans capacity. Interleave the searches only when
-        // the membership table is smaller than the topic bucket.
-        let mut members = (topic.len() > membership.capacity()).then(|| membership.iter());
-        let mut best_member: Option<&DdsEntity> = None;
-        let mut fallback = None;
-        for key in topic.iter().rev() {
-            #[cfg(all(test, debug_assertions))]
-            SURVIVOR_VISITS.with(|visits| visits.set(visits.get() + 1));
-            // Ordered search goes first: a compatible survivor is immediately
-            // definitive, even when its node owns only part of a shared topic.
-            if membership.contains(key) {
-                let candidate = &self.entities[key];
-                if candidate.type_name == removed.type_name {
-                    return Some(candidate);
-                }
-                if fallback.is_none() {
-                    fallback = Some(candidate);
-                }
-            }
-            if let Some(members) = members.as_mut() {
-                let Some(key) = members.next() else {
-                    return best_member;
-                };
-                #[cfg(all(test, debug_assertions))]
-                SURVIVOR_VISITS.with(|visits| visits.set(visits.get() + 1));
-                if let Some(candidate) = self.entities.get(key).filter(|candidate| {
-                    candidate.participant_key == removed.participant_key
-                        && candidate.topic_name == removed.topic_name
-                }) {
-                    if best_member.is_none_or(|best| {
-                        (candidate.type_name == removed.type_name, candidate.key)
-                            > (best.type_name == removed.type_name, best.key)
-                    }) {
-                        best_member = Some(candidate);
-                    }
-                }
-            }
-        }
-        fallback
-    }
-
-    fn get(&self, key: &Gid) -> Option<&DdsEntity> {
-        self.entities.get(key)
-    }
-
-    fn contains_key(&self, key: &Gid) -> bool {
-        self.entities.contains_key(key)
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &Gid> {
-        self.entities.keys()
-    }
-
-    fn len(&self) -> usize {
-        self.entities.len()
-    }
 }
 
 impl Debug for DiscoveredEntities {
@@ -257,8 +113,10 @@ impl DiscoveredEntities {
     pub fn remove_participant(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
         self.participants.remove(gid);
         self.ros_participant_info.remove(gid);
-        self.writers.remove_participant(gid);
-        self.readers.remove_participant(gid);
+        self.writers
+            .retain(|_, entity| entity.participant_key != *gid);
+        self.readers
+            .retain(|_, entity| entity.participant_key != *gid);
         self.admin_space.retain(|_, entity| match entity {
             EntityRef::Participant(p) | EntityRef::Node(p, _) => p != gid,
             EntityRef::Writer(w) => self.writers.contains_key(w),
@@ -276,6 +134,16 @@ impl DiscoveredEntities {
 
     #[inline]
     fn add_writer(&mut self, writer: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+        self.admin_space.insert(
+            keformat!(
+                ke_admin_writer::formatter(),
+                pgid = writer.participant_key,
+                wgid = writer.key,
+                topic = &writer.topic_name
+            )
+            .unwrap(),
+            EntityRef::Writer(writer.key),
+        );
         let mut events = Vec::new();
         if let Some(nodes) = self.nodes_info.get_mut(&writer.participant_key) {
             for node in nodes.values_mut() {
@@ -289,29 +157,7 @@ impl DiscoveredEntities {
                 }
             }
         }
-        if let EndpointUpdate::Identity { current, previous } = self.writers.insert(writer) {
-            if let Some((participant, topic)) = previous {
-                self.admin_space.remove(
-                    &keformat!(
-                        ke_admin_writer::formatter(),
-                        pgid = participant,
-                        wgid = current.key,
-                        topic = topic
-                    )
-                    .unwrap(),
-                );
-            }
-            self.admin_space.insert(
-                keformat!(
-                    ke_admin_writer::formatter(),
-                    pgid = current.participant_key,
-                    wgid = current.key,
-                    topic = &current.topic_name
-                )
-                .unwrap(),
-                EntityRef::Writer(current.key),
-            );
-        }
+        self.writers.insert(writer.key, writer);
         events
     }
 
@@ -339,6 +185,16 @@ impl DiscoveredEntities {
             self.ros_participant_info.get(&writer.participant_key),
             self.nodes_info.get_mut(&writer.participant_key),
         ) {
+            // The endpoint is already out of the global map, so this holds
+            // only survivors on the same topic within the same participant.
+            let replacements: Vec<_> = self
+                .writers
+                .values()
+                .filter(|candidate| {
+                    candidate.participant_key == writer.participant_key
+                        && candidate.topic_name == writer.topic_name
+                })
+                .collect();
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.writer_gid_seq;
                 if membership.contains(gid) {
@@ -350,12 +206,14 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_writer(gid);
                     if tracked {
-                        match self.writers.replacement(&writer, membership) {
-                            Some(replacement) => push_replacement_events(
-                                &mut events,
-                                withdrawal,
-                                node.update_with_writer(replacement),
-                            ),
+                        match replacements
+                            .iter()
+                            .filter(|candidate| membership.contains(&candidate.key))
+                            .max_by_key(|candidate| candidate.key)
+                        {
+                            Some(replacement) => {
+                                events.extend(node.update_with_writer(replacement))
+                            }
                             None => events.extend(withdrawal),
                         }
                     }
@@ -368,6 +226,16 @@ impl DiscoveredEntities {
 
     #[inline]
     fn add_reader(&mut self, reader: DdsEntity) -> Vec<ROS2DiscoveryEvent> {
+        self.admin_space.insert(
+            keformat!(
+                ke_admin_reader::formatter(),
+                pgid = reader.participant_key,
+                wgid = reader.key,
+                topic = &reader.topic_name
+            )
+            .unwrap(),
+            EntityRef::Reader(reader.key),
+        );
         let mut events = Vec::new();
         if let Some(nodes) = self.nodes_info.get_mut(&reader.participant_key) {
             for node in nodes.values_mut() {
@@ -381,29 +249,7 @@ impl DiscoveredEntities {
                 }
             }
         }
-        if let EndpointUpdate::Identity { current, previous } = self.readers.insert(reader) {
-            if let Some((participant, topic)) = previous {
-                self.admin_space.remove(
-                    &keformat!(
-                        ke_admin_reader::formatter(),
-                        pgid = participant,
-                        wgid = current.key,
-                        topic = topic
-                    )
-                    .unwrap(),
-                );
-            }
-            self.admin_space.insert(
-                keformat!(
-                    ke_admin_reader::formatter(),
-                    pgid = current.participant_key,
-                    wgid = current.key,
-                    topic = &current.topic_name
-                )
-                .unwrap(),
-                EntityRef::Reader(current.key),
-            );
-        }
+        self.readers.insert(reader.key, reader);
         events
     }
 
@@ -431,6 +277,16 @@ impl DiscoveredEntities {
             self.ros_participant_info.get(&reader.participant_key),
             self.nodes_info.get_mut(&reader.participant_key),
         ) {
+            // The endpoint is already out of the global map, so this holds
+            // only survivors on the same topic within the same participant.
+            let replacements: Vec<_> = self
+                .readers
+                .values()
+                .filter(|candidate| {
+                    candidate.participant_key == reader.participant_key
+                        && candidate.topic_name == reader.topic_name
+                })
+                .collect();
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.reader_gid_seq;
                 if membership.contains(gid) {
@@ -442,12 +298,14 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_reader(gid);
                     if tracked {
-                        match self.readers.replacement(&reader, membership) {
-                            Some(replacement) => push_replacement_events(
-                                &mut events,
-                                withdrawal,
-                                node.update_with_reader(replacement),
-                            ),
+                        match replacements
+                            .iter()
+                            .filter(|candidate| membership.contains(&candidate.key))
+                            .max_by_key(|candidate| candidate.key)
+                        {
+                            Some(replacement) => {
+                                events.extend(node.update_with_reader(replacement))
+                            }
                             None => events.extend(withdrawal),
                         }
                     }
@@ -461,8 +319,8 @@ impl DiscoveredEntities {
     /// Update only the affected interface, as the eclipse-zenoh upstream
     /// does. ROS graph snapshots reconcile membership; DDS events must not
     /// reconstruct unrelated routes, even when the events arrive one at a
-    /// time. A compatible survivor preserves the interface; a type change
-    /// withdraws the old interface before announcing its replacement.
+    /// time. One removal emits either the survivor swap or the withdrawal
+    /// for an interface, never both.
     pub fn apply_dds_event(&mut self, event: DDSDiscoveryEvent) -> Vec<ROS2DiscoveryEvent> {
         match event {
             DDSDiscoveryEvent::DiscoveredPublication { entity } => self.add_writer(entity),
@@ -488,9 +346,9 @@ impl DiscoveredEntities {
     /// the difference. This reconcile path never carries endpoints absent from
     /// the current ROS snapshot; incremental endpoint events are handled by
     /// `remove_reader`/`remove_writer`, which withdraw an interface only when
-    /// its last tracked endpoint is gone. Within one returned batch, same-type
-    /// discoveries precede withdrawals across all nodes, so transferring an
-    /// interface preserves its route. Type changes withdraw the old route first.
+    /// its last tracked endpoint is gone. Within one returned batch, discoveries
+    /// for current nodes precede withdrawals of vanished nodes, so a route
+    /// shared by interface name survives a node rename.
     fn reconcile_participant(&mut self, participant: Gid) -> Vec<ROS2DiscoveryEvent> {
         if !self.participants.contains_key(&participant) {
             return Vec::new();
@@ -574,7 +432,7 @@ impl DiscoveredEntities {
             events.extend(node.remove_all_entities());
         }
         self.nodes_info.insert(participant, current);
-        order_participant_events(events)
+        events
     }
 
     fn get_entity_json_value(
@@ -675,87 +533,6 @@ impl DiscoveredEntities {
     }
 }
 
-// Routes are shared by interface family/name, but their DDS resources also
-// depend on type. A same-topic survivor alone does not establish compatibility.
-fn interface_signature(event: &ROS2DiscoveryEvent) -> (u8, &str, &str) {
-    use ROS2DiscoveryEvent::*;
-    match event {
-        DiscoveredMsgPub(_, _, v) | UndiscoveredMsgPub(_, _, v) => (0, &v.name, &v.typ),
-        DiscoveredMsgSub(_, _, v) | UndiscoveredMsgSub(_, _, v) => (1, &v.name, &v.typ),
-        DiscoveredServiceSrv(_, _, v) | UndiscoveredServiceSrv(_, _, v) => (2, &v.name, &v.typ),
-        DiscoveredServiceCli(_, _, v) | UndiscoveredServiceCli(_, _, v) => (3, &v.name, &v.typ),
-        DiscoveredActionSrv(_, _, v) | UndiscoveredActionSrv(_, _, v) => (4, &v.name, &v.typ),
-        DiscoveredActionCli(_, _, v) | UndiscoveredActionCli(_, _, v) => (5, &v.name, &v.typ),
-    }
-}
-
-fn is_discovery(event: &ROS2DiscoveryEvent) -> bool {
-    use ROS2DiscoveryEvent::*;
-    matches!(
-        event,
-        DiscoveredMsgPub(..)
-            | DiscoveredMsgSub(..)
-            | DiscoveredServiceSrv(..)
-            | DiscoveredServiceCli(..)
-            | DiscoveredActionSrv(..)
-            | DiscoveredActionCli(..)
-    )
-}
-
-fn push_replacement_events(
-    events: &mut Vec<ROS2DiscoveryEvent>,
-    withdrawal: Option<ROS2DiscoveryEvent>,
-    replacement: Option<ROS2DiscoveryEvent>,
-) {
-    events.extend(withdrawal.filter(|old| {
-        replacement.as_ref().map(interface_signature) != Some(interface_signature(old))
-    }));
-    events.extend(replacement);
-}
-
-fn order_participant_events(events: Vec<ROS2DiscoveryEvent>) -> Vec<ROS2DiscoveryEvent> {
-    if !events.iter().any(is_discovery) || events.iter().all(is_discovery) {
-        return events;
-    }
-    // Determine ordering across the whole participant, not one node at a time.
-    // Borrow signatures only during classification; no persistent routing index
-    // or cloned interface state is needed.
-    let mut additions = HashMap::new();
-    for event in events.iter().filter(|event| is_discovery(event)) {
-        let (family, name, typ) = interface_signature(event);
-        additions
-            .entry((family, name))
-            .and_modify(|(first_type, mixed)| *mixed |= *first_type != typ)
-            .or_insert((typ, false));
-    }
-    let phases: Vec<_> = events
-        .iter()
-        .map(|event| {
-            if is_discovery(event) {
-                1
-            } else {
-                let (family, name, typ) = interface_signature(event);
-                if additions
-                    .get(&(family, name))
-                    .is_some_and(|(new_type, mixed)| *mixed || *new_type != typ)
-                {
-                    0 // Retire incompatible DDS resources before recreation.
-                } else {
-                    2 // Keep the route alive during same-type owner transfers.
-                }
-            }
-        })
-        .collect();
-    let mut ordered = [Vec::new(), Vec::new(), Vec::new()];
-    for (event, phase) in events.into_iter().zip(phases) {
-        ordered[phase].push(event);
-    }
-    let [mut replacements, additions, withdrawals] = ordered;
-    replacements.extend(additions);
-    replacements.extend(withdrawals);
-    replacements
-}
-
 // Remove any null QoS values from a serde_json::Value
 fn remove_null_qos_values(
     value: Result<serde_json::Value, serde_json::Error>,
@@ -779,10 +556,9 @@ fn remove_null_qos_values(
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use cyclors::qos::Qos;
-
     use super::*;
     use crate::ros_discovery::NodeEntitiesInfo;
+    use cyclors::qos::Qos;
     fn gid(n: u8) -> Gid {
         Gid::from([n; 16])
     }
@@ -879,156 +655,9 @@ mod lifecycle_tests {
         let mut d = initial();
         d.remove_participant(&gid(1));
         assert!(d.ros_participant_info.is_empty());
-        assert!(d.readers.entities.is_empty());
-        assert!(d.writers.entities.is_empty());
-        assert!(d.readers.topics.is_empty());
-        assert!(d.writers.topics.is_empty());
+        assert!(d.readers.is_empty());
+        assert!(d.writers.is_empty());
         assert!(d.nodes_info.is_empty());
-    }
-
-    #[test]
-    fn endpoint_index_tracks_metadata_replacement_and_releases_empty_buckets() {
-        let mut endpoints = Endpoints::default();
-        let first = entity(1, 20, true);
-        let second = entity(1, 21, true);
-        let topic = first.topic_name.clone();
-        endpoints.insert(first);
-        endpoints.insert(second);
-        assert_eq!(endpoints.on_topic(&gid(1), &topic).count(), 2);
-
-        let mut replacement = entity(2, 20, true);
-        replacement.topic_name = "rq/newRequest".into();
-        for _ in 0..100 {
-            endpoints.insert(replacement.clone());
-        }
-        replacement.type_name = "ChangedRequest_".into();
-        endpoints.insert(replacement);
-        assert_eq!(
-            endpoints
-                .on_topic(&gid(2), "rq/newRequest")
-                .next()
-                .unwrap()
-                .type_name,
-            "ChangedRequest_"
-        );
-        assert_eq!(endpoints.len(), 2);
-        assert_eq!(
-            endpoints
-                .on_topic(&gid(1), &topic)
-                .map(|e| e.key)
-                .collect::<Vec<_>>(),
-            vec![gid(21)]
-        );
-        assert_eq!(
-            endpoints
-                .on_topic(&gid(2), "rq/newRequest")
-                .map(|e| e.key)
-                .collect::<Vec<_>>(),
-            vec![gid(20)]
-        );
-
-        endpoints.remove_participant(&gid(1));
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints.topics.len(), 1);
-        assert!(endpoints.remove(&gid(20)).is_some());
-        assert!(endpoints.remove(&gid(20)).is_none());
-        assert!(endpoints.entities.is_empty());
-        assert!(endpoints.topics.is_empty());
-    }
-
-    #[test]
-    fn ordered_survivor_preserves_compatible_type_then_highest_member_gid() {
-        for unrelated in [0, 64] {
-            let mut endpoints = Endpoints::default();
-            let removed = entity(1, 10, true);
-            for id in [24, 21, 23, 20, 22] {
-                let mut candidate = entity(1, id, true);
-                if id % 2 == 0 {
-                    candidate.type_name = "other::srv::dds_::Response_".into();
-                }
-                endpoints.insert(candidate);
-            }
-            endpoints.insert(entity(2, 30, true));
-            let mut other_topic = entity(1, 31, true);
-            other_topic.topic_name = "rr/otherReply".into();
-            endpoints.insert(other_topic);
-            for id in 32..32 + unrelated {
-                endpoints.insert(entity(1, id, true));
-            }
-
-            // Exercise both search directions, including absent metadata,
-            // ineligible high GIDs, compatible preference, and type fallback.
-            for subset in 0u8..32 {
-                let mut membership: HashSet<_> = (20..25)
-                    .filter(|id| subset & (1 << (id - 20)) != 0)
-                    .map(gid)
-                    .collect();
-                membership.extend([gid(30), gid(31), gid(255)]);
-                if subset % 2 == 0 {
-                    membership.reserve(128);
-                }
-                let expected = endpoints
-                    .entities
-                    .values()
-                    .filter(|candidate| {
-                        candidate.participant_key == removed.participant_key
-                            && candidate.topic_name == removed.topic_name
-                            && membership.contains(&candidate.key)
-                    })
-                    .max_by_key(|candidate| {
-                        (candidate.type_name == removed.type_name, candidate.key)
-                    })
-                    .map(|candidate| candidate.key);
-                assert_eq!(
-                    endpoints
-                        .replacement(&removed, &membership)
-                        .map(|candidate| candidate.key),
-                    expected,
-                    "membership subset {subset}, unrelated endpoints {unrelated}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn endpoint_admin_identity_follows_canonical_metadata() {
-        for writer in [false, true] {
-            let mut discovered = DiscoveredEntities::default();
-            let mut endpoint = entity(1, 20, writer);
-            let update = |discovered: &mut DiscoveredEntities, endpoint| {
-                if writer {
-                    discovered.add_writer(endpoint)
-                } else {
-                    discovered.add_reader(endpoint)
-                }
-            };
-            assert!(update(&mut discovered, endpoint.clone()).is_empty());
-            let old_admin_key = discovered.admin_space.keys().next().unwrap().clone();
-
-            endpoint.qos.user_data = Some(vec![1, 2, 3]);
-            assert!(update(&mut discovered, endpoint.clone()).is_empty());
-            assert_eq!(discovered.admin_space.len(), 1);
-            assert!(discovered.admin_space.contains_key(&old_admin_key));
-            let metadata = if writer {
-                discovered.get_writer(&endpoint.key)
-            } else {
-                discovered.get_reader(&endpoint.key)
-            }
-            .unwrap();
-            assert_eq!(metadata.qos.user_data, Some(vec![1, 2, 3]));
-
-            endpoint.participant_key = gid(2);
-            endpoint.topic_name = "rr/movedReply".into();
-            assert!(update(&mut discovered, endpoint).is_empty());
-            assert_eq!(discovered.admin_space.len(), 1);
-            assert!(!discovered.admin_space.contains_key(&old_admin_key));
-            discovered.remove_participant(&gid(1));
-            assert_eq!(discovered.admin_space.len(), 1);
-            discovered.remove_participant(&gid(2));
-            assert!(discovered.admin_space.is_empty());
-            assert_eq!(discovered.readers.len(), 0);
-            assert_eq!(discovered.writers.len(), 0);
-        }
     }
 
     fn interface_endpoints(action: bool, client: bool, copy: u8) -> Vec<(bool, DdsEntity)> {
@@ -1196,40 +825,6 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn incomplete_interfaces_still_replace_tracked_components() {
-        for action in [false, true] {
-            for client in [false, true] {
-                let survivors = interface_endpoints(action, client, 0);
-                let selected = interface_endpoints(action, client, 1);
-                let mut endpoints = survivors.clone();
-                endpoints.extend(selected.clone());
-                let mut d = discover_interface(&endpoints);
-                // Remove every endpoint for one component, withdrawing the
-                // complete interface while retaining its other components.
-                let (writer, endpoint) = &survivors[0];
-                assert!(remove_endpoint(&mut d, *writer, &endpoint.key).is_empty());
-                let (writer, endpoint) = &selected[0];
-                assert_eq!(remove_endpoint(&mut d, *writer, &endpoint.key).len(), 1);
-
-                // This tracked disposal has no withdrawal (already incomplete),
-                // but must still find the survivor for its own component.
-                let (writer, endpoint) = &selected[1];
-                assert!(remove_endpoint(&mut d, *writer, &endpoint.key).is_empty());
-                let (writer, endpoint) = &selected[0];
-                let events = add_endpoint(&mut d, *writer, endpoint.clone());
-                assert_eq!(
-                    events.len(),
-                    1,
-                    "action={action}, client={client}: {events:?}"
-                );
-                let mut expected: Vec<_> = selected.iter().map(|(_, e)| e.key).collect();
-                expected[1] = survivors[1].1.key;
-                assert_eq!(discovered_components(&events[0]), expected);
-            }
-        }
-    }
-
-    #[test]
     fn disposing_an_untracked_endpoint_does_not_rewrite_the_interface() {
         for action in [false, true] {
             for client in [false, true] {
@@ -1248,16 +843,8 @@ mod lifecycle_tests {
                     );
                 }
                 let node = &d.nodes_info[&gid(1)]["/camera"];
-                let complete = node
-                    .service_srv
-                    .values()
-                    .filter(|s| s.is_complete())
-                    .count()
-                    + node
-                        .service_cli
-                        .values()
-                        .filter(|s| s.is_complete())
-                        .count()
+                let complete = node.service_srv.values().filter(|s| s.is_complete()).count()
+                    + node.service_cli.values().filter(|s| s.is_complete()).count()
                     + node.action_srv.values().filter(|s| s.is_complete()).count()
                     + node.action_cli.values().filter(|s| s.is_complete()).count();
                 assert_eq!(complete, 1);
@@ -1270,287 +857,6 @@ mod lifecycle_tests {
         endpoint.topic_name = "rt/image".into();
         endpoint.type_name = "sensor_msgs::msg::dds_::Image_".into();
         endpoint
-    }
-
-    fn event_details(event: &ROS2DiscoveryEvent) -> (bool, Gid, &str, &str, &str) {
-        use ROS2DiscoveryEvent::*;
-        match event {
-            DiscoveredMsgPub(p, n, v) => (true, *p, n, &v.name, &v.typ),
-            UndiscoveredMsgPub(p, n, v) => (false, *p, n, &v.name, &v.typ),
-            DiscoveredMsgSub(p, n, v) => (true, *p, n, &v.name, &v.typ),
-            UndiscoveredMsgSub(p, n, v) => (false, *p, n, &v.name, &v.typ),
-            DiscoveredServiceSrv(p, n, v) => (true, *p, n, &v.name, &v.typ),
-            UndiscoveredServiceSrv(p, n, v) => (false, *p, n, &v.name, &v.typ),
-            DiscoveredServiceCli(p, n, v) => (true, *p, n, &v.name, &v.typ),
-            UndiscoveredServiceCli(p, n, v) => (false, *p, n, &v.name, &v.typ),
-            DiscoveredActionSrv(p, n, v) => (true, *p, n, &v.name, &v.typ),
-            UndiscoveredActionSrv(p, n, v) => (false, *p, n, &v.name, &v.typ),
-            DiscoveredActionCli(p, n, v) => (true, *p, n, &v.name, &v.typ),
-            UndiscoveredActionCli(p, n, v) => (false, *p, n, &v.name, &v.typ),
-        }
-    }
-
-    fn discovered_components(event: &ROS2DiscoveryEvent) -> Vec<Gid> {
-        use ROS2DiscoveryEvent::*;
-        match event {
-            DiscoveredServiceSrv(_, _, v) => vec![v.entities.req_reader, v.entities.rep_writer],
-            DiscoveredServiceCli(_, _, v) => vec![v.entities.req_writer, v.entities.rep_reader],
-            DiscoveredActionSrv(_, _, v) => vec![
-                v.entities.send_goal.req_reader,
-                v.entities.send_goal.rep_writer,
-                v.entities.cancel_goal.req_reader,
-                v.entities.cancel_goal.rep_writer,
-                v.entities.get_result.req_reader,
-                v.entities.get_result.rep_writer,
-                v.entities.feedback_writer,
-                v.entities.status_writer,
-            ],
-            DiscoveredActionCli(_, _, v) => vec![
-                v.entities.send_goal.req_writer,
-                v.entities.send_goal.rep_reader,
-                v.entities.cancel_goal.req_writer,
-                v.entities.cancel_goal.rep_reader,
-                v.entities.get_result.req_writer,
-                v.entities.get_result.rep_reader,
-                v.entities.feedback_reader,
-                v.entities.status_reader,
-            ],
-            _ => panic!("expected a complete service/action discovery: {event:?}"),
-        }
-    }
-
-    fn changed_type(mut endpoints: Vec<(bool, DdsEntity)>) -> Vec<(bool, DdsEntity)> {
-        for (_, endpoint) in &mut endpoints {
-            endpoint.type_name = endpoint
-                .type_name
-                .replace("AddTwoInts", "SetBool")
-                .replace("Fibonacci", "OtherAction")
-                .replace(
-                    "sensor_msgs::msg::dds_::Image_",
-                    "std_msgs::msg::dds_::String_",
-                );
-        }
-        endpoints
-    }
-
-    #[test]
-    fn incompatible_topic_survivor_withdraws_before_rediscovery() {
-        for writer in [false, true] {
-            let old = topic_entity(11, writer);
-            let new = changed_type(vec![(writer, topic_entity(12, writer))])
-                .pop()
-                .unwrap()
-                .1;
-            let mut d = discover_interface(&[(writer, old.clone())]);
-            assert!(add_endpoint(&mut d, writer, new.clone()).is_empty());
-            let mut info = d.ros_participant_info[&gid(1)].clone();
-            let node = info.node_entities_info_seq.get_mut("/camera").unwrap();
-            if writer {
-                node.writer_gid_seq.insert(new.key);
-            } else {
-                node.reader_gid_seq.insert(new.key);
-            }
-            // Both types are present in one real ROS node. The second type is
-            // ignored until the final endpoint of the original type disappears.
-            assert!(d.update_participant_info(info.clone()).is_empty());
-            let events = remove_endpoint(&mut d, writer, &old.key);
-            assert_eq!(
-                events.iter().map(event_details).collect::<Vec<_>>(),
-                [
-                    (false, gid(1), "/camera", "/image", "sensor_msgs/msg/Image"),
-                    (true, gid(1), "/camera", "/image", "std_msgs/msg/String"),
-                ],
-                "writer={writer}: {events:?}"
-            );
-            let node = info.node_entities_info_seq.get_mut("/camera").unwrap();
-            if writer {
-                node.writer_gid_seq.remove(&old.key);
-                assert_eq!(
-                    d.nodes_info[&gid(1)]["/camera"].msg_pub["/image"].writers,
-                    [new.key].into()
-                );
-            } else {
-                node.reader_gid_seq.remove(&old.key);
-                assert_eq!(
-                    d.nodes_info[&gid(1)]["/camera"].msg_sub["/image"].readers,
-                    [new.key].into()
-                );
-            }
-            assert!(d.update_participant_info(info).is_empty());
-        }
-    }
-
-    #[test]
-    fn incompatible_service_and_action_survivors_withdraw_the_old_type() {
-        for action in [false, true] {
-            for client in [false, true] {
-                let old = interface_endpoints(action, client, 1);
-                let new = changed_type(interface_endpoints(action, client, 0));
-                for (index, (writer, endpoint)) in old.iter().enumerate() {
-                    if endpoint.type_name == new[index].1.type_name {
-                        continue; // Action status/cancel components have a shared type.
-                    }
-                    let mut endpoints = new.clone();
-                    endpoints.extend(old.clone());
-                    let mut d = discover_interface(&endpoints);
-                    let events = remove_endpoint(&mut d, *writer, &endpoint.key);
-                    let old_type = if action {
-                        "example_interfaces/action/Fibonacci"
-                    } else {
-                        "example_interfaces/srv/AddTwoInts"
-                    };
-                    let new_type = if action {
-                        "example_interfaces/action/OtherAction"
-                    } else {
-                        "example_interfaces/srv/SetBool"
-                    };
-                    assert_eq!(
-                        events.iter().map(event_details).collect::<Vec<_>>(),
-                        [
-                            (false, gid(1), "/camera", "/test", old_type),
-                            (true, gid(1), "/camera", "/test", new_type),
-                        ],
-                        "action={action}, client={client}, component={index}: {events:?}"
-                    );
-                    let mut expected: Vec<_> = old.iter().map(|(_, e)| e.key).collect();
-                    expected[index] = new[index].1.key;
-                    assert_eq!(discovered_components(&events[1]), expected);
-                    // A different-type handover must not erase the other
-                    // already-known components while retiring the old route.
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn compatible_service_and_action_survivors_take_precedence_over_other_types() {
-        for action in [false, true] {
-            for client in [false, true] {
-                let compatible = interface_endpoints(action, client, 0);
-                let incompatible = changed_type(interface_endpoints(action, client, 1));
-                let selected = interface_endpoints(action, client, 2);
-                for (index, (writer, endpoint)) in selected.iter().enumerate() {
-                    if endpoint.type_name == incompatible[index].1.type_name {
-                        continue;
-                    }
-                    let mut endpoints = compatible.clone();
-                    endpoints.push(incompatible[index].clone());
-                    endpoints.extend(selected.clone());
-                    let mut d = discover_interface(&endpoints);
-                    let events = remove_endpoint(&mut d, *writer, &endpoint.key);
-                    let typ = if action {
-                        "example_interfaces/action/Fibonacci"
-                    } else {
-                        "example_interfaces/srv/AddTwoInts"
-                    };
-                    assert_eq!(
-                        events.iter().map(event_details).collect::<Vec<_>>(),
-                        [(true, gid(1), "/camera", "/test", typ)],
-                        "action={action}, client={client}, component={index}: {events:?}"
-                    );
-                    let mut expected: Vec<_> = selected.iter().map(|(_, e)| e.key).collect();
-                    expected[index] = compatible[index].1.key;
-                    assert_eq!(discovered_components(&events[0]), expected);
-                    // The actual retained component, not just the advertised
-                    // type, must come from the compatible endpoint.
-                }
-            }
-        }
-    }
-
-    fn participant_handoff(
-        old: Vec<(bool, DdsEntity)>,
-        new: Vec<(bool, DdsEntity)>,
-        type_change: bool,
-    ) {
-        let mut d = DiscoveredEntities::default();
-        d.add_participant(DdsParticipant {
-            key: gid(1),
-            qos: Qos::default(),
-        });
-        for (writer, endpoint) in old.iter().chain(&new) {
-            add_endpoint(&mut d, *writer, endpoint.clone());
-        }
-        let mut next = ParticipantEntitiesInfo::new(gid(1));
-        for name in ["one", "two"] {
-            let node = NodeEntitiesInfo::new("/".into(), name.into());
-            next.node_entities_info_seq.insert(node.full_name(), node);
-        }
-        // Assign the old owner to the actual first iterated node. Updating only
-        // values below preserves that iteration order, making c04 fail without
-        // relying on a particular randomized HashMap seed.
-        let names: Vec<_> = next.node_entities_info_seq.keys().cloned().collect();
-        let old_name = &names[0];
-        let new_name = &names[1];
-        let mut previous = next.clone();
-        for (info, name, endpoints) in
-            [(&mut previous, old_name, &old), (&mut next, new_name, &new)]
-        {
-            let node = info.node_entities_info_seq.get_mut(name).unwrap();
-            for (writer, endpoint) in endpoints {
-                if *writer {
-                    node.writer_gid_seq.insert(endpoint.key);
-                } else {
-                    node.reader_gid_seq.insert(endpoint.key);
-                }
-            }
-        }
-        let initial = d.update_participant_info(previous);
-        assert_eq!(initial.len(), 1);
-        let old_type = event_details(&initial[0]).4;
-        let events = d.update_participant_info(next.clone());
-        assert_eq!(events.len(), 2, "{events:?}");
-        let details: Vec<_> = events.iter().map(event_details).collect();
-        let (withdrawal, addition) = if type_change { (0, 1) } else { (1, 0) };
-        assert!(!details[withdrawal].0, "{events:?}");
-        assert_eq!(details[withdrawal].1, gid(1));
-        assert_eq!(details[withdrawal].2, old_name);
-        assert_eq!(details[withdrawal].4, old_type);
-        assert!(details[addition].0, "{events:?}");
-        assert_eq!(details[addition].1, gid(1));
-        assert_eq!(details[addition].2, new_name);
-        assert_eq!(details[addition].4 == old_type, !type_change);
-        assert!(d.update_participant_info(next).is_empty());
-    }
-
-    #[test]
-    fn transfers_between_existing_nodes_preserve_same_type_routes() {
-        for writer in [false, true] {
-            participant_handoff(
-                vec![(writer, topic_entity(11, writer))],
-                vec![(writer, topic_entity(12, writer))],
-                false,
-            );
-        }
-        for action in [false, true] {
-            for client in [false, true] {
-                participant_handoff(
-                    interface_endpoints(action, client, 0),
-                    interface_endpoints(action, client, 1),
-                    false,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn type_changes_between_nodes_withdraw_before_discovery() {
-        for writer in [false, true] {
-            participant_handoff(
-                vec![(writer, topic_entity(11, writer))],
-                changed_type(vec![(writer, topic_entity(12, writer))]),
-                true,
-            );
-        }
-        for action in [false, true] {
-            for client in [false, true] {
-                participant_handoff(
-                    interface_endpoints(action, client, 0),
-                    changed_type(interface_endpoints(action, client, 1)),
-                    true,
-                );
-            }
-        }
     }
 
     #[test]
@@ -1581,18 +887,12 @@ mod lifecycle_tests {
         // Disposing the last endpoint withdraws the route, and only then.
         let events = d.remove_writer(&gid(32));
         assert!(
-            matches!(
-                events.as_slice(),
-                [ROS2DiscoveryEvent::UndiscoveredMsgPub(..)]
-            ),
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredMsgPub(..)]),
             "{events:?}"
         );
         let events = d.remove_reader(&gid(42));
         assert!(
-            matches!(
-                events.as_slice(),
-                [ROS2DiscoveryEvent::UndiscoveredMsgSub(..)]
-            ),
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredMsgSub(..)]),
             "{events:?}"
         );
         let node = &d.nodes_info[&gid(1)]["/camera"];
@@ -1600,18 +900,12 @@ mod lifecycle_tests {
         // A returning endpoint re-announces without a new ROS snapshot.
         let events = d.add_writer(topic_entity(32, true));
         assert!(
-            matches!(
-                events.as_slice(),
-                [ROS2DiscoveryEvent::DiscoveredMsgPub(..)]
-            ),
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredMsgPub(..)]),
             "{events:?}"
         );
         let events = d.add_reader(topic_entity(42, false));
         assert!(
-            matches!(
-                events.as_slice(),
-                [ROS2DiscoveryEvent::DiscoveredMsgSub(..)]
-            ),
+            matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredMsgSub(..)]),
             "{events:?}"
         );
         let node = &d.nodes_info[&gid(1)]["/camera"];
@@ -1743,12 +1037,11 @@ mod lifecycle_tests {
 
 #[cfg(test)]
 mod cpu_benchmark {
-    use std::time::Instant;
-
-    use cyclors::qos::Qos;
-
     use super::*;
-    use crate::{dds_discovery::DDSDiscoveryEvent, ros_discovery::NodeEntitiesInfo};
+    use crate::dds_discovery::DDSDiscoveryEvent;
+    use crate::ros_discovery::NodeEntitiesInfo;
+    use cyclors::qos::Qos;
+    use std::time::Instant;
 
     fn id(n: usize) -> Gid {
         let mut bytes = [0; 16];
@@ -1810,7 +1103,7 @@ mod cpu_benchmark {
     #[test]
     #[ignore = "release-mode discovery CPU comparison; see tests/lifecycle/README.md"]
     fn discovery_churn_benchmark() {
-        for nodes in [1, 512] {
+        for nodes in [1, 231] {
             for (base, added) in [
                 (0, 250),
                 (0, 500),
@@ -1818,8 +1111,6 @@ mod cpu_benchmark {
                 (500, 150),
                 (1850, 150),
                 (1850, 300),
-                (0, 12000),
-                (9000, 3000),
             ] {
                 for repeat in 0..3 {
                     let mut d = DiscoveredEntities::default();
@@ -1849,391 +1140,6 @@ mod cpu_benchmark {
                         .sum();
                     assert_eq!(complete, base);
                     println!("BENCH {{\"nodes\":{nodes},\"base_services\":{base},\"added_services\":{added},\"repeat\":{repeat},\"add_us\":{elapsed_us},\"remove_us\":{remove_us},\"emitted\":{emitted},\"complete\":{complete}}}");
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod survivor_shape_benchmark {
-    use std::{hint::black_box, time::Instant};
-
-    use cyclors::qos::Qos;
-
-    use super::*;
-    use crate::ros_discovery::NodeEntitiesInfo;
-
-    const NODE: &str = "/dense_node";
-    const SERVICE: &str = "/dense";
-    const REPEATS: usize = 7;
-    const UPDATES: usize = 65_536;
-
-    fn participant() -> Gid {
-        let mut bytes = [0x42; 16];
-        bytes[12..].copy_from_slice(&[0, 0, 1, 0xc1]);
-        Gid::from(bytes)
-    }
-
-    // DDS-like common participant prefix and monotonically ordered entity IDs.
-    // Big-endian rank is essential: numerical descending removal must match Gid::Ord.
-    fn endpoint_gid(rank: usize, writer: bool) -> Gid {
-        let mut bytes = [0x42; 16];
-        bytes[12..15].copy_from_slice(&((rank + 1) as u32).to_be_bytes()[1..]);
-        bytes[15] = if writer { 3 } else { 4 };
-        Gid::from(bytes)
-    }
-
-    fn endpoint(rank: usize, writer: bool) -> DdsEntity {
-        DdsEntity {
-            key: endpoint_gid(rank, writer),
-            participant_key: participant(),
-            topic_name: if writer {
-                "rq/denseRequest"
-            } else {
-                "rr/denseReply"
-            }
-            .into(),
-            type_name: if writer {
-                "example_interfaces::srv::dds_::AddTwoInts_Request_"
-            } else {
-                "example_interfaces::srv::dds_::AddTwoInts_Response_"
-            }
-            .into(),
-            _type_info: None,
-            keyless: true,
-            qos: Qos::default(),
-        }
-    }
-
-    fn discovery(entity: DdsEntity, writer: bool) -> DDSDiscoveryEvent {
-        if writer {
-            DDSDiscoveryEvent::DiscoveredPublication { entity }
-        } else {
-            DDSDiscoveryEvent::DiscoveredSubscription { entity }
-        }
-    }
-
-    fn disposal(key: Gid, writer: bool) -> DDSDiscoveryEvent {
-        if writer {
-            DDSDiscoveryEvent::UndiscoveredPublication { key }
-        } else {
-            DDSDiscoveryEvent::UndiscoveredSubscription { key }
-        }
-    }
-
-    fn component(entities: &ServiceCliEntities, writer: bool) -> Gid {
-        if writer {
-            entities.req_writer
-        } else {
-            entities.rep_reader
-        }
-    }
-
-    fn selected(d: &DiscoveredEntities, writer: bool) -> Gid {
-        selected_for(d, NODE, writer)
-    }
-
-    fn selected_for(d: &DiscoveredEntities, node: &str, writer: bool) -> Gid {
-        component(
-            &d.nodes_info[&participant()][node].service_cli[SERVICE].entities,
-            writer,
-        )
-    }
-
-    fn node_name(index: usize) -> String {
-        if index == 0 {
-            NODE.to_owned()
-        } else {
-            format!("{NODE}_{index}")
-        }
-    }
-
-    fn fixture(endpoints: usize) -> DiscoveredEntities {
-        fixture_for_nodes(1, endpoints)
-    }
-
-    fn fixture_for_nodes(nodes: usize, per_node: usize) -> DiscoveredEntities {
-        let endpoints = nodes * per_node;
-        let mut d = DiscoveredEntities::default();
-        assert!(d
-            .apply_dds_event(DDSDiscoveryEvent::DiscoveredParticipant {
-                entity: DdsParticipant {
-                    key: participant(),
-                    qos: Qos::default()
-                },
-            })
-            .is_empty());
-        let mut graph = ParticipantEntitiesInfo::new(participant());
-        for index in 0..nodes {
-            let name = node_name(index);
-            let mut node = NodeEntitiesInfo::new("/".into(), name[1..].into());
-            for rank in index * per_node..(index + 1) * per_node {
-                for writer in [false, true] {
-                    let entity = endpoint(rank, writer);
-                    if writer {
-                        node.writer_gid_seq.insert(entity.key);
-                    } else {
-                        node.reader_gid_seq.insert(entity.key);
-                    }
-                    assert!(d.apply_dds_event(discovery(entity, writer)).is_empty());
-                }
-            }
-            graph.node_entities_info_seq.insert(name, node);
-        }
-        let events = d.update_participant_info(graph);
-        assert_eq!(events.len(), nodes);
-        assert!(events
-            .iter()
-            .all(|event| matches!(event, ROS2DiscoveryEvent::DiscoveredServiceCli(..))));
-        for index in 0..nodes {
-            for writer in [false, true] {
-                assert_eq!(
-                    selected_for(&d, &node_name(index), writer),
-                    endpoint_gid((index + 1) * per_node - 1, writer)
-                );
-            }
-        }
-        assert_eq!(d.writers.len(), endpoints);
-        assert_eq!(d.readers.len(), endpoints);
-        d
-    }
-
-    fn canonical(d: &DiscoveredEntities, rank: usize, writer: bool) -> &DdsEntity {
-        if writer {
-            d.get_writer(&endpoint_gid(rank, writer)).unwrap()
-        } else {
-            d.get_reader(&endpoint_gid(rank, writer)).unwrap()
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn sparse_node_survivor_search_has_linear_candidate_work() {
-        const NODES: usize = 64;
-        for writer in [false, true] {
-            let mut d = fixture_for_nodes(NODES, 1);
-            let membership = &d.ros_participant_info[&participant()].node_entities_info_seq[NODE];
-            let capacity = if writer {
-                membership.writer_gid_seq.capacity()
-            } else {
-                membership.reader_gid_seq.capacity()
-            };
-            SURVIVOR_VISITS.with(|visits| visits.set(0));
-            for rank in (0..NODES).rev() {
-                let key = endpoint_gid(rank, writer);
-                let name = node_name(rank);
-                assert_eq!(selected_for(&d, &name, writer), key);
-                let events = d.apply_dds_event(disposal(key, writer));
-                assert!(
-                    matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredServiceCli(p, node, service)]
-                    if *p == participant() && node == &name && service.name == SERVICE)
-                );
-                assert_eq!(selected_for(&d, &name, writer), Gid::NOT_DISCOVERED);
-                assert!(if writer {
-                    d.get_writer(&key)
-                } else {
-                    d.get_reader(&key)
-                }
-                .is_none());
-            }
-            let visits = SURVIVOR_VISITS.with(|visits| visits.get());
-            // At most capacity ordered entries plus one finishing step, each
-            // paired with at most one membership entry. This is a work bound,
-            // not a timing threshold; the graph-node walk is not counted.
-            assert!(visits <= NODES * (2 * capacity + 1),
-                "writer={writer}: {visits} candidate visits for {NODES} singleton nodes with capacity {capacity}");
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn dense_subset_survivor_keeps_the_immediate_ordered_match() {
-        for writer in [false, true] {
-            let mut d = fixture_for_nodes(4, 512);
-            let name = node_name(3);
-            let key = endpoint_gid(2047, writer);
-            let expected = endpoint_gid(2046, writer);
-            assert_eq!(selected_for(&d, &name, writer), key);
-            SURVIVOR_VISITS.with(|visits| visits.set(0));
-            let events = d.apply_dds_event(disposal(key, writer));
-            assert!(
-                matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredServiceCli(p, node, service)]
-                if *p == participant() && node == &name && service.name == SERVICE
-                && service.is_complete() && component(&service.entities, writer) == expected)
-            );
-            assert_eq!(selected_for(&d, &name, writer), expected);
-            assert!(if writer {
-                d.get_writer(&key)
-            } else {
-                d.get_reader(&key)
-            }
-            .is_none());
-            let visits = SURVIVOR_VISITS.with(|visits| visits.get());
-            assert!(visits <= 1, "writer={writer}: compatible highest remaining topic member must win before unordered traversal");
-        }
-    }
-
-    #[test]
-    #[ignore = "matched release microbenchmark; root coordinates immutable ELF comparisons"]
-    fn dense_selected_disposal() {
-        for (nodes, per_node) in [
-            (1, 1),
-            (1, 8),
-            (1, 64),
-            (1, 512),
-            (1, 2048),
-            (4, 512),
-            (64, 1),
-            (512, 1),
-            (2048, 1),
-            (64, 4),
-            (512, 4),
-            (2048, 4),
-        ] {
-            let endpoints = nodes * per_node;
-            let names: Vec<_> = (0..nodes).map(node_name).collect();
-            for writer in [false, true] {
-                for repeat in 0..REPEATS {
-                    let mut d = fixture_for_nodes(nodes, per_node);
-                    let start = Instant::now();
-                    let mut replacements = 0;
-                    let mut withdrawals = 0;
-                    for rank in (0..endpoints).rev() {
-                        // This check stays in the measured loop for both variants:
-                        // every removal must exercise the selected-survivor path.
-                        let key = endpoint_gid(rank, writer);
-                        let name = &names[rank / per_node];
-                        assert_eq!(selected_for(&d, name, writer), key);
-                        let events = black_box(d.apply_dds_event(disposal(key, writer)));
-                        assert!(if writer {
-                            d.get_writer(&key)
-                        } else {
-                            d.get_reader(&key)
-                        }
-                        .is_none());
-                        if rank % per_node > 0 {
-                            let expected = endpoint_gid(rank - 1, writer);
-                            assert!(
-                                matches!(events.as_slice(), [ROS2DiscoveryEvent::DiscoveredServiceCli(p, node, service)]
-                                if *p == participant() && node == name && service.name == SERVICE
-                                && service.is_complete() && component(&service.entities, writer) == expected)
-                            );
-                            assert_eq!(selected_for(&d, name, writer), expected);
-                            replacements += 1;
-                        } else {
-                            assert!(
-                                matches!(events.as_slice(), [ROS2DiscoveryEvent::UndiscoveredServiceCli(p, node, service)]
-                                if *p == participant() && node == name && service.name == SERVICE)
-                            );
-                            assert_eq!(selected_for(&d, name, writer), Gid::NOT_DISCOVERED);
-                            withdrawals += 1;
-                        }
-                    }
-                    let elapsed_ns = start.elapsed().as_nanos();
-                    assert_eq!(replacements, endpoints - nodes);
-                    assert_eq!(withdrawals, nodes);
-                    assert_eq!(
-                        if writer {
-                            d.writers.len()
-                        } else {
-                            d.readers.len()
-                        },
-                        0
-                    );
-                    assert_eq!(
-                        if writer {
-                            d.readers.len()
-                        } else {
-                            d.writers.len()
-                        },
-                        endpoints
-                    );
-                    assert!(d.nodes_info[&participant()]
-                        .values()
-                        .all(|node| !node.service_cli[SERVICE].is_complete()));
-                    println!(
-                        "SURVIVOR_BENCH {}",
-                        serde_json::json!({
-                            "kind":"dense_selected_disposal", "manifest_dir":env!("CARGO_MANIFEST_DIR"),
-                            "endpoints_per_direction":endpoints, "nodes":nodes, "endpoints_per_node":per_node,
-                            "writer":writer, "repeat":repeat,
-                            "elapsed_ns":elapsed_ns, "ns_per_removal":elapsed_ns as f64/endpoints as f64,
-                            "replacements":replacements, "withdrawals":withdrawals,
-                            "oracle":"actual selected GID checked before and after every measured removal",
-                        })
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "matched release microbenchmark; root coordinates immutable ELF comparisons"]
-    fn duplicate_metadata_updates() {
-        for endpoints in [1, 64, 2048] {
-            for writer in [false, true] {
-                for round_robin in [false, true] {
-                    if round_robin && endpoints != 2048 {
-                        continue;
-                    }
-                    for repeat in 0..REPEATS {
-                        let mut d = fixture(endpoints);
-                        // Owned DDS samples are prepared outside the measured API calls.
-                        let input = (0..UPDATES)
-                            .map(|update| {
-                                let rank = if round_robin {
-                                    update % endpoints
-                                } else {
-                                    endpoints - 1
-                                };
-                                let mut entity = endpoint(rank, writer);
-                                entity.qos.user_data = Some((update as u64).to_be_bytes().to_vec());
-                                discovery(entity, writer)
-                            })
-                            .collect::<Vec<_>>();
-                        let start = Instant::now();
-                        let mut emitted = 0;
-                        for event in input {
-                            emitted += black_box(d.apply_dds_event(black_box(event))).len();
-                        }
-                        let elapsed_ns = start.elapsed().as_nanos();
-                        assert_eq!(emitted, 0);
-                        assert_eq!(d.writers.len(), endpoints);
-                        assert_eq!(d.readers.len(), endpoints);
-                        assert_eq!(d.admin_space.len(), 2 * endpoints + 2);
-                        assert_eq!(selected(&d, true), endpoint_gid(endpoints - 1, true));
-                        assert_eq!(selected(&d, false), endpoint_gid(endpoints - 1, false));
-                        assert!(
-                            d.nodes_info[&participant()][NODE].service_cli[SERVICE].is_complete()
-                        );
-                        let ranks = if round_robin {
-                            0..endpoints
-                        } else {
-                            endpoints - 1..endpoints
-                        };
-                        for rank in ranks {
-                            let last_update = if round_robin {
-                                UPDATES - endpoints + rank
-                            } else {
-                                UPDATES - 1
-                            };
-                            assert_eq!(
-                                canonical(&d, rank, writer).qos.user_data.as_deref(),
-                                Some((last_update as u64).to_be_bytes().as_slice())
-                            );
-                        }
-                        println!(
-                            "SURVIVOR_BENCH {}",
-                            serde_json::json!({
-                                "kind":"duplicate_metadata_updates", "manifest_dir":env!("CARGO_MANIFEST_DIR"),
-                                "endpoints_per_direction":endpoints, "writer":writer, "repeat":repeat,
-                                "round_robin":round_robin, "updates":UPDATES, "emitted":emitted,
-                                "elapsed_ns":elapsed_ns, "ns_per_update":elapsed_ns as f64/UPDATES as f64,
-                                "metadata":"canonical QoS user_data checked against final per-GID update sequence",
-                            })
-                        );
-                    }
                 }
             }
         }

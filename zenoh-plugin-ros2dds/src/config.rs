@@ -113,6 +113,21 @@ impl Config {
         Duration::from_secs_f32(DEFAULT_QUERIES_TIMEOUT)
     }
 
+    /// Legacy/native callers do not expose their Zenoh deadline. Use this
+    /// bridge's configured timeout for the same operation as a retention bound.
+    /// Patched callers propagate their timeout as an optional query parameter.
+    pub(crate) fn get_incoming_query_retention(&self, ros2_name: &str) -> Duration {
+        if let Some(action) = ros2_name.strip_suffix("/_action/get_result") {
+            self.get_queries_timeout_action_get_result(action)
+        } else if let Some(action) = ros2_name.strip_suffix("/_action/send_goal") {
+            self.get_queries_timeout_action_send_goal(action)
+        } else if let Some(action) = ros2_name.strip_suffix("/_action/cancel_goal") {
+            self.get_queries_timeout_action_cancel_goal(action)
+        } else {
+            self.get_queries_timeout_service(ros2_name)
+        }
+    }
+
     pub fn get_queries_timeout_service(&self, ros2_name: &str) -> Duration {
         if let Some(qt) = &self.queries_timeout {
             for (re, secs) in &qt.services {
@@ -729,9 +744,7 @@ pub fn serialize_duration_as_f32<S>(d: &Duration, serializer: S) -> Result<S::Ok
 where
     S: Serializer,
 {
-    // Preserve the number produced by the former admin Value pipeline, which
-    // widens f32 with the default serde_json features.
-    serde_json::Value::from(d.as_secs_f32()).serialize(serializer)
+    serializer.serialize_f32(d.as_secs_f32())
 }
 
 #[cfg(test)]

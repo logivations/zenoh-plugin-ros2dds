@@ -1,6 +1,6 @@
 # Lifecycle patch on 1.10.1
 
-Plugin base: `d8269b5bbca6bfadae61f830bfdbcf17a0a7b7cd` (1.10.1).
+Base: `d8269b5bbca6bfadae61f830bfdbcf17a0a7b7cd`. Cargo.lock is unchanged.
 This branch targets the standalone bridge. Dynamic plugin hot-unload is outside
 its support contract.
 
@@ -10,10 +10,8 @@ has its own cell, so a queued old callback cannot mutate its replacement.
 The pinned Zenoh 1.10.1 implementation serializes matching callbacks and checks
 current matching state before delivery. Callbacks perform no DDS/session work,
 including during listener declaration/destruction (the historical #382/#533
-lock cycle). The owner reconciles on matching notifications and when a retry or
-known request deadline is due. An idle bridge has no lifecycle polling tick.
-One shared wake hint coalesces due work, with at most one scheduled scan per
-250 ms. Failed activation retains intent and retries with 100 ms to 5 s backoff.
+lock cycle). The owner reconciles on notifications and a 250 ms tick; failed
+activation retains intent and retries with 100 ms to 5 s backoff.
 
 A service owns one request/reply pair. Construction rolls back on any failure;
 ROS graph advertisement/withdrawal commits both endpoints together. Data callbacks
@@ -30,12 +28,9 @@ Local nodes are identified by participant GID and node name. Discovery derives
 interfaces from the current ROS membership snapshot and current DDS endpoints.
 ROS graph updates reconcile membership; individual DDS events update only the
 affected interface, preserving the eclipse-zenoh upstream's incremental
-discovery. Removal clears only that component and prefers a surviving same-type
-endpoint from the same node's membership. A compatible survivor preserves the
-route; a different-type survivor withdraws the old interface before rediscovery.
-An interface entry is dropped once every component is gone. Same-type transfers
-between nodes in one participant snapshot add the new owner before removing the
-old owner, while type changes retire incompatible resources first. A disposal that no interface component references
+discovery. Removal clears only that component, swaps in a surviving same-topic
+endpoint from the same node's membership, and drops an interface entry once
+every component is gone. A disposal that no interface component references
 leaves the derived state untouched, so it cannot rewrite a live interface.
 A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
@@ -56,12 +51,9 @@ resource retirement indefinitely. That attempted data delivery is lost on write 
 this is an intentional overload behavior change, not a delivery guarantee. Counters
 and route logs expose the failures. This does not change reliability matching. ROS graph
 publication uses an unlocked snapshot and retries failure without losing concurrent
-edits. Pending incoming queries with an advertised timeout expire even when no
-later message arrives. Legacy/native callers expose no deadline in the pinned
-Zenoh API: their queries remain until a reply or route retirement, as upstream
-does. The receiving bridge's outgoing timeout cannot safely limit those calls.
-Invalid explicit timeout metadata is rejected before forwarding to DDS.
-Retirement fences new requests and releases pending queries outside locks.
+edits. Pending incoming queries expire even when no later message arrives; patched
+callers communicate their timeout, while legacy/native callers use the receiving
+bridge's configured timeout.
 
 Request correlation uses numeric client/sequence identity, independent of CDR byte
 order. Request and reply headers use their own payload's byte order, including
@@ -70,9 +62,7 @@ native Zenoh big-endian messages and header-only empty requests. The existing
 interoperability defect; an unpatched receiving bridge still has that defect.
 
 `@/<zid>/ros2/lifecycle` exposes build identity, reconciliation progress and owned
-resource/cleanup/write-failure accounting. `reconciliation_age_ms` measures time
-since the last needed scan; it is not a heartbeat and can grow during healthy idle.
-Admin data alone cannot detect every
+resource/cleanup/write-failure accounting. Admin data alone cannot detect every
 orphan or establish application health. A timeout alone does not justify a restart.
 Set BRIDGE_BUILD_ID to the exact commit when packaging. Test hooks are disabled by
 default and must not be included in deployed binaries.
@@ -98,16 +88,6 @@ Transient `activation failed:` messages belong to the owner's existing retry pat
 external log-string watchdogs must not kill this process during that backoff.
 
 ## Provenance
-
-The existing Zenoh dependencies share one pinned 1.10.1 core commit from the
-[core patch](https://github.com/logivations/zenoh/pull/1). It uses
-the existing child hash lookup for literal resource keys, avoiding repeated
-full-tree walks when correctly retired Queriers are recreated. Wildcard matching
-retains the upstream traversal. Cleanup compares resource identities without
-temporary strong owners and checks remaining interest owners only when an
-upstream destination needs a Final. Future ownership uses resource/options;
-requesting an initial snapshot does not create a separate ownership group.
-Current-query completion remains separate. No new ownership index or task is added.
 
 The participant identity and CString fixes preserve the isolated upstream #705
 changes (`33e0078eb42aae13510836947467ecc46a5df9eb` and
@@ -140,8 +120,6 @@ lease recovery, each construction failure and cleanup quarantine/recovery.
 Physical workload and sustained soak checks remain required. A build is not a rollout gate.
 
 Mixed 1.10.1/patched bridges retain wire compatibility, but the unpatched owner keeps
-its defects. Last-endpoint replacement by a different type is covered by discovery
-and complete-binary regressions. Concurrent incompatible interfaces still share
-one name-keyed route; this does not add per-type routes, general QoS migration or
-dynamic plugin hot-unload.
+its defects. Rollout must preserve the existing ROS type/QoS contract. Changing the
+type of an already retained route and dynamic plugin hot-unload are not covered.
 Physical hardware, real workload and shadow-health validation precede fleet rollout.

@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
 
 //! Full-binary lab hooks. This entire module is absent from production builds.
+use serde::Deserialize;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicIsize, Ordering},
     time::{Duration, Instant},
 };
-
-use serde::Deserialize;
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

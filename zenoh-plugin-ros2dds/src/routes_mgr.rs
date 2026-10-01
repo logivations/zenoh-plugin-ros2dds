@@ -14,7 +14,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::{atomic::Ordering, Arc, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cyclors::{
@@ -39,7 +39,6 @@ use crate::{
     ros_discovery::RosDiscoveryInfoMgr,
     route_action_cli::RouteActionCli,
     route_action_srv::RouteActionSrv,
-    route_lifecycle::Maintenance,
     route_publisher::RoutePublisher,
     route_service_cli::RouteServiceCli,
     route_service_srv::RouteServiceSrv,
@@ -85,7 +84,6 @@ pub struct Context {
     // ros_discovery_info read/write manager
     pub(crate) ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
     pub(crate) matching_changed: Arc<tokio::sync::Notify>,
-    pub(crate) maintenance: Arc<Maintenance>,
 }
 
 pub struct RoutesMgr {
@@ -123,7 +121,6 @@ impl RoutesMgr {
             discovered_entities,
             ros_discovery_mgr,
             matching_changed: Arc::new(tokio::sync::Notify::new()),
-            maintenance: Arc::new(Maintenance::default()),
         };
 
         RoutesMgr {
@@ -150,18 +147,9 @@ impl RoutesMgr {
         self.context.matching_changed.clone()
     }
 
-    pub(crate) fn maintenance(&self) -> Arc<Maintenance> {
-        self.context.maintenance.clone()
-    }
-
-    pub(crate) fn maintenance_not_before(&self) -> Instant {
-        // Keep the former 250 ms retry/expiry scan bound without idle polling.
-        // Short RPC deadlines must not turn one scan per request into O(routes).
-        self.last_reconciled + Duration::from_millis(250)
-    }
-
     pub(crate) async fn reconcile(&mut self) {
-        self.context.maintenance.begin_reconcile();
+        #[cfg(feature = "lifecycle-test-hooks")]
+        self.inject_test_fault();
         for route in self.routes_publishers.values_mut() {
             route.reconcile().await;
         }
@@ -185,7 +173,7 @@ impl RoutesMgr {
     }
 
     #[cfg(feature = "lifecycle-test-hooks")]
-    pub(crate) fn inject_test_fault(&mut self) {
+    fn inject_test_fault(&mut self) {
         use crate::{
             dds_endpoint::{self, DdsEndpoint},
             lifecycle_test_hooks::{self, Command},
@@ -960,15 +948,22 @@ impl RoutesMgr {
     }
 
     async fn send_admin_reply(&self, query: &Query, key_expr: &keyexpr, route_ref: &RouteRef) {
-        match self.get_entity_json_bytes(route_ref) {
-            Ok(Some(bytes)) => {
+        match self.get_entity_json_value(route_ref) {
+            Ok(Some(v)) => {
                 let admin_keyexpr = &self.admin_prefix / key_expr;
-                if let Err(e) = query
-                    .reply(admin_keyexpr, ZBytes::from(bytes))
-                    .encoding(Encoding::APPLICATION_JSON)
-                    .await
-                {
-                    tracing::warn!("Error replying to admin query {:?}: {}", query, e);
+                match serde_json::to_vec(&v) {
+                    Ok(bytes) => {
+                        if let Err(e) = query
+                            .reply(admin_keyexpr, ZBytes::from(bytes))
+                            .encoding(Encoding::APPLICATION_JSON)
+                            .await
+                        {
+                            tracing::warn!("Error replying to admin query {:?}: {}", query, e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error transforming JSON to admin query {:?}: {}", query, e);
+                    }
                 }
             }
             Ok(None) => {
@@ -980,40 +975,40 @@ impl RoutesMgr {
         }
     }
 
-    fn get_entity_json_bytes(
+    fn get_entity_json_value(
         &self,
         route_ref: &RouteRef,
-    ) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    ) -> Result<Option<serde_json::Value>, serde_json::Error> {
         match route_ref {
             RouteRef::Publisher(ke) => self
                 .routes_publishers
                 .get(ke)
-                .map(serde_json::to_vec)
+                .map(serde_json::to_value)
                 .transpose(),
             RouteRef::Subscriber(ke) => self
                 .routes_subscribers
                 .get(ke)
-                .map(serde_json::to_vec)
+                .map(serde_json::to_value)
                 .transpose(),
             RouteRef::ServiceSrv(ke) => self
                 .routes_service_srv
                 .get(ke)
-                .map(serde_json::to_vec)
+                .map(serde_json::to_value)
                 .transpose(),
             RouteRef::ServiceCli(ke) => self
                 .routes_service_cli
                 .get(ke)
-                .map(serde_json::to_vec)
+                .map(serde_json::to_value)
                 .transpose(),
             RouteRef::ActionSrv(ke) => self
                 .routes_action_srv
                 .get(ke)
-                .map(serde_json::to_vec)
+                .map(serde_json::to_value)
                 .transpose(),
             RouteRef::ActionCli(ke) => self
                 .routes_action_cli
                 .get(ke)
-                .map(serde_json::to_vec)
+                .map(serde_json::to_value)
                 .transpose(),
         }
     }
@@ -1021,13 +1016,13 @@ impl RoutesMgr {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::dds_endpoint::DDS_TEST;
+    use crate::dds_utils::delete_dds_entity;
     use cyclors::{dds_create_domain, dds_create_participant};
 
-    use super::*;
-    use crate::{dds_endpoint::DDS_TEST, dds_utils::delete_dds_entity, gid::Gid};
-
     #[test]
-    fn remote_action_creates_discovery_endpoints_without_a_tick_and_retires_cleanly() {
+    fn action_retirement_removes_the_route_and_its_admin_entry() {
         let _serial = DDS_TEST.lock().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -1042,7 +1037,7 @@ mod tests {
             let session = Arc::new(zenoh::open(config).await.unwrap());
             let graph = Arc::new(RosDiscoveryInfoMgr::new(participant, "/", "actions_test").unwrap());
             let mut manager = RoutesMgr::new(
-                Arc::new(serde_json::from_str(r#"{"queries_timeout":{"default":0.3}}"#).unwrap()), session.clone(), participant,
+                Arc::new(serde_json::from_str("{}").unwrap()), session.clone(), participant,
                 Arc::new(RwLock::new(DiscoveredEntities::default())), graph,
                 OwnedKeyExpr::try_from("@/test/ros2").unwrap(),
             );
@@ -1058,57 +1053,7 @@ mod tests {
             ] {
                 manager.on_ros_announcement_event(announce).await.unwrap();
                 assert!(manager.admin_space.contains_key(&(prefix / &zenoh_key_expr)));
-                // No matching callback or maintenance tick is required for the
-                // remote-only discovery writers / request-reply pairs.
-                let endpoints: usize = manager.routes_action_cli.values().map(RouteActionCli::endpoint_count).sum::<usize>()
-                    + manager.routes_action_srv.values().map(RouteActionSrv::endpoint_count).sum::<usize>();
-                assert_eq!(endpoints, if prefix == *KE_PREFIX_ROUTE_ACTION_CLI { 2 } else { 6 });
-
-                let nodes = [(Gid::from([1; 16]), "/same_node".to_string()), (Gid::from([2; 16]), "/same_node".to_string())];
-                let route_ref = match &manager.admin_space[&(prefix / &zenoh_key_expr)] {
-                    RouteRef::ActionCli(name) => RouteRef::ActionCli(name.clone()),
-                    RouteRef::ActionSrv(name) => RouteRef::ActionSrv(name.clone()),
-                    _ => unreachable!(),
-                };
-                let expected = match &route_ref {
-                    RouteRef::ActionCli(name) => {
-                        let route = manager.routes_action_cli.get_mut(name).unwrap();
-                        for node in &nodes { route.add_local_node(node.clone()).await; }
-                        serde_json::to_value(route).unwrap()
-                    }
-                    RouteRef::ActionSrv(name) => {
-                        let route = manager.routes_action_srv.get_mut(name).unwrap();
-                        for node in &nodes { route.add_local_node(node.clone()).await; }
-                        serde_json::to_value(route).unwrap()
-                    }
-                    _ => unreachable!(),
-                };
-                let bytes = manager.get_entity_json_bytes(&route_ref).unwrap().unwrap();
-                let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                // Compare with the former Value pipeline, including all five
-                // action subroutes and their flattened endpoint/member fields.
-                assert_eq!(actual, expected);
-                let names = serde_json::json!(["/same_node"]);
-                let identities = serde_json::json!([
-                    {"participant":nodes[0].0, "name":"/same_node"},
-                    {"participant":nodes[1].0, "name":"/same_node"},
-                ]);
-                for value in std::iter::once(&actual).chain(["send_goal", "cancel_goal", "get_result", "feedback", "status"].map(|name| &actual[name])) {
-                    assert_eq!(value["local_nodes"], names);
-                    assert_eq!(value["local_node_identities"], identities);
-                }
-                if matches!(&route_ref, RouteRef::ActionCli(_)) {
-                    // Value widens f32: a naive direct serializer writes 0.3
-                    // instead and changes the parsed JSON number.
-                    assert_eq!(actual["send_goal"]["queries_timeout"], serde_json::json!(f64::from(0.3_f32)));
-                }
-                match &route_ref {
-                    RouteRef::ActionCli(name) => for node in &nodes { manager.routes_action_cli.get_mut(name).unwrap().remove_local_node(node); },
-                    RouteRef::ActionSrv(name) => for node in &nodes { manager.routes_action_srv.get_mut(name).unwrap().remove_local_node(node); },
-                    _ => unreachable!(),
-                }
                 manager.on_ros_announcement_event(retire).await.unwrap();
-                assert!(manager.get_entity_json_bytes(&route_ref).unwrap().is_none());
                 assert!(manager.admin_space.is_empty());
                 assert!(manager.routes_action_cli.is_empty() && manager.routes_action_srv.is_empty());
             }

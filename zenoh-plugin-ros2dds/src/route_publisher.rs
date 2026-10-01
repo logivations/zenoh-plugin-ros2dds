@@ -223,8 +223,7 @@ impl RoutePublisher {
                 .map_err(|e| format!("Failed create Publisher for key {zenoh_key_expr}: {e}",))?,
         );
 
-        let lifecycle = RouteLifecycle::new(context.maintenance.clone());
-        let announcement_retry = Retry::new(context.maintenance.clone());
+        let lifecycle = RouteLifecycle::new();
         let observe = lifecycle.observer(context.matching_changed.clone());
         let matching_listener = publisher
             .matching_listener()
@@ -243,7 +242,7 @@ impl RoutePublisher {
             },
             dds_reader: None,
             lifecycle,
-            announcement_retry,
+            announcement_retry: Retry::new(),
             discovered_writer_qos: None,
             matching_listener: Some(matching_listener),
             priority,
@@ -273,9 +272,9 @@ impl RoutePublisher {
                 .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
-            && self.liveliness_token.is_none()
             && !is_message_for_action(&self.ros2_name)
-            && self.announcement_retry.ready_or_schedule()
+            && self.liveliness_token.is_none()
+            && self.announcement_retry.ready()
         {
             if let Some(qos) = self.discovered_writer_qos.clone() {
                 let result = self.announce_route(&qos).await;
