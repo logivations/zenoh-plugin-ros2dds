@@ -413,6 +413,34 @@ impl std::fmt::Debug for NodeInfo {
     }
 }
 
+// Services and actions have the same removal contract, with different DDS
+// components. Only clone the affected complete interface for its withdrawal,
+// and drop an entry whose components are all gone so a later endpoint of a
+// different type starts fresh instead of hitting the changed-type path.
+macro_rules! remove_component {
+    ($node:ident, $field:ident, $gid:ident, $removed:ident, [$($($component:ident).+),+]) => {
+        if let Some(name) = $node.$field.iter().find_map(|(name, value)| {
+            [$(value.entities.$($component).+),+].contains($gid).then(|| name.clone())
+        }) {
+            let (previous, emptied) = {
+                let value = $node.$field.get_mut(&name).unwrap();
+                let previous = value.is_complete().then(|| value.clone());
+                for component in [$(&mut value.entities.$($component).+),+] {
+                    if component == $gid {
+                        *component = Gid::NOT_DISCOVERED;
+                    }
+                }
+                (previous, value.entities == Default::default())
+            };
+            if emptied {
+                $node.$field.remove(&name);
+            }
+            return (true, previous.map(|previous| $removed(
+                $node.participant, $node.fullname().to_owned(), previous)));
+        }
+    };
+}
+
 impl NodeInfo {
     pub fn create(
         node_namespace: String,
@@ -1891,6 +1919,105 @@ impl NodeInfo {
         self.undiscovered_writer.resize(0, Gid::NOT_DISCOVERED);
 
         events
+    }
+
+    // The eclipse-zenoh upstream removal paths discard the entire service or
+    // action on one endpoint disposal. Keep its other components so an old
+    // endpoint cannot erase a replacement that DDS has already discovered.
+    // Returns whether this node tracked the endpoint, and the withdrawal to
+    // emit if its interface was complete. A `(false, _)` result means no
+    // component referenced the gid, so the caller must not rewrite the
+    // interface with a replacement.
+    pub fn remove_reader(&mut self, gid: &Gid) -> (bool, Option<ROS2DiscoveryEvent>) {
+        use ROS2DiscoveryEvent::*;
+        if let Some((name, emptied)) = self.msg_sub.iter_mut().find_map(|(name, value)| {
+            value
+                .readers
+                .remove(gid)
+                .then(|| (name.clone(), value.readers.is_empty()))
+        }) {
+            let withdrawal = emptied.then(|| {
+                UndiscoveredMsgSub(
+                    self.participant,
+                    self.fullname().to_owned(),
+                    self.msg_sub.remove(&name).unwrap(),
+                )
+            });
+            return (true, withdrawal);
+        }
+        remove_component!(self, service_srv, gid, UndiscoveredServiceSrv, [req_reader]);
+        remove_component!(self, service_cli, gid, UndiscoveredServiceCli, [rep_reader]);
+        remove_component!(
+            self,
+            action_srv,
+            gid,
+            UndiscoveredActionSrv,
+            [
+                send_goal.req_reader,
+                cancel_goal.req_reader,
+                get_result.req_reader
+            ]
+        );
+        remove_component!(
+            self,
+            action_cli,
+            gid,
+            UndiscoveredActionCli,
+            [
+                send_goal.rep_reader,
+                cancel_goal.rep_reader,
+                get_result.rep_reader,
+                status_reader,
+                feedback_reader
+            ]
+        );
+        (false, None)
+    }
+
+    pub fn remove_writer(&mut self, gid: &Gid) -> (bool, Option<ROS2DiscoveryEvent>) {
+        use ROS2DiscoveryEvent::*;
+        if let Some((name, emptied)) = self.msg_pub.iter_mut().find_map(|(name, value)| {
+            value
+                .writers
+                .remove(gid)
+                .then(|| (name.clone(), value.writers.is_empty()))
+        }) {
+            let withdrawal = emptied.then(|| {
+                UndiscoveredMsgPub(
+                    self.participant,
+                    self.fullname().to_owned(),
+                    self.msg_pub.remove(&name).unwrap(),
+                )
+            });
+            return (true, withdrawal);
+        }
+        remove_component!(self, service_srv, gid, UndiscoveredServiceSrv, [rep_writer]);
+        remove_component!(self, service_cli, gid, UndiscoveredServiceCli, [req_writer]);
+        remove_component!(
+            self,
+            action_srv,
+            gid,
+            UndiscoveredActionSrv,
+            [
+                send_goal.rep_writer,
+                cancel_goal.rep_writer,
+                get_result.rep_writer,
+                status_writer,
+                feedback_writer
+            ]
+        );
+        remove_component!(
+            self,
+            action_cli,
+            gid,
+            UndiscoveredActionCli,
+            [
+                send_goal.req_writer,
+                cancel_goal.req_writer,
+                get_result.req_writer
+            ]
+        );
+        (false, None)
     }
 
     /// Emit changes between two derived snapshots. Endpoint replacement updates

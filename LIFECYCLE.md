@@ -25,13 +25,29 @@ response) runs outside DDS access guards, including failed writes, replacement
 and callbacks rejected after retirement.
 
 Local nodes are identified by participant GID and node name. Discovery derives
-interfaces from the current ROS membership snapshot and current DDS endpoints;
-a delayed disposal cannot remove a replacement participant or endpoint. Retention
+interfaces from the current ROS membership snapshot and current DDS endpoints.
+ROS graph updates reconcile membership; individual DDS events update only the
+affected interface, preserving the eclipse-zenoh upstream's incremental
+discovery. Removal clears only that component, swaps in a surviving same-topic
+endpoint from the same node's membership, and drops an interface entry once
+every component is gone. A disposal that no interface component references
+leaves the derived state untouched, so it cannot rewrite a live interface.
+A delayed disposal cannot remove a replacement participant or endpoint. Retention
 and matching demand are distinct, including native Zenoh matches.
 
-DDS writes cap reliability max_blocking_time at the DDS default 100 ms (a stricter
-limit remains). Overloaded writes fail explicitly rather than preventing resource
-retirement indefinitely. That attempted data delivery is lost on write failure;
+Known discovery limit: overlapping nodes with the same full name inside one DDS
+participant can lose bridge routes while their local DDS services still answer.
+The existing graph deserializer overwrites duplicate-name entries; the native RMW
+graph also associates/removes nodes by name. Immediate same-context replacement
+can overlap native cleanup. Node-instance identity/input handling remains unresolved
+for this case; the passing distinct-participant restart tests do not qualify it.
+
+DDS writes replace an infinite reliability max_blocking_time with the DDS default
+100 ms; finite application values are preserved. Retirement can wait for that
+configured finite timeout; preserving a timeout above one second is logged at
+writer creation, and a retirement fence that waits longer than a second on an
+in-flight operation logs the wait. Overloaded writes fail explicitly rather than preventing
+resource retirement indefinitely. That attempted data delivery is lost on write failure;
 this is an intentional overload behavior change, not a delivery guarantee. Counters
 and route logs expose the failures. This does not change reliability matching. ROS graph
 publication uses an unlocked snapshot and retries failure without losing concurrent

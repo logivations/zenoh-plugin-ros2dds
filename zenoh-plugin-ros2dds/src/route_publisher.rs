@@ -256,12 +256,10 @@ impl RoutePublisher {
     }
 
     pub(crate) async fn reconcile(&mut self) {
-        let route_id = self.to_string();
         let result = self.lifecycle.reconcile(&mut self.dds_reader, || {
             create_reader(
                 &self.ros2_name,
                 &self.ros2_type,
-                &route_id,
                 &self.context,
                 self.keyless,
                 &self._reader_qos,
@@ -270,7 +268,8 @@ impl RoutePublisher {
             )
         });
         if let Err(error) = result {
-            self.lifecycle.log_activation_failure(&route_id, &error);
+            self.lifecycle
+                .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
             && !is_message_for_action(&self.ros2_name)
@@ -280,7 +279,7 @@ impl RoutePublisher {
             if let Some(qos) = self.discovered_writer_qos.clone() {
                 let result = self.announce_route(&qos).await;
                 if let Err(error) = self.announcement_retry.record(result) {
-                    tracing::error!("{route_id}: announcement failed: {error}");
+                    tracing::error!("{self}: announcement failed: {error}");
                 }
             }
         }
@@ -389,18 +388,19 @@ fn get_read_period(config: &Config, ros2_name: &str) -> Option<Duration> {
         .map(|f| Duration::from_secs_f32(1f32 / f))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn create_reader(
     ros2_name: &str,
     ros2_type: &str,
-    route_id: &str,
     context: &Context,
     keyless: bool,
     reader_qos: &Qos,
     type_info: &Option<Arc<TypeInfo>>,
     publisher: &Arc<AdvancedPublisher<'static>>,
 ) -> Result<DdsEndpoint, String> {
-    let route_id = route_id.to_string();
+    let route_id = format!(
+        "Route Publisher (ROS:{ros2_name} -> Zenoh:{})",
+        publisher.key_expr()
+    );
     let publisher = publisher.clone();
     let mut reader = DdsEndpoint::reader(
         context.participant,

@@ -235,7 +235,6 @@ impl RouteSubscriber {
     }
 
     pub(crate) async fn reconcile(&mut self) {
-        let route_id = self.to_string();
         self.lifecycle.set_desired(true);
         if let Err(error) = self.lifecycle.reconcile(&mut self.dds_writer, || {
             let mut writer = DdsEndpoint::writer(
@@ -248,7 +247,8 @@ impl RouteSubscriber {
             writer.advertise(self.context.ros_discovery_mgr.clone());
             Ok(writer)
         }) {
-            self.lifecycle.log_activation_failure(&route_id, &error);
+            self.lifecycle
+                .log_activation_failure(&self.to_string(), &error);
         }
         if !self.local_nodes.is_empty()
             && self.dds_writer.is_some()
@@ -258,7 +258,7 @@ impl RouteSubscriber {
             if let Some(qos) = self.discovered_reader_qos.clone() {
                 let result = self.announce_route(&qos).await;
                 if let Err(error) = self.announcement_retry.record(result) {
-                    tracing::error!("{route_id}: announcement failed: {error}");
+                    tracing::error!("{self}: announcement failed: {error}");
                 }
             }
         }

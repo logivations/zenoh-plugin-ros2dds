@@ -64,7 +64,17 @@ impl DdsAccess {
         }
     }
     pub(crate) fn close(&self) {
+        // Closing waits for in-flight access, bounded by the writer's blocking
+        // time. A long wait is a stalled peer; make it visible to operators.
+        let start = std::time::Instant::now();
         self.0.write().unwrap_or_else(|e| e.into_inner()).take();
+        let waited = start.elapsed();
+        if waited.as_nanos() > crate::dds_utils::SLOW_RETIREMENT_WARN_NS as u128 {
+            tracing::warn!(
+                waited_ms = waited.as_millis(),
+                "DDS endpoint retirement fence waited on an in-flight operation"
+            );
+        }
     }
 }
 
@@ -167,14 +177,20 @@ impl DdsEndpoint {
         keyless: bool,
         mut qos: Qos,
     ) -> Result<Self, String> {
-        // An in-flight write holds revocable access. Infinite DDS backpressure
-        // would prevent retirement from ever acquiring the fence. Use the DDS
-        // writer default (100 ms) as an upper bound, preserving stricter limits.
-        // max_blocking_time does not participate in DDS reliability matching.
+        // An infinite write can hold revocable access forever, preventing
+        // retirement. Bound only that case to the DDS default (100 ms). Finite
+        // application timeouts already bound the borrow and must be preserved,
+        // but a long one silently delays retirement by as much, so surface it.
         if let Some(reliability) = &mut qos.reliability {
-            reliability.max_blocking_time = reliability
-                .max_blocking_time
-                .min(crate::dds_utils::MAX_DDS_WRITE_BLOCKING_TIME);
+            if reliability.max_blocking_time == cyclors::qos::DDS_INFINITE_TIME {
+                reliability.max_blocking_time = crate::dds_utils::MAX_DDS_WRITE_BLOCKING_TIME;
+            } else if reliability.max_blocking_time > crate::dds_utils::SLOW_RETIREMENT_WARN_NS {
+                tracing::warn!(
+                    topic = %topic,
+                    max_blocking_time_ns = reliability.max_blocking_time,
+                    "Preserving a long finite DDS write timeout; route retirement can wait this long"
+                );
+            }
         }
         Self::create(
             participant,
@@ -695,6 +711,36 @@ mod tests {
         let participant =
             unsafe { dds_create_participant(221, std::ptr::null(), std::ptr::null()) };
         assert!(participant > 0 && domain > 0);
+        // Finite application QoS already bounds retirement. Do not silently
+        // shorten a configured timeout merely to use our infinite-write bound.
+        for max_blocking_time in [5_000_000, 2_000_000_000] {
+            let writer = DdsEndpoint::writer(
+                participant,
+                "rt/finite_qos".into(),
+                "Raw".into(),
+                true,
+                Qos {
+                    reliability: Some(Reliability {
+                        kind: ReliabilityKind::RELIABLE,
+                        max_blocking_time,
+                    }),
+                    ..Qos::default()
+                },
+            )
+            .unwrap();
+            let actual = unsafe {
+                let qos = dds_create_qos();
+                assert_eq!(dds_get_qos(writer.entity, qos), 0);
+                let actual = Qos::from_qos_native(qos)
+                    .reliability
+                    .unwrap()
+                    .max_blocking_time;
+                dds_delete_qos(qos);
+                actual
+            };
+            drop(writer);
+            assert_eq!(actual, max_blocking_time);
+        }
         let qos = Qos {
             history: Some(History {
                 kind: HistoryKind::KEEP_ALL,
