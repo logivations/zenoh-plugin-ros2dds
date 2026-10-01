@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -108,6 +109,18 @@ class Lab:
             )) + "\n")
 
     def bridge(self, side):
+        if side == "camera" and json.loads((self.output / "camera.json5").read_text())["mode"] == "client":
+            # Client startup makes one connection attempt. REST can become
+            # ready before runtime.start() binds this server's Zenoh listener.
+            def server_listening():
+                assert self.processes["server"].poll() is None, "Server exited before client startup"
+                try:
+                    with socket.create_connection(("127.0.0.1", 17447), timeout=0.2):
+                        return True
+                except OSError:
+                    return False
+
+            eventually(server_listening)
         self.start(
             side,
             [
