@@ -25,6 +25,10 @@ use crate::{dds_types::TypeInfo, gid::Gid};
 // A forwarding callback or graph publication must not prevent lifecycle progress.
 pub(crate) const MAX_DDS_WRITE_BLOCKING_TIME: i64 = 100_000_000;
 
+// Finite application write timeouts are preserved, so retirement can wait for
+// them. Surface the ones long enough to look like a stalled bridge.
+pub(crate) const SLOW_RETIREMENT_WARN_NS: i64 = 1_000_000_000;
+
 pub(crate) static DDS_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

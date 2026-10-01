@@ -64,7 +64,17 @@ impl DdsAccess {
         }
     }
     pub(crate) fn close(&self) {
+        // Closing waits for in-flight access, bounded by the writer's blocking
+        // time. A long wait is a stalled peer; make it visible to operators.
+        let start = std::time::Instant::now();
         self.0.write().unwrap_or_else(|e| e.into_inner()).take();
+        let waited = start.elapsed();
+        if waited.as_nanos() > crate::dds_utils::SLOW_RETIREMENT_WARN_NS as u128 {
+            tracing::warn!(
+                waited_ms = waited.as_millis(),
+                "DDS endpoint retirement fence waited on an in-flight operation"
+            );
+        }
     }
 }
 
@@ -169,13 +179,18 @@ impl DdsEndpoint {
     ) -> Result<Self, String> {
         // An infinite write can hold revocable access forever, preventing
         // retirement. Bound only that case to the DDS default (100 ms). Finite
-        // application timeouts already bound the borrow and must be preserved.
-        if let Some(reliability) = qos
-            .reliability
-            .as_mut()
-            .filter(|reliability| reliability.max_blocking_time == cyclors::qos::DDS_INFINITE_TIME)
-        {
-            reliability.max_blocking_time = crate::dds_utils::MAX_DDS_WRITE_BLOCKING_TIME;
+        // application timeouts already bound the borrow and must be preserved,
+        // but a long one silently delays retirement by as much, so surface it.
+        if let Some(reliability) = &mut qos.reliability {
+            if reliability.max_blocking_time == cyclors::qos::DDS_INFINITE_TIME {
+                reliability.max_blocking_time = crate::dds_utils::MAX_DDS_WRITE_BLOCKING_TIME;
+            } else if reliability.max_blocking_time > crate::dds_utils::SLOW_RETIREMENT_WARN_NS {
+                tracing::warn!(
+                    topic = %topic,
+                    max_blocking_time_ns = reliability.max_blocking_time,
+                    "Preserving a long finite DDS write timeout; route retirement can wait this long"
+                );
+            }
         }
         Self::create(
             participant,
