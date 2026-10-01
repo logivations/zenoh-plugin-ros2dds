@@ -40,7 +40,8 @@ use crate::{
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
         create_dds_reader, create_dds_writer, dds_write, delete_dds_entity, get_guid,
-        is_cdr_little_endian, serialize_atomic_entity_guid, AtomicDDSEntity, DDS_ENTITY_NULL,
+        is_cdr_little_endian, serialize_atomic_entity_guid, AtomicDDSEntity, RouteLiveness,
+        DDS_ENTITY_NULL,
     },
     liveliness_mgt::new_ke_liveliness_service_cli,
     ros2_utils::{
@@ -71,6 +72,11 @@ pub struct RouteServiceCli {
     // background, where it can survive route removal.
     #[serde(skip)]
     matching_listener: Option<MatchingListener<()>>,
+    // Serializes DDS entity activation (from the matching callback) with
+    // route retirement, so a callback in flight during Drop cannot resurrect
+    // entities for a retired route.
+    #[serde(skip)]
+    liveness: Arc<RouteLiveness>,
     #[serde(serialize_with = "crate::config::serialize_duration_as_f32")]
     queries_timeout: Duration,
     // the local DDS Reader receiving client's requests and routing them to Zenoh
@@ -90,8 +96,17 @@ pub struct RouteServiceCli {
 
 impl Drop for RouteServiceCli {
     fn drop(&mut self) {
-        self.matching_listener.take();
+        // Retire first: this serializes with any in-flight matching callback
+        // (the liveness flag is cleared under the same lock inside which the
+        // callback creates the DDS entities), so after this call no callback
+        // can resurrect entities for this route and the deactivation below
+        // is final.
+        self.liveness.retire();
         self.deactivate();
+        // Drop the listener handle only after retire() released the lock:
+        // undeclaring may wait for an in-flight callback, which could itself
+        // be waiting on the liveness lock (a #382-style self-deadlock).
+        self.matching_listener.take();
     }
 }
 
@@ -136,18 +151,24 @@ impl RouteServiceCli {
         // (copy/move all required args for the callback)
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let liveness = RouteLiveness::new();
 
         let matching_listener = zenoh_querier
             .matching_listener()
             .callback({
                 let rep_writer = rep_writer.clone();
                 let req_reader = req_reader.clone();
+                let liveness = liveness.clone();
                 let ros2_name = ros2_name.clone();
                 let ros2_type = ros2_type.clone();
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
 
                 move |status| {
+                    // Activation/deactivation happens inside the liveness
+                    // critical section: once the route is retired (Drop) this
+                    // callback must not touch DDS entities anymore.
+                    let handled = liveness.if_live(|| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
                         if status.matching() {
                             if let Err(e) = activate(
@@ -170,6 +191,12 @@ impl RouteServiceCli {
                                 &context.ros_discovery_mgr,
                             )
                         }
+                    });
+                    if handled.is_none() {
+                        tracing::debug!(
+                            "{route_id}: MatchingStatus changed after route retirement - ignored: {status:?}"
+                        );
+                    }
                 }
             })
             .await
@@ -182,6 +209,7 @@ impl RouteServiceCli {
             context,
             _zenoh_querier: zenoh_querier,
             matching_listener: Some(matching_listener),
+            liveness,
             queries_timeout,
             rep_writer,
             req_reader,

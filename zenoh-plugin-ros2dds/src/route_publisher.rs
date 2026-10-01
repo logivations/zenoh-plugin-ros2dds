@@ -39,7 +39,7 @@ use crate::{
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
         create_dds_reader, delete_dds_entity, get_guid, serialize_atomic_entity_guid,
-        AtomicDDSEntity, DDS_ENTITY_NULL,
+        AtomicDDSEntity, RouteLiveness, DDS_ENTITY_NULL,
     },
     liveliness_mgt::new_ke_liveliness_pub,
     qos_helpers::*,
@@ -86,6 +86,11 @@ pub struct RoutePublisher {
     // this object and can recreate a DDS Reader after the route is removed.
     #[serde(skip)]
     matching_listener: Option<MatchingListener<()>>,
+    // Serializes DDS Reader activation (from the matching callback) with
+    // route retirement, so a callback in flight during Drop cannot resurrect
+    // a Reader for a retired route.
+    #[serde(skip)]
+    liveness: Arc<RouteLiveness>,
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_reader: Arc<AtomicDDSEntity>,
@@ -114,10 +119,17 @@ pub struct RoutePublisher {
 
 impl Drop for RoutePublisher {
     fn drop(&mut self) {
-        // Stop matching callbacks before deleting the DDS entity and dropping
-        // the publisher captured by the callback.
-        self.matching_listener.take();
+        // Retire first: this serializes with any in-flight matching callback
+        // (the liveness flag is cleared under the same lock inside which the
+        // callback creates the DDS Reader), so after this call no callback
+        // can resurrect a Reader for this route and the deactivation below
+        // is final.
+        self.liveness.retire();
         self.deactivate_dds_reader();
+        // Drop the listener handle only after retire() released the lock:
+        // undeclaring may wait for an in-flight callback, which could itself
+        // be waiting on the liveness lock (a #382-style self-deadlock).
+        self.matching_listener.take();
     }
 }
 
@@ -228,11 +240,13 @@ impl RoutePublisher {
         // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let liveness = RouteLiveness::new();
 
         let matching_listener = publisher
             .matching_listener()
             .callback({
                 let dds_reader = dds_reader.clone();
+                let liveness = liveness.clone();
                 let ros2_name = ros2_name.clone();
                 let ros2_type = ros2_type.clone();
                 let zenoh_key_expr = zenoh_key_expr.clone();
@@ -244,23 +258,33 @@ impl RoutePublisher {
                 let publisher = publisher.clone();
 
                 move |status| {
-                    tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
-                    if status.matching() {
-                        if let Err(e) = activate_dds_reader(
-                            &dds_reader,
-                            &ros2_name,
-                            &ros2_type,
-                            &route_id,
-                            &context,
-                            keyless,
-                            &reader_qos,
-                            &type_info,
-                            &publisher,
-                        ) {
-                            tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
+                    // Activation/deactivation happens inside the liveness
+                    // critical section: once the route is retired (Drop) this
+                    // callback must not touch DDS entities anymore.
+                    let handled = liveness.if_live(|| {
+                        tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                        if status.matching() {
+                            if let Err(e) = activate_dds_reader(
+                                &dds_reader,
+                                &ros2_name,
+                                &ros2_type,
+                                &route_id,
+                                &context,
+                                keyless,
+                                &reader_qos,
+                                &type_info,
+                                &publisher,
+                            ) {
+                                tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
+                            }
+                        } else {
+                            deactivate_dds_reader(&dds_reader, &route_id, &context.ros_discovery_mgr)
                         }
-                    } else {
-                        deactivate_dds_reader(&dds_reader, &route_id, &context.ros_discovery_mgr)
+                    });
+                    if handled.is_none() {
+                        tracing::debug!(
+                            "{route_id}: MatchingStatus changed after route retirement - ignored: {status:?}"
+                        );
                     }
                 }
             })
@@ -277,6 +301,7 @@ impl RoutePublisher {
                 cache_size,
             },
             matching_listener: Some(matching_listener),
+            liveness,
             dds_reader,
             priority,
             _type_info: type_info.clone(),

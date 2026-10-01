@@ -14,7 +14,7 @@
 use std::{
     ffi::{CStr, CString},
     mem::MaybeUninit,
-    sync::{atomic::AtomicI32, Arc},
+    sync::{atomic::AtomicI32, Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -33,6 +33,59 @@ use crate::{
 
 // An atomic dds_entity_t (=i32), for safe concurrent creation/deletion of DDS entities
 pub type AtomicDDSEntity = AtomicI32;
+
+/// Serializes a route's DDS entity activation (performed from a zenoh
+/// `MatchingListener` callback) with the route's retirement (`Drop`).
+///
+/// Taking the `MatchingListener` in `Drop` is not a completion barrier: a
+/// callback that already started keeps executing after the listener handle is
+/// dropped, and can re-create a DDS entity for the retired route - a permanent
+/// orphan, since no further matching event can ever delete it. A plain atomic
+/// flag is not enough either: it leaves a window between the flag check and
+/// the entity creation. Instead, the callback checks liveness and creates the
+/// entities inside a single critical section (`if_live`), and `retire()` takes
+/// the same lock before clearing the flag. Once `retire()` returns, any
+/// in-flight activation has fully completed and no later callback can create
+/// entities anymore, so the deactivation that follows in `Drop` is final.
+///
+/// Locking discipline (cf. eclipse-zenoh/zenoh-plugin-ros2dds#382): `Drop`
+/// must drop the `MatchingListener` handle only after `retire()` has released
+/// this lock, since undeclaring the listener may wait for an in-flight
+/// callback that could itself be blocked on this lock.
+pub struct RouteLiveness {
+    live: Mutex<bool>,
+}
+
+impl RouteLiveness {
+    pub fn new() -> Arc<Self> {
+        Arc::new(RouteLiveness {
+            live: Mutex::new(true),
+        })
+    }
+
+    /// Runs `op` holding the liveness lock if the route was not retired yet.
+    /// Returns `None` (without running `op`) after `retire()`.
+    pub fn if_live<R>(&self, op: impl FnOnce() -> R) -> Option<R> {
+        let guard = self.lock();
+        if *guard {
+            Some(op())
+        } else {
+            None
+        }
+    }
+
+    /// Marks the route retired. Blocks until no `if_live` section is running;
+    /// afterwards `if_live` never runs its closure again.
+    pub fn retire(&self) {
+        *self.lock() = false;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        // A poisoned lock only means some closure panicked mid-activation;
+        // the liveness flag itself remains meaningful.
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 pub const DDS_ENTITY_NULL: dds_entity_t = 0;
 pub const CDR_HEADER_LE: [u8; 4] = [0, 1, 0, 0];
