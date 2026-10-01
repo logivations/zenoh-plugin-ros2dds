@@ -13,7 +13,7 @@
 //
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Debug},
 };
 
@@ -44,11 +44,88 @@ kedefine!(
 #[derive(Default)]
 pub struct DiscoveredEntities {
     participants: HashMap<Gid, DdsParticipant>,
-    writers: HashMap<Gid, DdsEntity>,
-    readers: HashMap<Gid, DdsEntity>,
+    writers: Endpoints,
+    readers: Endpoints,
     ros_participant_info: HashMap<Gid, ParticipantEntitiesInfo>,
     nodes_info: HashMap<Gid, HashMap<String, NodeInfo>>,
     admin_space: HashMap<OwnedKeyExpr, EntityRef>,
+}
+
+/// DDS metadata has one owner; the topic index contains only its keys.
+/// Removal must inspect competing endpoints, not scan unrelated participants.
+#[derive(Default)]
+struct Endpoints {
+    entities: HashMap<Gid, DdsEntity>,
+    topics: HashMap<Gid, HashMap<String, HashSet<Gid>>>,
+}
+
+impl Endpoints {
+    fn insert(&mut self, entity: DdsEntity) {
+        let key = entity.key;
+        if let Some(previous) = self.entities.get_mut(&key) {
+            if previous.participant_key == entity.participant_key
+                && previous.topic_name == entity.topic_name
+            {
+                *previous = entity;
+                return;
+            }
+        }
+        self.remove(&key);
+        self.topics
+            .entry(entity.participant_key)
+            .or_default()
+            .entry(entity.topic_name.clone())
+            .or_default()
+            .insert(key);
+        self.entities.insert(key, entity);
+    }
+
+    fn remove(&mut self, key: &Gid) -> Option<DdsEntity> {
+        let entity = self.entities.remove(key)?;
+        let topics = self.topics.get_mut(&entity.participant_key).unwrap();
+        let members = topics.get_mut(&entity.topic_name).unwrap();
+        assert!(members.remove(key));
+        if members.is_empty() {
+            topics.remove(&entity.topic_name);
+        }
+        if topics.is_empty() {
+            self.topics.remove(&entity.participant_key);
+        }
+        Some(entity)
+    }
+
+    fn remove_participant(&mut self, participant: &Gid) {
+        if let Some(topics) = self.topics.remove(participant) {
+            for key in topics.into_values().flatten() {
+                self.entities.remove(&key);
+            }
+        }
+    }
+
+    fn on_topic(&self, participant: &Gid, topic: &str) -> impl Iterator<Item = &DdsEntity> {
+        self.topics
+            .get(participant)
+            .and_then(|topics| topics.get(topic))
+            .into_iter()
+            .flatten()
+            .map(|key| &self.entities[key])
+    }
+
+    fn get(&self, key: &Gid) -> Option<&DdsEntity> {
+        self.entities.get(key)
+    }
+
+    fn contains_key(&self, key: &Gid) -> bool {
+        self.entities.contains_key(key)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &Gid> {
+        self.entities.keys()
+    }
+
+    fn len(&self) -> usize {
+        self.entities.len()
+    }
 }
 
 impl Debug for DiscoveredEntities {
@@ -113,10 +190,8 @@ impl DiscoveredEntities {
     pub fn remove_participant(&mut self, gid: &Gid) -> Vec<ROS2DiscoveryEvent> {
         self.participants.remove(gid);
         self.ros_participant_info.remove(gid);
-        self.writers
-            .retain(|_, entity| entity.participant_key != *gid);
-        self.readers
-            .retain(|_, entity| entity.participant_key != *gid);
+        self.writers.remove_participant(gid);
+        self.readers.remove_participant(gid);
         self.admin_space.retain(|_, entity| match entity {
             EntityRef::Participant(p) | EntityRef::Node(p, _) => p != gid,
             EntityRef::Writer(w) => self.writers.contains_key(w),
@@ -157,7 +232,7 @@ impl DiscoveredEntities {
                 }
             }
         }
-        self.writers.insert(writer.key, writer);
+        self.writers.insert(writer);
         events
     }
 
@@ -185,7 +260,6 @@ impl DiscoveredEntities {
             self.ros_participant_info.get(&writer.participant_key),
             self.nodes_info.get_mut(&writer.participant_key),
         ) {
-            let mut replacements = None;
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.writer_gid_seq;
                 if membership.contains(gid) {
@@ -197,20 +271,9 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_writer(gid);
                     if tracked {
-                        // A snapshot may already have withdrawn this endpoint.
-                        // Search only when a derived component still used it,
-                        // and share the one scan across all affected nodes.
-                        let replacements = replacements.get_or_insert_with(|| {
-                            self.writers
-                                .values()
-                                .filter(|candidate| {
-                                    candidate.participant_key == writer.participant_key
-                                        && candidate.topic_name == writer.topic_name
-                                })
-                                .collect::<Vec<_>>()
-                        });
-                        match replacements
-                            .iter()
+                        match self
+                            .writers
+                            .on_topic(&writer.participant_key, &writer.topic_name)
                             .filter(|candidate| membership.contains(&candidate.key))
                             .max_by_key(|candidate| {
                                 (candidate.type_name == writer.type_name, candidate.key)
@@ -255,7 +318,7 @@ impl DiscoveredEntities {
                 }
             }
         }
-        self.readers.insert(reader.key, reader);
+        self.readers.insert(reader);
         events
     }
 
@@ -283,7 +346,6 @@ impl DiscoveredEntities {
             self.ros_participant_info.get(&reader.participant_key),
             self.nodes_info.get_mut(&reader.participant_key),
         ) {
-            let mut replacements = None;
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.reader_gid_seq;
                 if membership.contains(gid) {
@@ -295,20 +357,9 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_reader(gid);
                     if tracked {
-                        // A snapshot may already have withdrawn this endpoint.
-                        // Search only when a derived component still used it,
-                        // and share the one scan across all affected nodes.
-                        let replacements = replacements.get_or_insert_with(|| {
-                            self.readers
-                                .values()
-                                .filter(|candidate| {
-                                    candidate.participant_key == reader.participant_key
-                                        && candidate.topic_name == reader.topic_name
-                                })
-                                .collect::<Vec<_>>()
-                        });
-                        match replacements
-                            .iter()
+                        match self
+                            .readers
+                            .on_topic(&reader.participant_key, &reader.topic_name)
                             .filter(|candidate| membership.contains(&candidate.key))
                             .max_by_key(|candidate| {
                                 (candidate.type_name == reader.type_name, candidate.key)
@@ -748,9 +799,61 @@ mod lifecycle_tests {
         let mut d = initial();
         d.remove_participant(&gid(1));
         assert!(d.ros_participant_info.is_empty());
-        assert!(d.readers.is_empty());
-        assert!(d.writers.is_empty());
+        assert!(d.readers.entities.is_empty());
+        assert!(d.writers.entities.is_empty());
+        assert!(d.readers.topics.is_empty());
+        assert!(d.writers.topics.is_empty());
         assert!(d.nodes_info.is_empty());
+    }
+
+    #[test]
+    fn endpoint_index_tracks_metadata_replacement_and_releases_empty_buckets() {
+        let mut endpoints = Endpoints::default();
+        let first = entity(1, 20, true);
+        let second = entity(1, 21, true);
+        let topic = first.topic_name.clone();
+        endpoints.insert(first);
+        endpoints.insert(second);
+        assert_eq!(endpoints.on_topic(&gid(1), &topic).count(), 2);
+
+        let mut replacement = entity(2, 20, true);
+        replacement.topic_name = "rq/newRequest".into();
+        for _ in 0..100 {
+            endpoints.insert(replacement.clone());
+        }
+        replacement.type_name = "ChangedRequest_".into();
+        endpoints.insert(replacement);
+        assert_eq!(
+            endpoints
+                .on_topic(&gid(2), "rq/newRequest")
+                .next()
+                .unwrap()
+                .type_name,
+            "ChangedRequest_"
+        );
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(
+            endpoints
+                .on_topic(&gid(1), &topic)
+                .map(|e| e.key)
+                .collect::<Vec<_>>(),
+            vec![gid(21)]
+        );
+        assert_eq!(
+            endpoints
+                .on_topic(&gid(2), "rq/newRequest")
+                .map(|e| e.key)
+                .collect::<Vec<_>>(),
+            vec![gid(20)]
+        );
+
+        endpoints.remove_participant(&gid(1));
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints.topics.len(), 1);
+        assert!(endpoints.remove(&gid(20)).is_some());
+        assert!(endpoints.remove(&gid(20)).is_none());
+        assert!(endpoints.entities.is_empty());
+        assert!(endpoints.topics.is_empty());
     }
 
     fn interface_endpoints(action: bool, client: bool, copy: u8) -> Vec<(bool, DdsEntity)> {
@@ -1531,7 +1634,7 @@ mod cpu_benchmark {
     #[test]
     #[ignore = "release-mode discovery CPU comparison; see tests/lifecycle/README.md"]
     fn discovery_churn_benchmark() {
-        for nodes in [1, 231] {
+        for nodes in [1, 512] {
             for (base, added) in [
                 (0, 250),
                 (0, 500),
@@ -1539,6 +1642,8 @@ mod cpu_benchmark {
                 (500, 150),
                 (1850, 150),
                 (1850, 300),
+                (0, 12000),
+                (9000, 3000),
             ] {
                 for repeat in 0..3 {
                     let mut d = DiscoveredEntities::default();
