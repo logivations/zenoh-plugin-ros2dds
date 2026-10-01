@@ -185,16 +185,7 @@ impl DiscoveredEntities {
             self.ros_participant_info.get(&writer.participant_key),
             self.nodes_info.get_mut(&writer.participant_key),
         ) {
-            // The endpoint is already out of the global map, so this holds
-            // only survivors on the same topic within the same participant.
-            let replacements: Vec<_> = self
-                .writers
-                .values()
-                .filter(|candidate| {
-                    candidate.participant_key == writer.participant_key
-                        && candidate.topic_name == writer.topic_name
-                })
-                .collect();
+            let mut replacements = None;
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.writer_gid_seq;
                 if membership.contains(gid) {
@@ -206,6 +197,18 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_writer(gid);
                     if tracked {
+                        // A snapshot may already have withdrawn this endpoint.
+                        // Search only when a derived component still used it,
+                        // and share the one scan across all affected nodes.
+                        let replacements = replacements.get_or_insert_with(|| {
+                            self.writers
+                                .values()
+                                .filter(|candidate| {
+                                    candidate.participant_key == writer.participant_key
+                                        && candidate.topic_name == writer.topic_name
+                                })
+                                .collect::<Vec<_>>()
+                        });
                         match replacements
                             .iter()
                             .filter(|candidate| membership.contains(&candidate.key))
@@ -280,16 +283,7 @@ impl DiscoveredEntities {
             self.ros_participant_info.get(&reader.participant_key),
             self.nodes_info.get_mut(&reader.participant_key),
         ) {
-            // The endpoint is already out of the global map, so this holds
-            // only survivors on the same topic within the same participant.
-            let replacements: Vec<_> = self
-                .readers
-                .values()
-                .filter(|candidate| {
-                    candidate.participant_key == reader.participant_key
-                        && candidate.topic_name == reader.topic_name
-                })
-                .collect();
+            let mut replacements = None;
             for (name, ros_node) in &graph.node_entities_info_seq {
                 let membership = &ros_node.reader_gid_seq;
                 if membership.contains(gid) {
@@ -301,6 +295,18 @@ impl DiscoveredEntities {
                     // must not rewrite a live interface it never backed.
                     let (tracked, withdrawal) = node.remove_reader(gid);
                     if tracked {
+                        // A snapshot may already have withdrawn this endpoint.
+                        // Search only when a derived component still used it,
+                        // and share the one scan across all affected nodes.
+                        let replacements = replacements.get_or_insert_with(|| {
+                            self.readers
+                                .values()
+                                .filter(|candidate| {
+                                    candidate.participant_key == reader.participant_key
+                                        && candidate.topic_name == reader.topic_name
+                                })
+                                .collect::<Vec<_>>()
+                        });
                         match replacements
                             .iter()
                             .filter(|candidate| membership.contains(&candidate.key))
@@ -912,6 +918,40 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn incomplete_interfaces_still_replace_tracked_components() {
+        for action in [false, true] {
+            for client in [false, true] {
+                let survivors = interface_endpoints(action, client, 0);
+                let selected = interface_endpoints(action, client, 1);
+                let mut endpoints = survivors.clone();
+                endpoints.extend(selected.clone());
+                let mut d = discover_interface(&endpoints);
+                // Remove every endpoint for one component, withdrawing the
+                // complete interface while retaining its other components.
+                let (writer, endpoint) = &survivors[0];
+                assert!(remove_endpoint(&mut d, *writer, &endpoint.key).is_empty());
+                let (writer, endpoint) = &selected[0];
+                assert_eq!(remove_endpoint(&mut d, *writer, &endpoint.key).len(), 1);
+
+                // This tracked disposal has no withdrawal (already incomplete),
+                // but must still find the survivor for its own component.
+                let (writer, endpoint) = &selected[1];
+                assert!(remove_endpoint(&mut d, *writer, &endpoint.key).is_empty());
+                let (writer, endpoint) = &selected[0];
+                let events = add_endpoint(&mut d, *writer, endpoint.clone());
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "action={action}, client={client}: {events:?}"
+                );
+                let mut expected: Vec<_> = selected.iter().map(|(_, e)| e.key).collect();
+                expected[1] = survivors[1].1.key;
+                assert_eq!(discovered_components(&events[0]), expected);
+            }
+        }
+    }
+
+    #[test]
     fn disposing_an_untracked_endpoint_does_not_rewrite_the_interface() {
         for action in [false, true] {
             for client in [false, true] {
@@ -1184,11 +1224,11 @@ mod lifecycle_tests {
         assert_eq!(events.len(), 2, "{events:?}");
         let details: Vec<_> = events.iter().map(event_details).collect();
         let (withdrawal, addition) = if type_change { (0, 1) } else { (1, 0) };
-        assert_eq!(details[withdrawal].0, false, "{events:?}");
+        assert!(!details[withdrawal].0, "{events:?}");
         assert_eq!(details[withdrawal].1, gid(1));
         assert_eq!(details[withdrawal].2, old_name);
         assert_eq!(details[withdrawal].4, old_type);
-        assert_eq!(details[addition].0, true, "{events:?}");
+        assert!(details[addition].0, "{events:?}");
         assert_eq!(details[addition].1, gid(1));
         assert_eq!(details[addition].2, new_name);
         assert_eq!(details[addition].4 == old_type, !type_change);
