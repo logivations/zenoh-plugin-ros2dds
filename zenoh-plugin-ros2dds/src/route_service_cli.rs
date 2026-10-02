@@ -48,6 +48,7 @@ use crate::{
     },
     ros_discovery::RosDiscoveryInfoMgr,
     routes_mgr::Context,
+    zenoh_send_queue::{ZenohSendQueue, ZenohSender},
     LOG_PAYLOAD,
 };
 
@@ -81,6 +82,9 @@ pub struct RouteServiceCli {
     remote_routes: HashSet<String>,
     // the list of nodes served by this route
     local_nodes: HashSet<String>,
+    // sends the requests to Zenoh outside of the DDS listener
+    #[serde(skip)]
+    _send_queue: ZenohSendQueue,
 }
 
 impl Drop for RouteServiceCli {
@@ -130,6 +134,7 @@ impl RouteServiceCli {
         // (copy/move all required args for the callback)
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let send_queue = ZenohSendQueue::new();
 
         zenoh_querier
             .matching_listener()
@@ -140,6 +145,7 @@ impl RouteServiceCli {
                 let ros2_type = ros2_type.clone();
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
+                let sender = send_queue.sender();
 
                 move |status| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
@@ -153,6 +159,7 @@ impl RouteServiceCli {
                                 &context,
                                 &type_info,
                                 &zquerier,
+                                &sender,
                             ) {
                                 tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                             }
@@ -182,6 +189,7 @@ impl RouteServiceCli {
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
+            _send_queue: send_queue,
         })
     }
 
@@ -295,6 +303,7 @@ fn activate(
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
     zenoh_querier: &Arc<Querier<'static>>,
+    sender: &ZenohSender,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: activate");
     // Default Service QoS
@@ -340,6 +349,7 @@ fn activate(
     let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
     let zquerier = zenoh_querier.clone();
     let route_id2 = route_id.to_owned();
+    let sender = sender.clone();
     let dds_reader = create_dds_reader(
         context.participant,
         req_topic_name,
@@ -349,7 +359,7 @@ fn activate(
         qos,
         None,
         move |sample| {
-            route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
+            route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer, &sender);
         },
     )?;
     let old = req_reader.swap(dds_reader, Ordering::Relaxed);
@@ -406,6 +416,7 @@ fn route_dds_request_to_zenoh(
     sample: &DDSRawSample,
     querier: &Arc<Querier<'static>>,
     rep_writer: dds_entity_t,
+    sender: &ZenohSender,
 ) {
     // Request payload is expected to be the Request type encoded as CDR, including a 4 bytes CDR header,
     // the 16 bytes request_id (8 bytes client guid + 8 bytes sequence_number), and the request payload. As per rmw_cyclonedds here:
@@ -446,37 +457,42 @@ fn route_dds_request_to_zenoh(
         );
     }
 
-    if let Err(e) = querier
-        .get()
-        .payload(zenoh_req_buf)
-        .attachment(request_id.as_attachment())
-        .with({
-            let route_id1: String = route_id.to_string();
-            let route_id2 = route_id.to_string();
-            let reply_received1 = Arc::new(AtomicBool::new(false));
-            let reply_received2 = reply_received1.clone();
-            CallbackDrop {
-                callback: move |reply| {
-                        if !reply_received1.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer)
-                        } else {
-                            tracing::warn!("{route_id1}: received more than 1 reply for request {request_id} - dropping the extra replies");
+    let querier = querier.clone();
+    let owned_route_id = route_id.to_string();
+    sender.send(route_id, move || {
+        let route_id = owned_route_id;
+        if let Err(e) = querier
+            .get()
+            .payload(zenoh_req_buf)
+            .attachment(request_id.as_attachment())
+            .with({
+                let route_id1: String = route_id.to_string();
+                let route_id2 = route_id.to_string();
+                let reply_received1 = Arc::new(AtomicBool::new(false));
+                let reply_received2 = reply_received1.clone();
+                CallbackDrop {
+                    callback: move |reply| {
+                            if !reply_received1.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer)
+                            } else {
+                                tracing::warn!("{route_id1}: received more than 1 reply for request {request_id} - dropping the extra replies");
+                            }
+                        },
+                    drop: move || {
+                        if !reply_received2.load(std::sync::atomic::Ordering::Relaxed) {
+                            // There is no way to send an error message as a reply to a ROS Service Client !
+                            // (sending an invalid message will make it crash...)
+                            // We have no choice but to log the error and let the client hanging without reply, until a timeout (if set by the client)
+                            tracing::warn!("{route_id2}: received NO reply for request {request_id} - cannot reply to client, it will hang until timeout");
                         }
                     },
-                drop: move || {
-                    if !reply_received2.load(std::sync::atomic::Ordering::Relaxed) {
-                        // There is no way to send an error message as a reply to a ROS Service Client !
-                        // (sending an invalid message will make it crash...)
-                        // We have no choice but to log the error and let the client hanging without reply, until a timeout (if set by the client)
-                        tracing::warn!("{route_id2}: received NO reply for request {request_id} - cannot reply to client, it will hang until timeout");
-                    }
-                },
-            }
-        })
-        .wait()
-    {
-        tracing::warn!("{route_id}: routing request {request_id} from DDS to Zenoh failed: {e}");
-    }
+                }
+            })
+            .wait()
+        {
+            tracing::warn!("{route_id}: routing request {request_id} from DDS to Zenoh failed: {e}");
+        }
+    });
 }
 
 fn route_zenoh_reply_to_dds(
