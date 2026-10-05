@@ -29,11 +29,11 @@ serde_json = "1.0.142"
 tokio = { version = "1.47.1", default-features = false } # Default features are disabled due to some crates' requirements
 # Pinned to the released 1.10.1 (not zenoh git main): this fork's plugin is
 # built against 1.10.1 and the harness must link the same zenoh.
-zenoh = { version = "1.10.1", features = [
+zenoh = { version = "=1.10.1", features = [
   "plugins",
   "unstable",
 ] }
-zenoh-config = { version = "1.10.1", default-features = false }
+zenoh-config = { version = "=1.10.1", default-features = false }
 zenoh-plugin-ros2dds = { path = "../zenoh-plugin-ros2dds/", default-features = false }
 
 # We need an empty workspace to avoid being viewed as a part of zenoh-plugin-ros2dds
