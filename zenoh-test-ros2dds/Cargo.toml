@@ -29,6 +29,8 @@ serde_json = "1.0.142"
 tokio = { version = "1.47.1", default-features = false } # Default features are disabled due to some crates' requirements
 # Pinned to the released 1.10.1 (not zenoh git main): this fork's plugin is
 # built against 1.10.1 and the harness must link the same zenoh.
+# Before local tests run `python3 align_zenoh.py` (also run by CI) to inherit
+# the release workspace patches and verify the resolved transport sources.
 zenoh = { version = "=1.10.1", features = [
   "plugins",
   "unstable",

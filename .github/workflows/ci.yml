@@ -136,12 +136,12 @@ jobs:
       run: 'source /opt/ros/humble/setup.bash && cd zenoh-test-ros2dds && cargo fmt --check -- --config "unstable_features=true,imports_granularity=Crate,group_imports=StdExternalCrate"'
     - name: Clippy
       shell: bash
-      run: "source /opt/ros/humble/setup.bash && cd zenoh-test-ros2dds && cargo clippy --tests -- --deny warnings"
+      run: "source /opt/ros/humble/setup.bash && cd zenoh-test-ros2dds && cargo clippy --locked --tests -- --deny warnings"
 
     - name: Run ROS tests
       shell: bash
       # Note that we limit only one test item tested at the same time to avoid the confliction between bridges
-      run: "source /opt/ros/humble/setup.bash && cd zenoh-test-ros2dds && cargo test --verbose"
+      run: "source /opt/ros/humble/setup.bash && cd zenoh-test-ros2dds && cargo test --locked --verbose"
 
   system_tests_with_ros2_jazzy:
     name: System tests with ROS 2 Jazzy
@@ -177,12 +177,12 @@ jobs:
       run: 'source /opt/ros/jazzy/setup.bash && cd zenoh-test-ros2dds && cargo fmt --check -- --config "unstable_features=true,imports_granularity=Crate,group_imports=StdExternalCrate"'
     - name: Clippy
       shell: bash
-      run: "source /opt/ros/jazzy/setup.bash && cd zenoh-test-ros2dds && cargo clippy --tests -- --deny warnings"
+      run: "source /opt/ros/jazzy/setup.bash && cd zenoh-test-ros2dds && cargo clippy --locked --tests -- --deny warnings"
 
     - name: Run ROS tests
       shell: bash
       # Note that we limit only one test item tested at the same time to avoid the confliction between bridges
-      run: "source /opt/ros/jazzy/setup.bash && cd zenoh-test-ros2dds && cargo test --verbose"
+      run: "source /opt/ros/jazzy/setup.bash && cd zenoh-test-ros2dds && cargo test --locked --verbose"
 
   markdown_lint:
     runs-on: ubuntu-latest
