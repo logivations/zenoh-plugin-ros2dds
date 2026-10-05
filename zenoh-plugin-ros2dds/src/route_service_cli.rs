@@ -329,9 +329,17 @@ impl RouteServiceCli {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
-        // if last remote node removed, deactivate the route
+        // if last remote node removed, deactivate the route.
+        // Deactivation must run inside the liveness critical section: a
+        // matching callback concurrently inside activate() could otherwise
+        // interleave with this deletion and leave a mixed state (e.g. live
+        // Request Reader + deleted Reply Writer with its gid already
+        // unregistered) that the req_reader NULL guard never heals.
+        // Lock order is liveness -> ros_discovery, as everywhere else.
+        // After retirement (if_live returns None) Drop already deactivated.
         if self.remote_routes.is_empty() {
-            self.deactivate();
+            let liveness = self.liveness.clone();
+            liveness.if_live(|| self.deactivate());
         }
     }
 

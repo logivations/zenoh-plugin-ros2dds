@@ -419,9 +419,16 @@ impl RoutePublisher {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
-        // if last remote route removed, deactivate the DDS Reader
+        // if last remote route removed, deactivate the DDS Reader.
+        // Deactivation must run inside the liveness critical section: a
+        // matching callback concurrently inside activate_dds_reader() could
+        // otherwise interleave with this deletion and leave a mixed state
+        // that the dds_reader NULL guard never heals.
+        // Lock order is liveness -> ros_discovery, as everywhere else.
+        // After retirement (if_live returns None) Drop already deactivated.
         if self.remote_routes.is_empty() {
-            self.deactivate_dds_reader();
+            let liveness = self.liveness.clone();
+            liveness.if_live(|| self.deactivate_dds_reader());
         }
     }
 
