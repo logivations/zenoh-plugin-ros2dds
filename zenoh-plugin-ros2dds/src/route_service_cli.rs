@@ -23,7 +23,7 @@ use std::{
 };
 
 use cyclors::dds_entity_t;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use zenoh::{
     bytes::ZBytes,
     handlers::CallbackDrop,
@@ -49,10 +49,36 @@ use crate::{
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
     },
     ros_discovery::RosDiscoveryInfoMgr,
+    route_health::{Progress, ProgressGuard, ReaderHealth, Receipts},
     routes_mgr::Context,
     zenoh_send_queue::{ZenohSendQueue, ZenohSender},
     LOG_PAYLOAD,
 };
+
+#[derive(Serialize)]
+struct ServiceCliHealth {
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    dds_to_zenoh: Arc<Progress>,
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    zenoh_to_dds: Arc<Progress>,
+    reader: ReaderHealth,
+    #[serde(serialize_with = "serialize_matching")]
+    matching: Arc<Querier<'static>>,
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    receipts: Arc<Receipts>,
+}
+
+fn serialize_matching<S: Serializer>(
+    querier: &Arc<Querier<'static>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    querier
+        .matching_status()
+        .wait()
+        .ok()
+        .map(|status| status.matching())
+        .serialize(serializer)
+}
 
 // a route for a Service Client exposed in Zenoh as a Queryier
 #[allow(clippy::upper_case_acronyms)]
@@ -90,6 +116,7 @@ pub struct RouteServiceCli {
     // the local DDS Writer sending replies to the client
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     rep_writer: Arc<AtomicDDSEntity>,
+    health: ServiceCliHealth,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -160,6 +187,13 @@ impl RouteServiceCli {
         // (copy/move all required args for the callback)
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let health = ServiceCliHealth {
+            dds_to_zenoh: Progress::new(),
+            zenoh_to_dds: Progress::new(),
+            reader: ReaderHealth::atomic(req_reader.clone(), None),
+            matching: zenoh_querier.clone(),
+            receipts: Receipts::new(),
+        };
         let liveness = RouteLiveness::new();
         let send_queue = Arc::new(ZenohSendQueue::new());
 
@@ -175,6 +209,9 @@ impl RouteServiceCli {
                 let zquerier = zenoh_querier.clone();
                 let type_info = type_info.clone();
                 let send_queue = send_queue.clone();
+                let dds_to_zenoh = health.dds_to_zenoh.clone();
+                let zenoh_to_dds = health.zenoh_to_dds.clone();
+                let receipts = health.receipts.clone();
 
                 move |status| {
                     // Activation/deactivation happens inside the liveness
@@ -204,6 +241,9 @@ impl RouteServiceCli {
                                 &type_info,
                                 &zquerier,
                                 &send_queue,
+                                &dds_to_zenoh,
+                                &zenoh_to_dds,
+                                &receipts,
                             ) {
                                 tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                             }
@@ -239,6 +279,7 @@ impl RouteServiceCli {
             queries_timeout,
             rep_writer,
             req_reader,
+            health,
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
@@ -318,6 +359,9 @@ impl RouteServiceCli {
                     &self.type_info,
                     &self.zenoh_querier,
                     &self.send_queue,
+                    &self.health.dds_to_zenoh,
+                    &self.health.zenoh_to_dds,
+                    &self.health.receipts,
                 )
             })
             // after retirement there is nothing left to re-activate
@@ -406,6 +450,10 @@ impl RouteServiceCli {
     }
 
     #[inline]
+    pub(crate) fn has_local_announcement(&self, node: &str) -> bool {
+        self.local_nodes.contains(node) && self.liveliness_token.is_some()
+    }
+
     pub fn is_unused(&self) -> bool {
         !self.is_serving_local_node() && !self.is_serving_remote_route()
     }
@@ -422,6 +470,9 @@ fn activate(
     type_info: &Option<Arc<TypeInfo>>,
     zenoh_querier: &Arc<Querier<'static>>,
     send_queue: &ZenohSendQueue,
+    dds_to_zenoh: &Arc<Progress>,
+    zenoh_to_dds: &Arc<Progress>,
+    receipts: &Arc<Receipts>,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: activate");
     // Default Service QoS
@@ -505,6 +556,9 @@ fn activate(
     let zquerier = zenoh_querier.clone();
     let route_id2 = route_id.to_owned();
     let sender = send_queue.sender();
+    let dds_to_zenoh = dds_to_zenoh.clone();
+    let zenoh_to_dds = zenoh_to_dds.clone();
+    let receipts = receipts.clone();
     let dds_reader = match create_dds_reader(
         context.participant,
         req_topic_name,
@@ -514,7 +568,16 @@ fn activate(
         qos,
         None,
         move |sample| {
-            route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer, &sender);
+            route_dds_request_to_zenoh(
+                &route_id2,
+                sample,
+                &zquerier,
+                dds_writer,
+                &sender,
+                &dds_to_zenoh,
+                &zenoh_to_dds,
+                &receipts,
+            );
         },
     ) {
         Ok(reader) => reader,
@@ -594,13 +657,18 @@ fn deactivate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_dds_request_to_zenoh(
     route_id: &str,
     sample: &DDSRawSample,
     querier: &Arc<Querier<'static>>,
     rep_writer: dds_entity_t,
     sender: &ZenohSender,
+    dds_to_zenoh: &Arc<Progress>,
+    zenoh_to_dds: &Arc<Progress>,
+    receipts: &Arc<Receipts>,
 ) {
+    let mut progress = dds_to_zenoh.begin();
     // Request payload is expected to be the Request type encoded as CDR, including a 4 bytes CDR header,
     // the 16 bytes request_id (8 bytes client guid + 8 bytes sequence_number), and the request payload. As per rmw_cyclonedds here:
     // https://github.com/ros2/rmw_cyclonedds/blob/2263814fab142ac19dd3395971fb1f358d22a653/rmw_cyclonedds_cpp/src/serdata.hpp#L73
@@ -643,6 +711,8 @@ fn route_dds_request_to_zenoh(
     let querier = querier.clone();
     let reply_generation = sender.generation.clone();
     let owned_route_id = route_id.to_string();
+    let zenoh_to_dds = zenoh_to_dds.clone();
+    let receipts = receipts.clone();
     sender.send(route_id, move || {
         let route_id = owned_route_id;
         if let Err(e) = querier
@@ -656,9 +726,10 @@ fn route_dds_request_to_zenoh(
                 let reply_received2 = reply_received1.clone();
                 CallbackDrop {
                     callback: move |reply| {
+                            let progress = zenoh_to_dds.begin();
                             if !reply_received1.swap(true, std::sync::atomic::Ordering::Relaxed) {
                                 reply_generation.if_current(|| {
-                                    route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer)
+                                    route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer, progress, &receipts)
                                 });
                             } else {
                                 tracing::warn!("{route_id1}: received more than 1 reply for request {request_id} - dropping the extra replies");
@@ -677,6 +748,10 @@ fn route_dds_request_to_zenoh(
             .wait()
         {
             tracing::warn!("{route_id}: routing request {request_id} from DDS to Zenoh failed: {e}");
+        } else {
+            // Sending the query completed. Waiting for its application reply is
+            // deliberately outside the local forwarding operation.
+            progress.succeed();
         }
     });
 }
@@ -686,6 +761,8 @@ fn route_zenoh_reply_to_dds(
     reply: Reply,
     request_id: CddsRequestHeader,
     rep_writer: dds_entity_t,
+    mut progress: ProgressGuard,
+    receipts: &Receipts,
 ) {
     match reply.result() {
         Ok(sample) => {
@@ -718,6 +795,11 @@ fn route_zenoh_reply_to_dds(
                 tracing::warn!(
                     "{route_id}: routing reply for {request_id} from Zenoh to DDS failed: {e}"
                 );
+            } else {
+                progress.succeed();
+                if let Some(source) = reply.replier_id() {
+                    receipts.record(source);
+                }
             }
         }
         Err(val) => {

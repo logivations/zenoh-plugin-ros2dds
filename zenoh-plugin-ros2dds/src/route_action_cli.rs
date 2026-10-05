@@ -41,15 +41,15 @@ pub struct RouteActionCli {
     #[serde(skip)]
     context: Context,
     is_active: bool,
-    #[serde(skip)]
+    #[serde(rename = "send_goal")]
     route_send_goal: RouteServiceCli,
-    #[serde(skip)]
+    #[serde(rename = "cancel_goal")]
     route_cancel_goal: RouteServiceCli,
-    #[serde(skip)]
+    #[serde(rename = "get_result")]
     route_get_result: RouteServiceCli,
-    #[serde(skip)]
+    #[serde(rename = "feedback")]
     route_feedback: RouteSubscriber,
-    #[serde(skip)]
+    #[serde(rename = "status")]
     route_status: RouteSubscriber,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
@@ -281,6 +281,10 @@ impl RouteActionCli {
         if self.local_nodes.is_empty() {
             self.retire_route();
         }
+    }
+
+    pub(crate) fn has_local_announcement(&self, node: &str) -> bool {
+        self.local_nodes.contains(node) && self.liveliness_token.is_some()
     }
 
     pub fn is_unused(&self) -> bool {

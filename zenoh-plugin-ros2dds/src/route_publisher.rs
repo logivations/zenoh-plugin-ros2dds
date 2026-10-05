@@ -34,9 +34,10 @@ use zenoh::{
     matching::MatchingListener,
     qos::{CongestionControl, Priority, Reliability},
     sample::Locality,
+    session::EntityGlobalId,
     Wait,
 };
-use zenoh_ext::{AdvancedPublisher, AdvancedPublisherBuilderExt, CacheConfig};
+use zenoh_ext::{AdvancedPublisher, AdvancedPublisherBuilderExt, CacheConfig, MissDetectionConfig};
 
 use crate::{
     dds_types::{DDSRawSample, TypeInfo},
@@ -48,6 +49,7 @@ use crate::{
     qos_helpers::*,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
     ros_discovery::RosDiscoveryInfoMgr,
+    route_health::{Progress, ReaderHealth},
     routes_mgr::Context,
     Config, LOG_PAYLOAD,
 };
@@ -55,6 +57,29 @@ use crate::{
 pub struct ZPublisher {
     publisher: Arc<AdvancedPublisher<'static>>,
     cache_size: usize,
+}
+
+#[derive(Serialize)]
+struct PublisherHealth {
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    dds_to_zenoh: Arc<Progress>,
+    reader: ReaderHealth,
+    #[serde(serialize_with = "serialize_matching")]
+    matching: Arc<AdvancedPublisher<'static>>,
+    #[serde(serialize_with = "crate::route_health::serialize_source_id")]
+    source: EntityGlobalId,
+}
+
+fn serialize_matching<S: Serializer>(
+    publisher: &Arc<AdvancedPublisher<'static>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    publisher
+        .matching_status()
+        .wait()
+        .ok()
+        .map(|status| status.matching())
+        .serialize(serializer)
 }
 
 impl Deref for ZPublisher {
@@ -97,6 +122,7 @@ pub struct RoutePublisher {
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_reader: Arc<AtomicDDSEntity>,
+    health: PublisherHealth,
     // the Zenoh Priority for publications
     #[serde(serialize_with = "serialize_priority")]
     priority: Priority,
@@ -223,7 +249,10 @@ impl RoutePublisher {
         let mut publisher_builder = context
             .zsession
             .declare_publisher(zenoh_key_expr.clone())
-            .advanced();
+            .advanced()
+            // Use Zenoh's own source identity/sequence metadata so a remote
+            // observer can distinguish real delivery from different bridges.
+            .sample_miss_detection(MissDetectionConfig::default());
         if transient_local {
             publisher_builder = publisher_builder
                 .cache(CacheConfig::default().max_samples(cache_size))
@@ -244,6 +273,15 @@ impl RoutePublisher {
         // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let health = PublisherHealth {
+            dds_to_zenoh: Progress::new(),
+            reader: ReaderHealth::atomic(
+                dds_reader.clone(),
+                get_read_period(&context.config, &ros2_name),
+            ),
+            matching: publisher.clone(),
+            source: publisher.id(),
+        };
         let liveness = RouteLiveness::new();
 
         let matching_listener = publisher
@@ -260,6 +298,7 @@ impl RoutePublisher {
                 let reader_qos = reader_qos.clone();
                 let type_info = type_info.clone();
                 let publisher = publisher.clone();
+                let dds_to_zenoh = health.dds_to_zenoh.clone();
 
                 move |status| {
                     // Activation/deactivation happens inside the liveness
@@ -289,6 +328,7 @@ impl RoutePublisher {
                                 &reader_qos,
                                 &type_info,
                                 &publisher,
+                                &dds_to_zenoh,
                             ) {
                                 tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                             }
@@ -318,6 +358,7 @@ impl RoutePublisher {
             matching_listener: Some(matching_listener),
             liveness,
             dds_reader,
+            health,
             priority,
             type_info: type_info.clone(),
             reader_qos,
@@ -369,6 +410,7 @@ impl RoutePublisher {
                     &self.reader_qos,
                     &self.type_info,
                     &self.zenoh_publisher.publisher,
+                    &self.health.dds_to_zenoh,
                 )
             })
             // after retirement there is nothing left to re-activate
@@ -489,6 +531,10 @@ impl RoutePublisher {
     }
 
     #[inline]
+    pub(crate) fn has_local_announcement(&self, node: &str) -> bool {
+        self.local_nodes.contains(node) && self.liveliness_token.is_some()
+    }
+
     pub fn is_unused(&self) -> bool {
         !self.is_serving_local_node() && !self.is_serving_remote_route()
     }
@@ -526,6 +572,7 @@ fn activate_dds_reader(
     reader_qos: &Qos,
     type_info: &Option<Arc<TypeInfo>>,
     publisher: &Arc<AdvancedPublisher<'static>>,
+    dds_to_zenoh: &Arc<Progress>,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: create Reader with {reader_qos:?}");
     let topic_name: String = format!("rt{}", ros2_name);
@@ -544,12 +591,19 @@ fn activate_dds_reader(
         {
             let route_id = route_id.to_string();
             let publisher = publisher.clone();
+            let dds_to_zenoh = dds_to_zenoh.clone();
             // per-route flag throttling the publish-failure log (see
             // route_dds_message_to_zenoh); a fresh activation starts with
             // error-level logging again
             let publish_failing = Arc::new(AtomicBool::new(false));
             move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(sample, &publisher, &route_id, &publish_failing);
+                route_dds_message_to_zenoh(
+                    sample,
+                    &publisher,
+                    &route_id,
+                    &publish_failing,
+                    &dds_to_zenoh,
+                );
             }
         },
     )?;
@@ -616,7 +670,9 @@ fn route_dds_message_to_zenoh(
     publisher: &Arc<AdvancedPublisher>,
     route_id: &str,
     publish_failing: &AtomicBool,
+    dds_to_zenoh: &Arc<Progress>,
 ) {
+    let mut progress = dds_to_zenoh.begin();
     if *LOG_PAYLOAD {
         tracing::debug!("{route_id}: routing message - payload: {:02x?}", sample);
     } else {
@@ -637,6 +693,7 @@ fn route_dds_message_to_zenoh(
             }
         }
         Ok(()) => {
+            progress.succeed();
             if publish_failing.load(Ordering::Relaxed) {
                 publish_failing.store(false, Ordering::Relaxed);
                 tracing::debug!(

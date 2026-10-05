@@ -264,3 +264,30 @@ This admin space can be queried via Zenoh `get()` operation. If the REST plugin 
 - `http://\<bridge-IP\>:8000/@/local/ros2/route/**` : to get all routes between ROS interfaces and Zenoh established by the bridge
 - `http://\<bridge-IP\>:8000/@/*/ros2/node/**` : to get all ROS nodes discovered by all bridges
 - `http://\<bridge-IP\>:8000/@/*/ros2/route/**/cmd_vel` : to get all routes between established by all bridges on `cmd_vel` topic
+
+### Local recovery observations
+
+The Logivations build additionally exposes `@/<id>/ros2/health` (schema 1): the
+local process PID, pending native discovery count, and complete allowed DDS
+interfaces whose owned route, membership, or announcement is missing. This is
+compared with the existing discovery graph; no second route registry is kept.
+
+Each primitive route exposes local forwarding `entered`, `completed`,
+`succeeded`, and `in_flight` counters. DDS reader inspection uses a temporary
+readcondition on the existing reader; it does not subscribe, read, or take data.
+An unavailable/retiring reader is reported as unknown. Action routes expose all
+five primitive children using the same observations.
+
+Successful topic/reply writes to DDS retain bounded counts keyed by native
+Zenoh publisher/replier identity. Topic publishers enable native SourceInfo via
+AdvancedPublisher miss detection (without heartbeat/retransmission tasks), so
+another camera publishing the same topic cannot supply the missing camera's
+receipt. Source identity is independent of timestamps and survives routers and
+retained-history delivery. Counts prove bridge delivery, not application success.
+
+These fields are evidence, not permission to restart. In-flight forwarding can
+be legitimate backpressure; missing membership/announcement can coexist with
+working data. Application silence and a slow service/action are not bridge
+faults. The external [deep_cv observer](https://github.com/logivations/deep_cv/pull/13550)
+owns persistence, local failure attribution, bounded recovery, and verification.
+Bind its REST entry point to `127.0.0.1` and keep process supervision external.

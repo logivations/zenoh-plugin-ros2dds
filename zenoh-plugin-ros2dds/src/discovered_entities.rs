@@ -87,6 +87,10 @@ enum EntityRef {
 }
 
 impl DiscoveredEntities {
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &NodeInfo> {
+        self.nodes_info.values().flat_map(|nodes| nodes.values())
+    }
+
     #[inline]
     pub fn add_participant(&mut self, participant: DdsParticipant) {
         self.admin_space.insert(
@@ -651,5 +655,155 @@ mod undiscovered_staging_tests {
 
         let node = &entities.nodes_info[&participant][&fullname];
         assert!(node.undiscovered_reader.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn only_allowed_complete_live_endpoints_require_a_local_route() {
+        use std::sync::{Arc, RwLock};
+
+        use crate::{
+            config::Config,
+            node_info::{ActionCli, ActionSrv, MsgPub, MsgSub, ServiceCli, ServiceSrv},
+            ros_discovery::RosDiscoveryInfoMgr,
+            routes_mgr::RoutesMgr,
+        };
+
+        // Use real route ownership, DDS and Zenoh resources. Only the native
+        // discovery input is constructed, as when a route-creation event is lost.
+        struct Participant(cyclors::dds_entity_t);
+        impl Drop for Participant {
+            fn drop(&mut self) {
+                unsafe { cyclors::dds_delete(self.0) };
+            }
+        }
+        let participant = Participant(unsafe {
+            cyclors::dds_create_participant(232, std::ptr::null(), std::ptr::null())
+        });
+        assert!(participant.0 > 0);
+        let mut zconfig = zenoh::Config::default();
+        zconfig
+            .insert_json5("scouting/multicast/enabled", "false")
+            .unwrap();
+        zconfig.insert_json5("listen/endpoints", "[]").unwrap();
+        let session = Arc::new(zenoh::open(zconfig).await.unwrap());
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "namespace": "/robot",
+            "allow": {
+                "publishers": ["/wanted"], "subscribers": ["/wanted"],
+                "service_servers": ["/wanted"], "service_clients": ["/wanted"],
+                "action_servers": ["/wanted"], "action_clients": ["/wanted"]
+            }
+        }))
+        .unwrap();
+        let discovered = Arc::new(RwLock::new(DiscoveredEntities::default()));
+        let manager = RoutesMgr::new(
+            Arc::new(config),
+            session,
+            participant.0,
+            discovered.clone(),
+            Arc::new(RosDiscoveryInfoMgr::new(participant.0, "/", "health_test").unwrap()),
+            "@/health-test/ros2".try_into().unwrap(),
+        );
+        let gid = test_gid(81, 9);
+        let mut node = NodeInfo::create("/".into(), "source".into(), gid).unwrap();
+        let id = node.id.clone();
+        for name in ["/wanted", "/denied"] {
+            node.msg_pub.insert(
+                name.into(),
+                MsgPub::create(name.into(), "T".into(), gid).unwrap(),
+            );
+            node.msg_sub.insert(
+                name.into(),
+                MsgSub::create(name.into(), "T".into(), gid).unwrap(),
+            );
+            node.service_srv.insert(
+                name.into(),
+                ServiceSrv::create(name.into(), "T".into()).unwrap(),
+            );
+            node.service_cli.insert(
+                name.into(),
+                ServiceCli::create(name.into(), "T".into()).unwrap(),
+            );
+            node.action_srv.insert(
+                name.into(),
+                ActionSrv::create(name.into(), "T".into()).unwrap(),
+            );
+            node.action_cli.insert(
+                name.into(),
+                ActionCli::create(name.into(), "T".into()).unwrap(),
+            );
+        }
+        discovered
+            .write()
+            .unwrap()
+            .nodes_info
+            .insert(gid, HashMap::from([("/source".into(), node)]));
+        let missing = serde_json::to_value(manager.missing_local_routes()).unwrap();
+        assert_eq!(
+            missing.as_array().unwrap().len(),
+            2,
+            "incomplete services/actions and denied topics are not required"
+        );
+        for row in missing.as_array().unwrap() {
+            assert_eq!(row["node"], id);
+            assert_eq!(row["zenoh_key_expr"], "robot/wanted");
+            assert_eq!(row["ros2_name"], "/wanted");
+            assert_eq!(row["ros2_type"], "T");
+        }
+
+        {
+            let mut graph = discovered.write().unwrap();
+            let node = graph
+                .nodes_info
+                .get_mut(&gid)
+                .unwrap()
+                .get_mut("/source")
+                .unwrap();
+            for srv in node.service_srv.values_mut() {
+                srv.entities.req_reader = gid;
+                srv.entities.rep_writer = gid;
+            }
+            for cli in node.service_cli.values_mut() {
+                cli.entities.req_writer = gid;
+                cli.entities.rep_reader = gid;
+            }
+            for srv in node.action_srv.values_mut() {
+                srv.entities.send_goal = node.service_srv["/wanted"].entities;
+                srv.entities.cancel_goal = srv.entities.send_goal;
+                srv.entities.get_result = srv.entities.send_goal;
+                srv.entities.status_writer = gid;
+                srv.entities.feedback_writer = gid;
+            }
+            for cli in node.action_cli.values_mut() {
+                cli.entities.send_goal = node.service_cli["/wanted"].entities;
+                cli.entities.cancel_goal = cli.entities.send_goal;
+                cli.entities.get_result = cli.entities.send_goal;
+                cli.entities.status_reader = gid;
+                cli.entities.feedback_reader = gid;
+            }
+        }
+        let missing = serde_json::to_value(manager.missing_local_routes()).unwrap();
+        let routes: std::collections::HashSet<_> = missing
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            routes,
+            std::collections::HashSet::from([
+                "topic/pub/robot/wanted",
+                "topic/sub/robot/wanted",
+                "service/srv/robot/wanted",
+                "service/cli/robot/wanted",
+                "action/srv/robot/wanted",
+                "action/cli/robot/wanted",
+            ])
+        );
+        discovered.write().unwrap().remove_participant(&gid);
+        assert!(
+            manager.missing_local_routes().is_empty(),
+            "an application which left the native discovery graph is not a bridge fault"
+        );
     }
 }

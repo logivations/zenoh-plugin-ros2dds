@@ -65,6 +65,7 @@ mod ros2_utils;
 mod ros_discovery;
 mod route_action_cli;
 mod route_action_srv;
+mod route_health;
 mod route_publisher;
 mod route_service_cli;
 mod route_service_srv;
@@ -411,6 +412,7 @@ pub struct ROS2PluginRuntime {
 enum AdminRef {
     Config,
     Version,
+    Health,
 }
 
 impl ROS2PluginRuntime {
@@ -453,6 +455,10 @@ impl ROS2PluginRuntime {
         self.admin_space.insert(
             &admin_prefix / unsafe { keyexpr::from_str_unchecked("version") },
             AdminRef::Version,
+        );
+        self.admin_space.insert(
+            &admin_prefix / unsafe { keyexpr::from_str_unchecked("health") },
+            AdminRef::Health,
         );
 
         // Create and start the RosDiscoveryInfoMgr (managing ros_discovery_info topic)
@@ -547,7 +553,9 @@ impl ROS2PluginRuntime {
 
                 get_request = admin_queryable.recv_async() => {
                     if let Ok(query) = get_request {
-                        self.treat_admin_query(&query).await;
+                        let discovery_pending = discovery_rcv.len()
+                            .saturating_add(liveliness_subscriber.len());
+                        self.treat_admin_query(&query, &routes_mgr, discovery_pending).await;
                         // pass query to discovery_mgr
                         discovery_mgr.treat_admin_query(&query, &admin_prefix);
                         // pass query to discovery_mgr
@@ -725,26 +733,46 @@ impl ROS2PluginRuntime {
         }
     }
 
-    async fn treat_admin_query(&self, query: &Query) {
+    async fn treat_admin_query(
+        &self,
+        query: &Query,
+        routes_mgr: &RoutesMgr,
+        discovery_pending: usize,
+    ) {
         let query_ke = query.key_expr();
         if query_ke.is_wild() {
             // iterate over all admin space to find matching keys and reply for each
             for (ke, admin_ref) in self.admin_space.iter() {
                 if query_ke.intersects(ke) {
-                    self.send_admin_reply(query, ke, admin_ref).await;
+                    self.send_admin_reply(query, ke, admin_ref, routes_mgr, discovery_pending)
+                        .await;
                 }
             }
         } else {
             // sub_ke correspond to 1 key - just get it and reply
             let own_ke: OwnedKeyExpr = query_ke.to_owned().into();
             if let Some(admin_ref) = self.admin_space.get(&own_ke) {
-                self.send_admin_reply(query, &own_ke, admin_ref).await;
+                self.send_admin_reply(query, &own_ke, admin_ref, routes_mgr, discovery_pending)
+                    .await;
             }
         }
     }
 
-    async fn send_admin_reply(&self, query: &Query, key_expr: &keyexpr, admin_ref: &AdminRef) {
+    async fn send_admin_reply(
+        &self,
+        query: &Query,
+        key_expr: &keyexpr,
+        admin_ref: &AdminRef,
+        routes_mgr: &RoutesMgr,
+        discovery_pending: usize,
+    ) {
         let z_bytes: ZBytes = match admin_ref {
+            AdminRef::Health => ZBytes::from(
+                serde_json::json!({"schema": 1, "pid": std::process::id(),
+                    "missing_routes": routes_mgr.missing_local_routes(),
+                    "discovery_pending": discovery_pending})
+                .to_string(),
+            ),
             AdminRef::Version => match serde_json::to_value(ROS2Plugin::PLUGIN_LONG_VERSION) {
                 Ok(v) => match serde_json::to_vec(&v) {
                     Ok(bytes) => ZBytes::from(bytes),
