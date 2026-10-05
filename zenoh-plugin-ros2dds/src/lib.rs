@@ -70,7 +70,6 @@ mod route_service_cli;
 mod route_service_srv;
 mod route_subscriber;
 mod routes_mgr;
-mod zenoh_send_queue;
 use config::{Config, RosAutomaticDiscoveryRange};
 
 use crate::{
