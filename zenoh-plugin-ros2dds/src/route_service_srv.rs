@@ -47,11 +47,21 @@ use crate::{
         is_service_for_action, new_service_id, ros2_service_type_to_reply_dds_type,
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
     },
+    route_health::{Progress, ProgressGuard, ReaderHealth},
     routes_mgr::Context,
     serialize_option_as_bool,
     zenoh_send_queue::{ZenohSendQueue, ZenohSender},
     LOG_PAYLOAD,
 };
+
+#[derive(Serialize)]
+struct ServiceSrvHealth {
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    dds_to_zenoh: Arc<Progress>,
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    zenoh_to_dds: Arc<Progress>,
+    reader: ReaderHealth,
+}
 
 // a route for a Service Server exposed in Zenoh as a Queryable
 #[derive(Serialize)]
@@ -75,6 +85,7 @@ pub struct RouteServiceSrv {
     // the local DDS Reader receiving replies from the service server
     #[serde(serialize_with = "serialize_entity_guid")]
     rep_reader: dds_entity_t,
+    health: ServiceSrvHealth,
     // the client GUID used in each request
     #[serde(skip)]
     client_guid: u64,
@@ -180,6 +191,7 @@ impl RouteServiceSrv {
 
         // create DDS Reader to receive replies and route them to Zenoh
         let send_queue = ZenohSendQueue::new();
+        let dds_to_zenoh = Progress::new();
         let rep_topic_name = format!("rr{ros2_name}Reply");
         let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
         let rep_reader = create_dds_reader(
@@ -194,13 +206,16 @@ impl RouteServiceSrv {
                 let queries_in_progress = queries_in_progress.clone();
                 let zenoh_key_expr = zenoh_key_expr.clone();
                 let sender = send_queue.sender();
+                let dds_to_zenoh = dds_to_zenoh.clone();
                 move |sample| {
+                    let progress = dds_to_zenoh.begin();
                     route_dds_reply_to_zenoh(
                         sample,
                         zenoh_key_expr.clone(),
                         &mut zwrite!(queries_in_progress),
                         &route_id,
                         &sender,
+                        progress,
                     );
                 }
             },
@@ -218,6 +233,11 @@ impl RouteServiceSrv {
             zenoh_queryable: None,
             req_writer,
             rep_reader,
+            health: ServiceSrvHealth {
+                dds_to_zenoh,
+                zenoh_to_dds: Progress::new(),
+                reader: ReaderHealth::fixed(rep_reader, None),
+            },
             client_guid,
             sequence_number: Arc::new(AtomicU64::default()),
             queries_in_progress,
@@ -246,11 +266,13 @@ impl RouteServiceSrv {
         let route_id: String = self.to_string();
         let client_guid = self.client_guid;
         let req_writer: i32 = self.req_writer;
+        let zenoh_to_dds = self.health.zenoh_to_dds.clone();
         self.zenoh_queryable = Some(
             self.context
                 .zsession
                 .declare_queryable(&self.zenoh_key_expr)
                 .callback(move |query| {
+                    let progress = zenoh_to_dds.begin();
                     route_zenoh_request_to_dds(
                         query,
                         &mut zwrite!(queries_in_progress),
@@ -258,6 +280,7 @@ impl RouteServiceSrv {
                         &route_id,
                         client_guid,
                         req_writer,
+                        progress,
                     )
                 })
                 .await
@@ -349,6 +372,10 @@ impl RouteServiceSrv {
     }
 
     #[inline]
+    pub(crate) fn has_local_announcement(&self, node: &str) -> bool {
+        self.local_nodes.contains(node) && self.liveliness_token.is_some()
+    }
+
     pub fn is_unused(&self) -> bool {
         !self.is_serving_local_node() && !self.is_serving_remote_route()
     }
@@ -361,6 +388,7 @@ fn route_zenoh_request_to_dds(
     route_id: &str,
     client_guid: u64,
     req_writer: i32,
+    mut progress: ProgressGuard,
 ) {
     // Get expected endianness from the query value:
     // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
@@ -433,6 +461,10 @@ fn route_zenoh_request_to_dds(
     if let Err(e) = dds_write(req_writer, dds_req_buf) {
         tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
         queries_in_progress.remove(&request_id);
+    } else {
+        // The service may legitimately take arbitrarily long to respond.
+        // Only forwarding the request to DDS is this bridge's operation.
+        progress.succeed();
     }
 }
 
@@ -442,6 +474,7 @@ fn route_dds_reply_to_zenoh(
     queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
     route_id: &str,
     sender: &ZenohSender,
+    mut progress: ProgressGuard,
 ) {
     // Reply payload is expected to be the Response type encoded as CDR, including a 4 bytes CDR header,
     // the 16 bytes request_id (8 bytes client guid + 8 bytes sequence_number), and the reply payload. As per rmw_cyclonedds here:
@@ -488,6 +521,8 @@ fn route_dds_reply_to_zenoh(
             sender.send(route_id, move || {
                 if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
                     tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
+                } else {
+                    progress.succeed();
                 }
             });
         }

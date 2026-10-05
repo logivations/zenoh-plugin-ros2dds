@@ -99,6 +99,16 @@ pub struct RoutesMgr {
     admin_space: HashMap<OwnedKeyExpr, RouteRef>,
 }
 
+#[derive(Serialize)]
+pub(crate) struct MissingRoute {
+    route: String,
+    ros2_name: String,
+    ros2_type: String,
+    zenoh_key_expr: OwnedKeyExpr,
+    node: String,
+    reason: &'static str,
+}
+
 impl RoutesMgr {
     pub fn new(
         config: Arc<Config>,
@@ -127,6 +137,84 @@ impl RoutesMgr {
             admin_prefix,
             admin_space: HashMap::new(),
         }
+    }
+
+    /// Compare the current native discovery graph with the routes we own.
+    /// Creation/announcement errors must not make a route invisible to health.
+    /// This cold snapshot may race queued discovery events; observers must
+    /// require persistence and a live counterpart before recovering a bridge.
+    pub(crate) fn missing_local_routes(&self) -> Vec<MissingRoute> {
+        let entities = zread!(self.context.discovered_entities);
+        let config = &self.context.config;
+        let mut missing = Vec::new();
+        for node in entities.nodes() {
+            macro_rules! check {
+                ($interfaces:expr, $routes:expr, $allowed:ident, $prefix:literal) => {
+                    for iface in $interfaces {
+                        if config
+                            .allowance
+                            .as_ref()
+                            .is_some_and(|a| !a.$allowed(&iface.name))
+                            || $routes
+                                .get(&iface.name)
+                                .is_some_and(|route| route.has_local_announcement(&node.id))
+                        {
+                            continue;
+                        }
+                        let zenoh_key_expr = ros2_name_to_key_expr(&iface.name, config);
+                        missing.push(MissingRoute {
+                            route: format!("{}/{}", $prefix, zenoh_key_expr),
+                            ros2_name: iface.name.clone(),
+                            ros2_type: iface.typ.clone(),
+                            zenoh_key_expr,
+                            node: node.id.clone(),
+                            reason: "expected_route_missing",
+                        });
+                    }
+                };
+            }
+            check!(
+                node.msg_pub.values(),
+                self.routes_publishers,
+                is_publisher_allowed,
+                "topic/pub"
+            );
+            check!(
+                node.msg_sub.values(),
+                self.routes_subscribers,
+                is_subscriber_allowed,
+                "topic/sub"
+            );
+            check!(
+                node.service_srv
+                    .values()
+                    .filter(|iface| iface.is_complete()),
+                self.routes_service_srv,
+                is_service_srv_allowed,
+                "service/srv"
+            );
+            check!(
+                node.service_cli
+                    .values()
+                    .filter(|iface| iface.is_complete()),
+                self.routes_service_cli,
+                is_service_cli_allowed,
+                "service/cli"
+            );
+            check!(
+                node.action_srv.values().filter(|iface| iface.is_complete()),
+                self.routes_action_srv,
+                is_action_srv_allowed,
+                "action/srv"
+            );
+            check!(
+                node.action_cli.values().filter(|iface| iface.is_complete()),
+                self.routes_action_cli,
+                is_action_cli_allowed,
+                "action/cli"
+            );
+        }
+        missing
     }
 
     pub async fn on_ros_discovery_event(

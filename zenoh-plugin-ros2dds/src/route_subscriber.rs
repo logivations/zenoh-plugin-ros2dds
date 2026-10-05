@@ -12,7 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use std::{collections::HashSet, ffi::CStr, fmt, time::Duration};
+use std::{collections::HashSet, ffi::CStr, fmt, sync::Arc, time::Duration};
 
 use cyclors::{
     dds_entity_t, dds_get_entity_sertype, dds_strretcode, dds_writecdr, ddsi_serdata_from_ser_iov,
@@ -37,6 +37,7 @@ use crate::{
     qos::{History, Qos},
     qos_helpers::is_transient_local,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
+    route_health::{Progress, Receipts},
     routes_mgr::Context,
     serialize_option_as_bool, vec_into_raw_parts, LOG_PAYLOAD,
 };
@@ -44,6 +45,14 @@ use crate::{
 enum ZSubscriber {
     Subscriber(Subscriber<()>),
     AdvancedSubscriber(AdvancedSubscriber<()>),
+}
+
+#[derive(Serialize)]
+struct SubscriberHealth {
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    zenoh_to_dds: Arc<Progress>,
+    #[serde(serialize_with = "crate::route_health::serialize_arc")]
+    receipts: Arc<Receipts>,
 }
 
 // a route from Zenoh to DDS
@@ -66,6 +75,7 @@ pub struct RouteSubscriber {
     // the local DDS Writer created to serve the route (i.e. re-publish to DDS message coming from zenoh)
     #[serde(serialize_with = "serialize_entity_guid")]
     dds_writer: dds_entity_t,
+    health: SubscriberHealth,
     // if the Writer is TRANSIENT_LOCAL
     transient_local: bool,
     // queries timeout for historical publication (if TRANSIENT_LOCAL)
@@ -157,6 +167,10 @@ impl RouteSubscriber {
             context,
             zenoh_subscriber: None,
             dds_writer,
+            health: SubscriberHealth {
+                zenoh_to_dds: Progress::new(),
+                receipts: Receipts::new(),
+            },
             transient_local,
             queries_timeout,
             keyless,
@@ -172,8 +186,10 @@ impl RouteSubscriber {
         // Callback routing message received by Zenoh subscriber to DDS Writer (if set)
         let ros2_name = self.ros2_name.clone();
         let dds_writer = self.dds_writer;
+        let zenoh_to_dds = self.health.zenoh_to_dds.clone();
+        let receipts = self.health.receipts.clone();
         let subscriber_callback = move |s: Sample| {
-            route_zenoh_message_to_dds(s, &ros2_name, dds_writer);
+            route_zenoh_message_to_dds(s, &ros2_name, dds_writer, &zenoh_to_dds, &receipts);
         };
 
         // create zenoh subscriber
@@ -308,12 +324,23 @@ impl RouteSubscriber {
     }
 
     #[inline]
+    pub(crate) fn has_local_announcement(&self, node: &str) -> bool {
+        self.local_nodes.contains(node) && self.liveliness_token.is_some()
+    }
+
     pub fn is_unused(&self) -> bool {
         !self.is_serving_local_node() && !self.is_serving_remote_route()
     }
 }
 
-fn route_zenoh_message_to_dds(s: Sample, ros2_name: &str, data_writer: dds_entity_t) {
+fn route_zenoh_message_to_dds(
+    s: Sample,
+    ros2_name: &str,
+    data_writer: dds_entity_t,
+    zenoh_to_dds: &Arc<Progress>,
+    receipts: &Receipts,
+) {
+    let mut progress = zenoh_to_dds.begin();
     if *LOG_PAYLOAD {
         tracing::debug!(
             "Route Subscriber (Zenoh:{} -> ROS:{}): routing message - payload: {:02x?}",
@@ -393,5 +420,9 @@ fn route_zenoh_message_to_dds(s: Sample, ros2_name: &str, data_writer: dds_entit
         }
 
         drop(Vec::from_raw_parts(ptr, len, capacity));
+        progress.succeed();
+        if let Some(source) = s.source_info() {
+            receipts.record(*source.source_id());
+        }
     }
 }
