@@ -421,27 +421,63 @@ fn activate(
         true,
         qos.clone(),
     )?;
+    // Get the gid before publishing the Writer in the route's atomic: on any
+    // failure below, the created entities are deleted, their gids removed
+    // from ros_discovery_info and the atomics reset to NULL, so the route
+    // stays fully deactivated and the NULL guard permits a later retry.
+    let writer_gid = match get_guid(&dds_writer) {
+        Ok(gid) => gid,
+        Err(e) => {
+            if let Err(e2) = delete_dds_entity(dds_writer) {
+                tracing::warn!(
+                    "{route_id}: failed to delete DDS Reply Writer while rolling back a partial activation: {e2}"
+                );
+            }
+            return Err(e);
+        }
+    };
     let old = rep_writer.swap(dds_writer, Ordering::Relaxed);
     if old != DDS_ENTITY_NULL {
         tracing::warn!(
             "{route_id}: on activation their was already a DDS Reply Writer - overwrite it"
         );
+        // remove the overwritten Writer's gid from ros_discovery_info BEFORE
+        // deleting the entity (get_guid fails on a deleted entity, which
+        // would leak the gid entry forever)
+        match get_guid(&old) {
+            Ok(old_gid) => context.ros_discovery_mgr.remove_dds_writer(old_gid),
+            Err(e) => tracing::warn!(
+                "{route_id}: failed to unregister overwritten DDS Reply Writer from ros_discovery_info: {e}"
+            ),
+        }
         if let Err(e) = delete_dds_entity(old) {
             tracing::warn!("{route_id}: failed to delete overwritten DDS Reply Writer: {e}");
         }
     }
 
     // add writer's GID in ros_discovery_info message
-    context
-        .ros_discovery_mgr
-        .add_dds_writer(get_guid(&dds_writer)?);
+    context.ros_discovery_mgr.add_dds_writer(writer_gid);
+
+    // roll the Reply Writer back on a Reader creation failure: a Writer (and
+    // its advertised gid) must not survive a partially failed activation, or
+    // the req_reader NULL guard would allow a later retry to re-create a
+    // second Writer while the first one is still advertised
+    let rollback_writer = |failure: &str| {
+        rep_writer.store(DDS_ENTITY_NULL, Ordering::Relaxed);
+        context.ros_discovery_mgr.remove_dds_writer(writer_gid);
+        if let Err(e) = delete_dds_entity(dds_writer) {
+            tracing::warn!(
+                "{route_id}: failed to delete DDS Reply Writer while rolling back a partial activation ({failure}): {e}"
+            );
+        }
+    };
 
     // create DDS Reader to receive requests and route them to Zenoh
     let req_topic_name = format!("rq{}Request", ros2_name);
     let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
     let zquerier = zenoh_querier.clone();
     let route_id2 = route_id.to_owned();
-    let dds_reader = create_dds_reader(
+    let dds_reader = match create_dds_reader(
         context.participant,
         req_topic_name,
         req_type_name,
@@ -452,21 +488,47 @@ fn activate(
         move |sample| {
             route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
         },
-    )?;
+    ) {
+        Ok(reader) => reader,
+        Err(e) => {
+            rollback_writer("Request Reader creation failed");
+            return Err(e);
+        }
+    };
+    // Same discipline as for the Writer: gid first, swap-in only on success.
+    // Previously the Reader was stored before get_guid(), so a gid failure
+    // left the route stuck "already activated" with no gid advertised.
+    let reader_gid = match get_guid(&dds_reader) {
+        Ok(gid) => gid,
+        Err(e) => {
+            if let Err(e2) = delete_dds_entity(dds_reader) {
+                tracing::warn!(
+                    "{route_id}: failed to delete DDS Request Reader while rolling back a partial activation: {e2}"
+                );
+            }
+            rollback_writer("Request Reader gid lookup failed");
+            return Err(e);
+        }
+    };
     let old = req_reader.swap(dds_reader, Ordering::Relaxed);
     if old != DDS_ENTITY_NULL {
         tracing::warn!(
             "{route_id}: on activation their was already a DDS Request Reader - overwrite it"
         );
+        // same as for the Writer: unregister the gid before deleting
+        match get_guid(&old) {
+            Ok(old_gid) => context.ros_discovery_mgr.remove_dds_reader(old_gid),
+            Err(e) => tracing::warn!(
+                "{route_id}: failed to unregister overwritten DDS Request Reader from ros_discovery_info: {e}"
+            ),
+        }
         if let Err(e) = delete_dds_entity(old) {
             tracing::warn!("{route_id}: failed to delete overwritten DDS Request Reader: {e}");
         }
     }
 
     // add reader's GID in ros_discovery_info message
-    context
-        .ros_discovery_mgr
-        .add_dds_reader(get_guid(&dds_reader)?);
+    context.ros_discovery_mgr.add_dds_reader(reader_gid);
 
     Ok(())
 }

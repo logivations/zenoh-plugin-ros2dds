@@ -533,16 +533,41 @@ fn activate_dds_reader(
             }
         },
     )?;
+    // Get the gid before publishing the Reader in the route's atomic: if the
+    // lookup fails, roll the entity back so the route stays deactivated and
+    // the NULL guard permits a later retry. Previously the Reader was stored
+    // first, leaving the route stuck "already activated" with no gid
+    // advertised in ros_discovery_info.
+    let reader_gid = match get_guid(&reader) {
+        Ok(gid) => gid,
+        Err(e) => {
+            if let Err(e2) = delete_dds_entity(reader) {
+                tracing::warn!(
+                    "{route_id}: failed to delete DDS Reader while rolling back a partial activation: {e2}"
+                );
+            }
+            return Err(e);
+        }
+    };
     let old = dds_reader.deref().swap(reader, Ordering::Relaxed);
-    // add reader's GID in ros_discovery_info message
-    context.ros_discovery_mgr.add_dds_reader(get_guid(&reader)?);
-
     if old != DDS_ENTITY_NULL {
         tracing::warn!("{route_id}: on activation their was already a DDS Reader - overwrite it");
+        // remove the overwritten Reader's gid from ros_discovery_info BEFORE
+        // deleting the entity (get_guid fails on a deleted entity, which
+        // would leak the gid entry forever)
+        match get_guid(&old) {
+            Ok(old_gid) => context.ros_discovery_mgr.remove_dds_reader(old_gid),
+            Err(e) => tracing::warn!(
+                "{route_id}: failed to unregister overwritten DDS Reader from ros_discovery_info: {e}"
+            ),
+        }
         if let Err(e) = delete_dds_entity(old) {
             tracing::warn!("{route_id}: failed to delete overwritten DDS Reader: {e}");
         }
     }
+
+    // add reader's GID in ros_discovery_info message
+    context.ros_discovery_mgr.add_dds_reader(reader_gid);
 
     Ok(())
 }
