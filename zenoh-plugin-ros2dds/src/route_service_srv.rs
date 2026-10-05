@@ -83,7 +83,7 @@ pub struct RouteServiceSrv {
     sequence_number: Arc<AtomicU64>,
     // queries waiting for a reply
     #[serde(skip)]
-    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>>,
+    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, PendingQuery>>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -175,7 +175,7 @@ impl RouteServiceSrv {
         );
 
         // map of queries in progress
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
+        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, PendingQuery>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         // create DDS Reader to receive replies and route them to Zenoh
@@ -240,7 +240,7 @@ impl RouteServiceSrv {
 
         // create the zenoh Queryable
         // if Reader is TRANSIENT_LOCAL, use a PublicationCache to store historical data
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
+        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, PendingQuery>>> =
             self.queries_in_progress.clone();
         let sequence_number: Arc<AtomicU64> = self.sequence_number.clone();
         let route_id: String = self.to_string();
@@ -356,12 +356,14 @@ impl RouteServiceSrv {
 
 fn route_zenoh_request_to_dds(
     query: Query,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &mut HashMap<CddsRequestHeader, PendingQuery>,
     sequence_number: &AtomicU64,
     route_id: &str,
     client_guid: u64,
     req_writer: i32,
 ) {
+    let pending = PendingQuery(Some(query));
+    let query = pending.0.as_ref().unwrap();
     // Get expected endianness from the query value:
     // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
     let is_little_endian = match query.payload() {
@@ -429,26 +431,26 @@ fn route_zenoh_request_to_dds(
         );
     }
 
-    queries_in_progress.insert(request_id, query);
+    queries_in_progress.insert(request_id, pending);
     if let Err(e) = dds_write(req_writer, dds_req_buf) {
         tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
         queries_in_progress.remove(&request_id);
     }
 }
 
-// Rejected or revoked replies must not run Query::drop() on a DDS/runtime
-// thread: finalizing a query can wait for the same congested transport. The
-// worker takes the Query before replying, preserving normal finalization for
-// sends that actually run.
-struct PendingReply(Option<Query>);
+// A query remains pending while awaiting DDS or a send worker. Discard on
+// rejection, DDS write failure, replacement or retirement must not send a final
+// response on the caller thread. Only the send worker takes the Query out and
+// restores normal finalization before replying.
+struct PendingQuery(Option<Query>);
 
-impl PendingReply {
+impl PendingQuery {
     fn into_query(mut self) -> Query {
         self.0.take().unwrap()
     }
 }
 
-impl Drop for PendingReply {
+impl Drop for PendingQuery {
     fn drop(&mut self) {
         if let Some(query) = self.0.take() {
             query.discard();
@@ -459,7 +461,7 @@ impl Drop for PendingReply {
 fn route_dds_reply_to_zenoh(
     sample: &DDSRawSample,
     zenoh_key_expr: OwnedKeyExpr,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &mut HashMap<CddsRequestHeader, PendingQuery>,
     route_id: &str,
     sender: &ZenohSender,
 ) {
@@ -505,9 +507,8 @@ fn route_dds_reply_to_zenoh(
             }
 
             let owned_route_id = route_id.to_string();
-            let pending_reply = PendingReply(Some(query));
             sender.send(route_id, move || {
-                let query = pending_reply.into_query();
+                let query = query.into_query();
                 if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
                     tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
                 }
@@ -544,7 +545,7 @@ mod send_tests {
                     .timeout(Duration::from_secs(1))
                     .await
                     .unwrap();
-                let pending = PendingReply(Some(queryable.recv_async().await.unwrap()));
+                let pending = PendingQuery(Some(queryable.recv_async().await.unwrap()));
                 let queue = ZenohSendQueue::new();
                 let (release, released) = mpsc::channel();
                 if reject {
