@@ -29,7 +29,7 @@ that service failing; recovery without any bridge restart counts as healthy.
 Entirely local: docker only, isolated internal network, no production access.
 
 Example:
-  python3 tools/w2_repro.py --phase native --binary /eng/stand100/bin/picks2-<sha> \
+  python3 tools/w2_repro.py --phase native --binary <path-to-zenoh-bridge-ros2dds> \
       --attempts 3 --output /tmp/w2-native
   python3 tools/w2_repro.py --phase churn --binary ... --runs 10 --output /tmp/w2-churn
 """
@@ -439,7 +439,7 @@ def main():
     ap.add_argument("--image", default="quay.io/logivations/ml_all:latest")
     ap.add_argument("--prefix", default="picks2-w2-")
     ap.add_argument("--domain", type=int, default=147)
-    ap.add_argument("--zenoh-py", default="/data/RTDTK-1026-engineering/detector/lab/zenoh_py",
+    ap.add_argument("--zenoh-py", required=True,
                     help="dir with the python zenoh package (native queryable)")
     ap.add_argument("--ros-setup", default="/code/ros2_ws/install/setup.bash")
     ap.add_argument("--attempts", type=int, default=3, help="native attempts")
