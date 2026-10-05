@@ -184,21 +184,23 @@ mod ros_discovery_probe {
                     .into_raw();
                 let topic = cdds_create_blob_topic(participant, cton, ctyn, true);
                 assert!(topic > 0, "failed to create probe blob topic");
-                let mut qos = Qos::default();
-                qos.durability = Some(Durability {
-                    kind: DurabilityKind::TRANSIENT_LOCAL,
-                });
-                qos.reliability = Some(Reliability {
-                    kind: ReliabilityKind::RELIABLE,
-                    max_blocking_time: DDS_INFINITE_TIME,
-                });
-                // KEEP_ALL: the topic is keyless (single instance), so a
-                // KEEP_LAST reader would let the r2r participant's sample
-                // evict the bridge's one before the probe takes it
-                qos.history = Some(History {
-                    kind: HistoryKind::KEEP_ALL,
-                    depth: 0,
-                });
+                let qos = Qos {
+                    durability: Some(Durability {
+                        kind: DurabilityKind::TRANSIENT_LOCAL,
+                    }),
+                    reliability: Some(Reliability {
+                        kind: ReliabilityKind::RELIABLE,
+                        max_blocking_time: DDS_INFINITE_TIME,
+                    }),
+                    // KEEP_ALL: the topic is keyless (single instance), so a
+                    // KEEP_LAST reader would let the r2r participant's sample
+                    // evict the bridge's one before the probe takes it.
+                    history: Some(History {
+                        kind: HistoryKind::KEEP_ALL,
+                        depth: 0,
+                    }),
+                    ..Qos::default()
+                };
                 let qos_native = qos.to_qos_native();
                 let reader = dds_create_reader(participant, topic, qos_native, std::ptr::null());
                 Qos::delete_qos_native(qos_native);
