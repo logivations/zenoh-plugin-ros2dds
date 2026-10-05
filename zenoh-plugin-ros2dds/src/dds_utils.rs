@@ -14,7 +14,10 @@
 use std::{
     ffi::{CStr, CString},
     mem::MaybeUninit,
-    sync::{atomic::AtomicI32, Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     time::Duration,
 };
 
@@ -54,12 +57,15 @@ pub type AtomicDDSEntity = AtomicI32;
 /// callback that could itself be blocked on this lock.
 pub struct RouteLiveness {
     live: Mutex<bool>,
+    // whether the poisoned-lock recovery was already logged for this route
+    poison_logged: AtomicBool,
 }
 
 impl RouteLiveness {
     pub fn new() -> Arc<Self> {
         Arc::new(RouteLiveness {
             live: Mutex::new(true),
+            poison_logged: AtomicBool::new(false),
         })
     }
 
@@ -82,8 +88,17 @@ impl RouteLiveness {
 
     fn lock(&self) -> MutexGuard<'_, bool> {
         // A poisoned lock only means some closure panicked mid-activation;
-        // the liveness flag itself remains meaningful.
-        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+        // the liveness flag itself remains meaningful, so recover and
+        // continue - but say so once at error level, since the panicking
+        // closure may have left a partial activation behind.
+        self.live.lock().unwrap_or_else(|poison| {
+            if !self.poison_logged.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "route liveness lock poisoned by a panic in an activation/deactivation closure; recovering and continuing with the current liveness state"
+                );
+            }
+            PoisonError::into_inner(poison)
+        })
     }
 }
 
