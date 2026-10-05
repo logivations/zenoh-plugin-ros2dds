@@ -34,6 +34,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # RTDTK-1026 transport pin guard: the [patch.crates-io] block in Cargo.toml must
+      # stay effective. If a future `cargo update` moves the umbrella crates off =1.10.1,
+      # the patch silently becomes unused and the build succeeds WITHOUT the transport
+      # fixes — so fail fast if the lock loses the patched source.
+      - name: Guard the patched zenoh transport source
+        shell: bash
+        run: |
+          srcs=$(grep -A2 '^name = "zenoh-transport"$' Cargo.lock | grep '^source = ' || true)
+          echo "zenoh-transport sources in Cargo.lock: ${srcs:-<none>}"
+          grep -q 'git+https://github.com/logivations/zenoh' <<< "$srcs" || { echo '::error::Cargo.lock lost the patched zenoh transport source (logivations/zenoh git pin, RTDTK-1026)'; exit 1; }
+          grep -q 'registry+' <<< "$srcs" && { echo '::error::a registry-sourced zenoh-transport is back in Cargo.lock'; exit 1; } || true
+
       - name: Install ACL
         if: startsWith(matrix.os,'ubuntu')
         run: sudo apt-get -y install libacl1-dev
