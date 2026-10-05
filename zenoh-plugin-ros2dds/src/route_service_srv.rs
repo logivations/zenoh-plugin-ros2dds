@@ -179,7 +179,7 @@ impl RouteServiceSrv {
             Arc::new(RwLock::new(HashMap::new()));
 
         // create DDS Reader to receive replies and route them to Zenoh
-        let send_queue = ZenohSendQueue::new();
+        let send_queue = ZenohSendQueue::new(context.service_send_budget.clone());
         let rep_topic_name = format!("rr{ros2_name}Reply");
         let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
         let rep_reader = create_dds_reader(
@@ -485,7 +485,7 @@ fn route_dds_reply_to_zenoh(
             }
 
             let owned_route_id = route_id.to_string();
-            sender.send(route_id, move || {
+            sender.send(route_id, zenoh_rep_buf.len(), move || {
                 if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
                     tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
                 }

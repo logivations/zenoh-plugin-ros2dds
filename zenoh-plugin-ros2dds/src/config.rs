@@ -11,7 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::{env, fmt, time::Duration};
+use std::{env, fmt, num::NonZeroUsize, time::Duration};
 
 use regex::Regex;
 use serde::{de, de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
@@ -65,6 +65,8 @@ pub struct Config {
     pub transient_local_cache_multiplier: usize,
     #[serde(default = "default_queries_timeout")]
     pub queries_timeout: Option<QueriesTimeouts>,
+    #[serde(default = "default_service_send_queue_max_bytes")]
+    pub service_send_queue_max_bytes: NonZeroUsize,
     #[serde(default = "default_reliable_routes_blocking")]
     pub reliable_routes_blocking: bool,
     #[serde(
@@ -411,6 +413,10 @@ fn default_queries_timeout() -> Option<QueriesTimeouts> {
 
 fn default_queries_timeout_default() -> f32 {
     DEFAULT_QUERIES_TIMEOUT
+}
+
+fn default_service_send_queue_max_bytes() -> NonZeroUsize {
+    NonZeroUsize::new(64 * 1024 * 1024).unwrap()
 }
 
 fn default_actions_timeout() -> Option<ActionsTimeouts> {
