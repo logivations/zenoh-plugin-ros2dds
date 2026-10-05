@@ -63,3 +63,38 @@ debug = false
 lto = "fat"
 opt-level = 3
 panic = "abort"
+
+# zenoh 1.10.1 + ros2dds-1.10.1-tf3 picks + logivations/zenoh@6e1febef (branch
+# fix/rx-push-blocked-peer-tf3): RX threads waiting for a closing transport's queue lock
+# give up instead of waiting wait_before_close one after another.
+[patch.crates-io]
+zenoh = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-buffers = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-codec = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-collections = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-config = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-core = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-crypto = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-ext = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-keyexpr = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-commons = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-quic = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-quic_datagram = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-tcp = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-tls = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-udp = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-unixsock_stream = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-link-ws = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-macros = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-plugin-rest = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-plugin-trait = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-protocol = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-result = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-runtime = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-shm = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-stats = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-sync = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-task = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-transport = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
+zenoh-util = { git = "https://github.com/logivations/zenoh.git", rev = "6e1febefa7986731582e9ae708ec47ee42fddb4f" }
