@@ -570,3 +570,86 @@ mod bench_undiscovered_staging {
         }
     }
 }
+
+// Regression tests for the #713 pick: gids declared by a graph announcement
+// but not yet discovered on DDS are staged exactly once per node.
+#[cfg(test)]
+mod undiscovered_staging_tests {
+    use std::collections::HashMap;
+
+    use cyclors::qos::Qos;
+
+    use super::DiscoveredEntities;
+    use crate::{
+        dds_discovery::DdsEntity, gid::Gid, node_info::NodeInfo, ros_discovery::NodeEntitiesInfo,
+    };
+
+    fn test_gid(i: u64, salt: u8) -> Gid {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b[8] = salt;
+        b[15] = 1;
+        Gid::from(b)
+    }
+
+    #[test]
+    fn repeated_node_info_does_not_duplicate_staged_gids() {
+        const N: u64 = 10;
+        let mut info = NodeEntitiesInfo::new("/".to_string(), "cam".to_string());
+        for i in 0..N {
+            info.reader_gid_seq.insert(test_gid(i, 2));
+            info.writer_gid_seq.insert(test_gid(i, 3));
+        }
+        let mut node =
+            NodeInfo::create("/".to_string(), "cam".to_string(), test_gid(999, 9)).unwrap();
+        let mut readers: HashMap<Gid, DdsEntity> = HashMap::new();
+        let mut writers: HashMap<Gid, DdsEntity> = HashMap::new();
+
+        // the same announcement processed twice must not duplicate the
+        // staged undiscovered gids (readers and writers)
+        for round in 1..=2 {
+            let events =
+                DiscoveredEntities::update_node_info(&mut node, &info, &mut readers, &mut writers);
+            assert!(events.is_empty(), "round {round}: no endpoint discovered");
+            assert_eq!(node.undiscovered_reader.len(), N as usize, "round {round}");
+            assert_eq!(node.undiscovered_writer.len(), N as usize, "round {round}");
+        }
+    }
+
+    #[test]
+    fn discovered_gid_leaves_staging() {
+        let participant = test_gid(77, 9);
+        let reader_gid = test_gid(1, 2);
+
+        // stage one undiscovered reader gid via a graph announcement
+        let mut info = NodeEntitiesInfo::new("/".to_string(), "cam".to_string());
+        info.reader_gid_seq.insert(reader_gid);
+        let mut node = NodeInfo::create("/".to_string(), "cam".to_string(), participant).unwrap();
+        let mut readers: HashMap<Gid, DdsEntity> = HashMap::new();
+        let mut writers: HashMap<Gid, DdsEntity> = HashMap::new();
+        DiscoveredEntities::update_node_info(&mut node, &info, &mut readers, &mut writers);
+        assert_eq!(node.undiscovered_reader, vec![reader_gid]);
+
+        // when the DDS Reader with that gid is discovered, the gid must
+        // leave the staging list and produce the discovery event
+        let fullname = node.fullname().to_string();
+        let mut entities = DiscoveredEntities::default();
+        entities
+            .nodes_info
+            .insert(participant, HashMap::from([(fullname.clone(), node)]));
+
+        let event = entities.add_reader(DdsEntity {
+            key: reader_gid,
+            participant_key: participant,
+            topic_name: "rt/detections".to_string(),
+            type_name: "std_msgs::msg::dds_::String_".to_string(),
+            _type_info: None,
+            keyless: true,
+            qos: Qos::default(),
+        });
+        assert!(event.is_some(), "a complete Subscriber must be discovered");
+
+        let node = &entities.nodes_info[&participant][&fullname];
+        assert!(node.undiscovered_reader.is_empty());
+    }
+}

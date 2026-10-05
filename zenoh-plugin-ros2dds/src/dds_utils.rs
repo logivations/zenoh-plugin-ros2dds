@@ -434,3 +434,106 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod route_liveness_tests {
+    use std::{
+        sync::mpsc::{channel, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+
+    use super::RouteLiveness;
+
+    // The only time-based wait in these tests: a negative check asserting
+    // that retire() did NOT complete. It is false-pass-safe: if retire()
+    // wrongly returned early, the "retired" message would arrive within the
+    // window and the assertion would fail.
+    const NEGATIVE_CHECK: Duration = Duration::from_millis(50);
+    // Generous bound for positive waits (events that must happen).
+    const POSITIVE_WAIT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn retire_blocks_until_in_flight_if_live_closure_finishes() {
+        let liveness = RouteLiveness::new();
+
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let (closure_done_tx, closure_done_rx) = channel();
+
+        let worker = {
+            let liveness = liveness.clone();
+            thread::spawn(move || {
+                let ran = liveness.if_live(|| {
+                    entered_tx.send(()).unwrap();
+                    // hold the critical section until the test releases it
+                    release_rx.recv().unwrap();
+                    closure_done_tx.send(()).unwrap();
+                });
+                assert!(ran.is_some(), "route was live, the closure must run");
+            })
+        };
+
+        // wait until the closure is inside the critical section
+        entered_rx.recv_timeout(POSITIVE_WAIT).unwrap();
+
+        let (retired_tx, retired_rx) = channel();
+        let retirer = {
+            let liveness = liveness.clone();
+            thread::spawn(move || {
+                liveness.retire();
+                retired_tx.send(()).unwrap();
+            })
+        };
+
+        // retire() must NOT complete while the closure holds the section
+        assert_eq!(
+            retired_rx.recv_timeout(NEGATIVE_CHECK),
+            Err(RecvTimeoutError::Timeout),
+            "retire() returned while an if_live closure was still running"
+        );
+
+        // release the closure: it must finish, then retire() must complete
+        release_tx.send(()).unwrap();
+        closure_done_rx.recv_timeout(POSITIVE_WAIT).unwrap();
+        retired_rx.recv_timeout(POSITIVE_WAIT).unwrap();
+
+        worker.join().unwrap();
+        retirer.join().unwrap();
+
+        // once retired, if_live never runs its closure again
+        assert!(liveness.if_live(|| ()).is_none());
+    }
+
+    #[test]
+    fn if_live_after_retire_returns_none_without_running_the_closure() {
+        let liveness = RouteLiveness::new();
+        assert_eq!(liveness.if_live(|| 42), Some(42));
+
+        liveness.retire();
+
+        let mut ran = false;
+        assert!(liveness.if_live(|| ran = true).is_none());
+        assert!(!ran, "closure must not run after retirement");
+    }
+
+    #[test]
+    fn poisoned_lock_recovers_without_panicking() {
+        let liveness = RouteLiveness::new();
+
+        // a panicking closure poisons the liveness mutex
+        let panicker = {
+            let liveness = liveness.clone();
+            thread::spawn(move || {
+                let _ = liveness.if_live(|| panic!("poison the liveness lock"));
+            })
+        };
+        assert!(panicker.join().is_err(), "the closure must have panicked");
+
+        // the poisoned lock is recovered: the liveness state stays
+        // meaningful, and neither if_live nor retire panics
+        assert_eq!(liveness.if_live(|| 7), Some(7));
+        liveness.retire();
+        assert!(liveness.if_live(|| ()).is_none());
+    }
+}
