@@ -16,7 +16,10 @@ use std::{
     collections::HashSet,
     fmt,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -541,8 +544,12 @@ fn activate_dds_reader(
         {
             let route_id = route_id.to_string();
             let publisher = publisher.clone();
+            // per-route flag throttling the publish-failure log (see
+            // route_dds_message_to_zenoh); a fresh activation starts with
+            // error-level logging again
+            let publish_failing = Arc::new(AtomicBool::new(false));
             move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(sample, &publisher, &route_id);
+                route_dds_message_to_zenoh(sample, &publisher, &route_id, &publish_failing);
             }
         },
     )?;
@@ -608,13 +615,34 @@ fn route_dds_message_to_zenoh(
     sample: &DDSRawSample,
     publisher: &Arc<AdvancedPublisher>,
     route_id: &str,
+    publish_failing: &AtomicBool,
 ) {
     if *LOG_PAYLOAD {
         tracing::debug!("{route_id}: routing message - payload: {:02x?}", sample);
     } else {
         tracing::trace!("{route_id}: routing message - {} bytes", sample.len());
     }
-    if let Err(e) = publisher.put(sample).wait() {
-        tracing::error!("{route_id}: failed to route message: {e}");
+    match publisher.put(sample).wait() {
+        Err(e) => {
+            // A closed/unresponsive peer fails EVERY sample: log the first
+            // failure at error level and the follow-ups at debug until a
+            // publication succeeds again, instead of flooding the log at
+            // the route's publication rate.
+            if !publish_failing.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "{route_id}: failed to route message: {e} - follow-up failures are logged at debug level until a publication succeeds"
+                );
+            } else {
+                tracing::debug!("{route_id}: failed to route message: {e}");
+            }
+        }
+        Ok(()) => {
+            if publish_failing.load(Ordering::Relaxed) {
+                publish_failing.store(false, Ordering::Relaxed);
+                tracing::debug!(
+                    "{route_id}: routing messages succeeds again - resuming error-level logging for future failures"
+                );
+            }
+        }
     }
 }
