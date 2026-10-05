@@ -9,6 +9,8 @@
 // SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
 //
 
+use std::sync::{Arc, Mutex};
+
 use tokio::task::JoinHandle;
 
 use crate::spawn_runtime;
@@ -32,6 +34,7 @@ type ZenohSend = Box<dyn FnOnce() + Send + 'static>;
 pub(crate) struct ZenohSendQueue {
     sender: flume::Sender<ZenohSend>,
     worker: JoinHandle<()>,
+    generation: Arc<Mutex<u64>>,
 }
 
 impl ZenohSendQueue {
@@ -45,27 +48,76 @@ impl ZenohSendQueue {
                 }
             }
         });
-        ZenohSendQueue { sender, worker }
+        ZenohSendQueue {
+            sender,
+            worker,
+            generation: Arc::new(Mutex::new(0)),
+        }
     }
 
     pub(crate) fn sender(&self) -> ZenohSender {
-        ZenohSender(self.sender.clone())
+        ZenohSender {
+            sender: self.sender.clone(),
+            generation: SendGeneration {
+                current: self.generation.clone(),
+                expected: *self.generation.lock().unwrap_or_else(|e| e.into_inner()),
+            },
+        }
+    }
+
+    /// Revoke queued work and reply callbacks before deleting DDS resources.
+    /// Does not wait for a blocking Zenoh send that has already started.
+    pub(crate) fn invalidate(&self) {
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 }
 
 impl Drop for ZenohSendQueue {
     fn drop(&mut self) {
+        self.invalidate();
         self.worker.abort();
     }
 }
 
 /// Queues sends for a [`ZenohSendQueue`] without ever blocking the caller.
 #[derive(Clone)]
-pub(crate) struct ZenohSender(flume::Sender<ZenohSend>);
+pub(crate) struct ZenohSender {
+    sender: flume::Sender<ZenohSend>,
+    pub(crate) generation: SendGeneration,
+}
+
+// A callback retains only the generation, never a Sender that would keep
+// its own queue alive through a queued closure.
+#[derive(Clone)]
+pub(crate) struct SendGeneration {
+    current: Arc<Mutex<u64>>,
+    expected: u64,
+}
+
+impl SendGeneration {
+    /// Serialize DDS reply access with invalidation. Never hold this guard
+    /// across a blocking Zenoh send or DDS entity deletion.
+    pub(crate) fn if_current<R>(&self, op: impl FnOnce() -> R) -> Option<R> {
+        let generation = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if *generation == self.expected {
+            Some(op())
+        } else {
+            None
+        }
+    }
+}
 
 impl ZenohSender {
     pub(crate) fn send(&self, route_id: &str, send: impl FnOnce() + Send + 'static) {
-        match self.0.try_send(Box::new(send)) {
+        let generation = self.generation.clone();
+        match self.sender.try_send(Box::new(move || {
+            // Claim on the blocking worker, not when queued: aborting its
+            // async parent cannot cancel a queued spawn_blocking closure.
+            // Once claimed it is in flight; its DDS reply needs its own guard.
+            if generation.if_current(|| ()).is_some() {
+                send();
+            }
+        })) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(_)) => tracing::warn!(
                 "{route_id}: {MAX_PENDING_SENDS} sends to Zenoh are still pending (congested destination?) - dropping this one"
@@ -170,5 +222,112 @@ mod tests {
         drop(done);
         let run: Vec<usize> = sends_done.iter().take(MAX_PENDING_SENDS + 5).collect();
         assert_eq!(run, (0..MAX_PENDING_SENDS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn drop_revokes_send_waiting_for_blocking_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let (release, released) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
+        let blocker = rt.spawn_blocking(move || {
+            ready.send(()).unwrap();
+            released.recv_timeout(WAIT).unwrap();
+        });
+        started.recv_timeout(WAIT).unwrap();
+        let queue = ZenohSendQueue::new();
+        let (sent, received) = mpsc::channel();
+        queue.sender().send("route", move || {
+            sent.send(()).unwrap();
+        });
+        let deadline = Instant::now() + WAIT;
+        while !queue.sender.is_empty() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(queue.sender.is_empty(), "worker must dequeue the send");
+        let worker = queue.worker.abort_handle();
+        drop(queue);
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(worker.is_finished());
+        release.send(()).unwrap();
+        rt.block_on(blocker).unwrap();
+        assert!(matches!(
+            received.recv_timeout(WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn reactivation_discards_old_sends_and_reply_access() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let queue = ZenohSendQueue::new();
+        let old = queue.sender();
+        let (release, released) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
+        old.send("route", move || {
+            ready.send(()).unwrap();
+            released.recv_timeout(WAIT).unwrap();
+        });
+        started.recv_timeout(WAIT).unwrap();
+        let (sent, received) = mpsc::channel();
+        let stale_sent = sent.clone();
+        old.send("route", move || {
+            stale_sent.send("stale").unwrap();
+        });
+        queue.invalidate(); // deactivation must not wait for the blocked send
+        assert!(old
+            .generation
+            .if_current(|| panic!("stale reply reached DDS"))
+            .is_none());
+        let current = queue.sender();
+        assert_eq!(current.generation.if_current(|| 42), Some(42));
+        current.send("route", move || {
+            sent.send("current").unwrap();
+        });
+        release.send(()).unwrap();
+        assert_eq!(received.recv_timeout(WAIT).unwrap(), "current");
+        assert!(matches!(
+            received.recv_timeout(WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn invalidation_waits_for_in_flight_dds_reply_access() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let queue = Arc::new(ZenohSendQueue::new());
+        let generation = queue.sender().generation;
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let reply = std::thread::spawn(move || {
+            generation.if_current(|| {
+                entered.send(()).unwrap();
+                released.recv_timeout(WAIT).unwrap();
+            })
+        });
+        entering.recv_timeout(WAIT).unwrap();
+        let (done, invalidated) = mpsc::channel();
+        let retiring = queue.clone();
+        let retire = std::thread::spawn(move || {
+            retiring.invalidate();
+            done.send(()).unwrap();
+        });
+        assert!(matches!(
+            invalidated.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.send(()).unwrap();
+        assert!(reply.join().unwrap().is_some());
+        invalidated.recv_timeout(WAIT).unwrap();
+        retire.join().unwrap();
     }
 }

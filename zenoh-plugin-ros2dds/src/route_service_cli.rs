@@ -100,7 +100,7 @@ pub struct RouteServiceCli {
     // sends the requests to Zenoh outside of the DDS listener; re-activation
     // hands fresh senders to the re-created DDS Reader
     #[serde(skip)]
-    send_queue: ZenohSendQueue,
+    send_queue: Arc<ZenohSendQueue>,
 }
 
 impl Drop for RouteServiceCli {
@@ -161,7 +161,7 @@ impl RouteServiceCli {
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let liveness = RouteLiveness::new();
-        let send_queue = ZenohSendQueue::new();
+        let send_queue = Arc::new(ZenohSendQueue::new());
 
         let matching_listener = zenoh_querier
             .matching_listener()
@@ -174,7 +174,7 @@ impl RouteServiceCli {
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
                 let type_info = type_info.clone();
-                let sender = send_queue.sender();
+                let send_queue = send_queue.clone();
 
                 move |status| {
                     // Activation/deactivation happens inside the liveness
@@ -203,7 +203,7 @@ impl RouteServiceCli {
                                 &context,
                                 &type_info,
                                 &zquerier,
-                                &sender,
+                                &send_queue,
                             ) {
                                 tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                             }
@@ -213,6 +213,7 @@ impl RouteServiceCli {
                                 &req_reader,
                                 &route_id,
                                 &context.ros_discovery_mgr,
+                                &send_queue,
                             )
                         }
                     });
@@ -286,6 +287,7 @@ impl RouteServiceCli {
             &self.req_reader,
             &route_id,
             &self.context.ros_discovery_mgr,
+            &self.send_queue,
         );
     }
 
@@ -306,7 +308,6 @@ impl RouteServiceCli {
                 }
                 let route_id = self.to_string();
                 tracing::debug!("{route_id}: re-activate");
-                let sender = self.send_queue.sender();
                 activate(
                     &self.rep_writer,
                     &self.req_reader,
@@ -316,7 +317,7 @@ impl RouteServiceCli {
                     &self.context,
                     &self.type_info,
                     &self.zenoh_querier,
-                    &sender,
+                    &self.send_queue,
                 )
             })
             // after retirement there is nothing left to re-activate
@@ -420,7 +421,7 @@ fn activate(
     context: &Context,
     type_info: &Option<Arc<TypeInfo>>,
     zenoh_querier: &Arc<Querier<'static>>,
-    sender: &ZenohSender,
+    send_queue: &ZenohSendQueue,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: activate");
     // Default Service QoS
@@ -488,6 +489,7 @@ fn activate(
     // the req_reader NULL guard would allow a later retry to re-create a
     // second Writer while the first one is still advertised
     let rollback_writer = |failure: &str| {
+        send_queue.invalidate();
         rep_writer.store(DDS_ENTITY_NULL, Ordering::Relaxed);
         context.ros_discovery_mgr.remove_dds_writer(writer_gid);
         if let Err(e) = delete_dds_entity(dds_writer) {
@@ -502,7 +504,7 @@ fn activate(
     let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
     let zquerier = zenoh_querier.clone();
     let route_id2 = route_id.to_owned();
-    let sender = sender.clone();
+    let sender = send_queue.sender();
     let dds_reader = match create_dds_reader(
         context.participant,
         req_topic_name,
@@ -564,8 +566,10 @@ fn deactivate(
     req_reader: &Arc<AtomicDDSEntity>,
     route_id: &str,
     ros_discovery_mgr: &Arc<RosDiscoveryInfoMgr>,
+    send_queue: &ZenohSendQueue,
 ) {
     tracing::debug!("{route_id}: Deactivate");
+    send_queue.invalidate();
     let req_reader = req_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
     if req_reader != DDS_ENTITY_NULL {
         // remove reader's GID from ros_discovery_info message
@@ -637,6 +641,7 @@ fn route_dds_request_to_zenoh(
     }
 
     let querier = querier.clone();
+    let reply_generation = sender.generation.clone();
     let owned_route_id = route_id.to_string();
     sender.send(route_id, move || {
         let route_id = owned_route_id;
@@ -652,7 +657,9 @@ fn route_dds_request_to_zenoh(
                 CallbackDrop {
                     callback: move |reply| {
                             if !reply_received1.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer)
+                                reply_generation.if_current(|| {
+                                    route_zenoh_reply_to_dds(&route_id1, reply, request_id, rep_writer)
+                                });
                             } else {
                                 tracing::warn!("{route_id1}: received more than 1 reply for request {request_id} - dropping the extra replies");
                             }

@@ -98,6 +98,7 @@ pub struct RouteServiceSrv {
 
 impl Drop for RouteServiceSrv {
     fn drop(&mut self) {
+        self._send_queue.invalidate();
         // remove writer's GID from ros_discovery_info message
         match get_guid(&self.req_writer) {
             Ok(gid) => self.context.ros_discovery_mgr.remove_dds_writer(gid),
