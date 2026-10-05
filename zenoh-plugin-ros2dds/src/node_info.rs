@@ -637,16 +637,16 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredMsgPub;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.msg_pub.entry(name.into()) {
             Entry::Vacant(e) => match MsgPub::create(name.into(), typ, *writer) {
                 Ok(t) => {
                     e.insert(t.clone());
-                    Some(DiscoveredMsgPub(node_fullname, t))
+                    Some(DiscoveredMsgPub(node_id, t))
                 }
                 Err(e) => {
                     tracing::error!(
-                        "ROS Node {node_fullname} declared an incompatible Publisher: {e} - ignored"
+                        "ROS Node {node_id} declared an incompatible Publisher: {e} - ignored"
                     );
                     None
                 }
@@ -656,12 +656,12 @@ impl NodeInfo {
                 let mut result: Option<ROS2DiscoveryEvent> = None;
                 if v.typ != typ {
                     tracing::error!(
-                        r#"ROS Node {node_fullname} declares 2 Publishers on same topic {name} but with different types: {} vs {typ} - Publisher with 2nd type ignored""#,
+                        r#"ROS Node {node_id} declares 2 Publishers on same topic {name} but with different types: {} vs {typ} - Publisher with 2nd type ignored""#,
                         v.typ
                     );
                 } else if v.writers.insert(*writer) && v.writers.len() == 1 {
                     // Send DiscoveredMsgPub event only for the 1st discovered Writer
-                    result = Some(DiscoveredMsgPub(node_fullname, v.clone()));
+                    result = Some(DiscoveredMsgPub(node_id, v.clone()));
                 }
                 result
             }
@@ -676,16 +676,16 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredMsgSub;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.msg_sub.entry(name.into()) {
             Entry::Vacant(e) => match MsgSub::create(name.into(), typ, *reader) {
                 Ok(t) => {
                     e.insert(t.clone());
-                    Some(DiscoveredMsgSub(node_fullname, t))
+                    Some(DiscoveredMsgSub(node_id, t))
                 }
                 Err(e) => {
                     tracing::error!(
-                        "ROS Node {node_fullname} declared an incompatible Subscriber: {e} - ignored"
+                        "ROS Node {node_id} declared an incompatible Subscriber: {e} - ignored"
                     );
                     None
                 }
@@ -695,12 +695,12 @@ impl NodeInfo {
                 let mut result: Option<ROS2DiscoveryEvent> = None;
                 if v.typ != typ {
                     tracing::error!(
-                        r#"ROS Node {node_fullname} declares 2 Subscriber on same topic {name} but with different types: {} vs {typ} - Publisher with 2nd type ignored""#,
+                        r#"ROS Node {node_id} declares 2 Subscriber on same topic {name} but with different types: {} vs {typ} - Publisher with 2nd type ignored""#,
                         v.typ
                     );
                 } else if v.readers.insert(*reader) && v.readers.len() == 1 {
                     // Send DiscoveredMsgSub event only for the 1st discovered Reader
-                    result = Some(DiscoveredMsgSub(node_fullname, v.clone()));
+                    result = Some(DiscoveredMsgSub(node_id, v.clone()));
                 }
                 result
             }
@@ -715,7 +715,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredServiceSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.service_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ServiceSrv::create(name.into(), typ) {
@@ -738,7 +738,7 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.req_reader != *reader {
@@ -750,7 +750,7 @@ impl NodeInfo {
                     }
                     v.entities.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -766,7 +766,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredServiceSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.service_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ServiceSrv::create(name.into(), typ) {
@@ -789,7 +789,7 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.rep_writer != *writer {
@@ -801,7 +801,7 @@ impl NodeInfo {
                     }
                     v.entities.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -817,7 +817,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredServiceCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.service_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ServiceCli::create(name.into(), typ) {
@@ -840,7 +840,7 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.rep_reader != *reader {
@@ -852,7 +852,7 @@ impl NodeInfo {
                     }
                     v.entities.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -868,7 +868,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredServiceCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.service_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ServiceCli::create(name.into(), typ) {
@@ -891,7 +891,7 @@ impl NodeInfo {
                     );
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredServiceCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.req_writer != *writer {
@@ -903,7 +903,7 @@ impl NodeInfo {
                     }
                     v.entities.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredServiceCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredServiceCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -919,7 +919,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), typ) {
@@ -944,7 +944,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.send_goal.req_reader != *reader {
@@ -956,7 +956,7 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -972,7 +972,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), typ) {
@@ -997,7 +997,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.send_goal.rep_writer != *writer {
@@ -1009,7 +1009,7 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1026,7 +1026,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), String::new()) {
@@ -1052,7 +1052,7 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1069,7 +1069,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), String::new()) {
@@ -1095,7 +1095,7 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1111,7 +1111,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), typ) {
@@ -1136,7 +1136,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.get_result.req_reader != *reader {
@@ -1148,7 +1148,7 @@ impl NodeInfo {
                     }
                     v.entities.get_result.req_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1164,7 +1164,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), typ) {
@@ -1189,7 +1189,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.get_result.rep_writer != *writer {
@@ -1201,7 +1201,7 @@ impl NodeInfo {
                     }
                     v.entities.get_result.rep_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1218,7 +1218,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), String::new()) {
@@ -1244,7 +1244,7 @@ impl NodeInfo {
                     }
                     v.entities.status_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1260,7 +1260,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionSrv;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_srv.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionSrv::create(name.into(), typ) {
@@ -1285,7 +1285,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.feedback_writer != *writer {
@@ -1297,7 +1297,7 @@ impl NodeInfo {
                     }
                     v.entities.feedback_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionSrv(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionSrv(node_id, v.clone()))
                     };
                 }
                 result
@@ -1313,7 +1313,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), typ) {
@@ -1338,7 +1338,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.send_goal.rep_reader != *reader {
@@ -1350,7 +1350,7 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1366,7 +1366,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), typ) {
@@ -1391,7 +1391,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.send_goal.req_writer != *writer {
@@ -1403,7 +1403,7 @@ impl NodeInfo {
                     }
                     v.entities.send_goal.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1420,7 +1420,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), String::new()) {
@@ -1446,7 +1446,7 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1463,7 +1463,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), String::new()) {
@@ -1489,7 +1489,7 @@ impl NodeInfo {
                     }
                     v.entities.cancel_goal.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1505,7 +1505,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), typ) {
@@ -1530,7 +1530,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.get_result.rep_reader != *reader {
@@ -1542,7 +1542,7 @@ impl NodeInfo {
                     }
                     v.entities.get_result.rep_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1558,7 +1558,7 @@ impl NodeInfo {
         writer: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), typ) {
@@ -1583,7 +1583,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.get_result.req_writer != *writer {
@@ -1595,7 +1595,7 @@ impl NodeInfo {
                     }
                     v.entities.get_result.req_writer = *writer;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1612,7 +1612,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), String::new()) {
@@ -1638,7 +1638,7 @@ impl NodeInfo {
                     }
                     v.entities.status_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1654,7 +1654,7 @@ impl NodeInfo {
         reader: &Gid,
     ) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::DiscoveredActionCli;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         match self.action_cli.entry(name.into()) {
             Entry::Vacant(e) => {
                 match ActionCli::create(name.into(), typ) {
@@ -1679,7 +1679,7 @@ impl NodeInfo {
                     }
                     v.typ = typ;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname.clone(), v.clone()))
+                        result = Some(DiscoveredActionCli(node_id.clone(), v.clone()))
                     };
                 }
                 if v.entities.feedback_reader != *reader {
@@ -1691,7 +1691,7 @@ impl NodeInfo {
                     }
                     v.entities.feedback_reader = *reader;
                     if v.is_complete() {
-                        result = Some(DiscoveredActionCli(node_fullname, v.clone()))
+                        result = Some(DiscoveredActionCli(node_id, v.clone()))
                     };
                 }
                 result
@@ -1702,26 +1702,26 @@ impl NodeInfo {
     //
     pub fn remove_all_entities(&mut self) -> Vec<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::*;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         let mut events = Vec::new();
 
         for (_, v) in self.msg_pub.drain() {
-            events.push(UndiscoveredMsgPub(node_fullname.clone(), v))
+            events.push(UndiscoveredMsgPub(node_id.clone(), v))
         }
         for (_, v) in self.msg_sub.drain() {
-            events.push(UndiscoveredMsgSub(node_fullname.clone(), v))
+            events.push(UndiscoveredMsgSub(node_id.clone(), v))
         }
         for (_, v) in self.service_srv.drain() {
-            events.push(UndiscoveredServiceSrv(node_fullname.clone(), v))
+            events.push(UndiscoveredServiceSrv(node_id.clone(), v))
         }
         for (_, v) in self.service_cli.drain() {
-            events.push(UndiscoveredServiceCli(node_fullname.clone(), v))
+            events.push(UndiscoveredServiceCli(node_id.clone(), v))
         }
         for (_, v) in self.action_srv.drain() {
-            events.push(UndiscoveredActionSrv(node_fullname.clone(), v))
+            events.push(UndiscoveredActionSrv(node_id.clone(), v))
         }
         for (_, v) in self.action_cli.drain() {
-            events.push(UndiscoveredActionCli(node_fullname.clone(), v))
+            events.push(UndiscoveredActionCli(node_id.clone(), v))
         }
         self.undiscovered_reader.resize(0, Gid::NOT_DISCOVERED);
         self.undiscovered_writer.resize(0, Gid::NOT_DISCOVERED);
@@ -1733,7 +1733,7 @@ impl NodeInfo {
     // this Reader was used by some Subscription, Service or Action
     pub fn remove_reader(&mut self, reader: &Gid) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::*;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         // Search in Subscribers list if one is using the writer
         if let Some(name) = self.msg_sub.iter_mut().find_map(|(name, sub)| {
             if sub.readers.remove(reader) && sub.readers.is_empty() {
@@ -1746,7 +1746,7 @@ impl NodeInfo {
         }) {
             // Return undiscovery event for this Subscriber, since all its DDS Writer have been undiscovered
             return Some(UndiscoveredMsgSub(
-                node_fullname,
+                node_id,
                 self.msg_sub.remove(&name).unwrap(),
             ));
         }
@@ -1756,7 +1756,7 @@ impl NodeInfo {
             .find(|(_, v)| v.entities.req_reader == *reader)
         {
             return Some(UndiscoveredServiceSrv(
-                node_fullname,
+                node_id,
                 self.service_srv.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1766,7 +1766,7 @@ impl NodeInfo {
             .find(|(_, v)| v.entities.rep_reader == *reader)
         {
             return Some(UndiscoveredServiceCli(
-                node_fullname,
+                node_id,
                 self.service_cli.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1776,7 +1776,7 @@ impl NodeInfo {
                 || v.entities.get_result.req_reader == *reader
         }) {
             return Some(UndiscoveredActionSrv(
-                node_fullname,
+                node_id,
                 self.action_srv.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1788,7 +1788,7 @@ impl NodeInfo {
                 || v.entities.feedback_reader == *reader
         }) {
             return Some(UndiscoveredActionCli(
-                node_fullname,
+                node_id,
                 self.action_cli.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1800,7 +1800,7 @@ impl NodeInfo {
     // this Writer was used by some Publication, Service or Action
     pub fn remove_writer(&mut self, writer: &Gid) -> Option<ROS2DiscoveryEvent> {
         use ROS2DiscoveryEvent::*;
-        let node_fullname = self.fullname().to_string();
+        let node_id = self.id.clone();
         // Search in Publishers list if one is using the writer
         if let Some(name) = self.msg_pub.iter_mut().find_map(|(name, publ)| {
             if publ.writers.remove(writer) && publ.writers.is_empty() {
@@ -1813,7 +1813,7 @@ impl NodeInfo {
         }) {
             // Return undiscovery event for this Publisher, since all its DDS Writer have been undiscovered
             return Some(UndiscoveredMsgPub(
-                node_fullname,
+                node_id,
                 self.msg_pub.remove(&name).unwrap(),
             ));
         }
@@ -1823,7 +1823,7 @@ impl NodeInfo {
             .find(|(_, v)| v.entities.rep_writer == *writer)
         {
             return Some(UndiscoveredServiceSrv(
-                node_fullname,
+                node_id,
                 self.service_srv.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1833,7 +1833,7 @@ impl NodeInfo {
             .find(|(_, v)| v.entities.req_writer == *writer)
         {
             return Some(UndiscoveredServiceCli(
-                node_fullname,
+                node_id,
                 self.service_cli.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1845,7 +1845,7 @@ impl NodeInfo {
                 || v.entities.feedback_writer == *writer
         }) {
             return Some(UndiscoveredActionSrv(
-                node_fullname,
+                node_id,
                 self.action_srv.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1855,7 +1855,7 @@ impl NodeInfo {
                 || v.entities.get_result.req_writer == *writer
         }) {
             return Some(UndiscoveredActionCli(
-                node_fullname,
+                node_id,
                 self.action_cli.remove(&name.clone()).unwrap(),
             ));
         }
@@ -1876,4 +1876,175 @@ where
         seq.serialize_element(x)?;
     }
     seq.end()
+}
+
+// Regression test for the #759 pick: discovery events are keyed by the node
+// id ("<participant gid>/<namespace>/<name>"), not by the node fullname.
+#[cfg(test)]
+mod node_id_event_keying_tests {
+    use cyclors::qos::Qos;
+
+    use super::NodeInfo;
+    use crate::{dds_discovery::DdsEntity, events::ROS2DiscoveryEvent, gid::Gid};
+
+    enum Endpoint {
+        Reader,
+        Writer,
+    }
+    use Endpoint::*;
+
+    fn test_gid(n: u8) -> Gid {
+        let mut bytes = [0u8; 16];
+        bytes[0] = n;
+        bytes[15] = 1;
+        Gid::from(bytes)
+    }
+
+    fn entity(key: Gid, topic_name: &str, type_name: &str) -> DdsEntity {
+        DdsEntity {
+            key,
+            participant_key: test_gid(200),
+            topic_name: topic_name.to_string(),
+            type_name: type_name.to_string(),
+            _type_info: None,
+            keyless: true,
+            qos: Qos::default(),
+        }
+    }
+
+    fn event_node_id(event: &ROS2DiscoveryEvent) -> &str {
+        use ROS2DiscoveryEvent::*;
+        match event {
+            DiscoveredMsgPub(node, _)
+            | UndiscoveredMsgPub(node, _)
+            | DiscoveredMsgSub(node, _)
+            | UndiscoveredMsgSub(node, _)
+            | DiscoveredServiceSrv(node, _)
+            | UndiscoveredServiceSrv(node, _)
+            | DiscoveredServiceCli(node, _)
+            | UndiscoveredServiceCli(node, _)
+            | DiscoveredActionSrv(node, _)
+            | UndiscoveredActionSrv(node, _)
+            | DiscoveredActionCli(node, _)
+            | UndiscoveredActionCli(node, _) => node,
+        }
+    }
+
+    fn variant_name(event: &ROS2DiscoveryEvent) -> &'static str {
+        use ROS2DiscoveryEvent::*;
+        match event {
+            DiscoveredMsgPub(..) => "DiscoveredMsgPub",
+            DiscoveredMsgSub(..) => "DiscoveredMsgSub",
+            DiscoveredServiceSrv(..) => "DiscoveredServiceSrv",
+            DiscoveredServiceCli(..) => "DiscoveredServiceCli",
+            DiscoveredActionSrv(..) => "DiscoveredActionSrv",
+            DiscoveredActionCli(..) => "DiscoveredActionCli",
+            _ => "unexpected variant",
+        }
+    }
+
+    const STRING_T: &str = "std_msgs::msg::dds_::String_";
+    const SRV_REQ_T: &str = "example_interfaces::srv::dds_::AddTwoInts_Request_";
+    const SRV_REP_T: &str = "example_interfaces::srv::dds_::AddTwoInts_Response_";
+    const GOAL_REQ_T: &str = "example_interfaces::action::dds_::Fibonacci_SendGoal_Request_";
+    const GOAL_REP_T: &str = "example_interfaces::action::dds_::Fibonacci_SendGoal_Response_";
+    const CANCEL_REQ_T: &str = "action_msgs::srv::dds_::CancelGoal_Request_";
+    const CANCEL_REP_T: &str = "action_msgs::srv::dds_::CancelGoal_Response_";
+    const RESULT_REQ_T: &str = "example_interfaces::action::dds_::Fibonacci_GetResult_Request_";
+    const RESULT_REP_T: &str = "example_interfaces::action::dds_::Fibonacci_GetResult_Response_";
+    const STATUS_T: &str = "action_msgs::msg::dds_::GoalStatusArray_";
+    const FEEDBACK_T: &str = "example_interfaces::action::dds_::Fibonacci_FeedbackMessage_";
+
+    #[test]
+    fn discovery_events_are_keyed_by_node_id_not_fullname() {
+        // one row per interface kind: the endpoint feeds complete the
+        // interface on the LAST feed, which must emit the expected event
+        type Feed = (Endpoint, &'static str, &'static str);
+        let table: Vec<(&str, Vec<Feed>)> = vec![
+            (
+                "DiscoveredMsgPub",
+                vec![(Writer, "rt/detections", STRING_T)],
+            ),
+            (
+                "DiscoveredMsgSub",
+                vec![(Reader, "rt/detections", STRING_T)],
+            ),
+            (
+                "DiscoveredServiceSrv",
+                vec![
+                    (Reader, "rq/get_frameRequest", SRV_REQ_T),
+                    (Writer, "rr/get_frameReply", SRV_REP_T),
+                ],
+            ),
+            (
+                "DiscoveredServiceCli",
+                vec![
+                    (Writer, "rq/get_frameRequest", SRV_REQ_T),
+                    (Reader, "rr/get_frameReply", SRV_REP_T),
+                ],
+            ),
+            (
+                "DiscoveredActionSrv",
+                vec![
+                    (Reader, "rq/fib/_action/send_goalRequest", GOAL_REQ_T),
+                    (Writer, "rr/fib/_action/send_goalReply", GOAL_REP_T),
+                    (Reader, "rq/fib/_action/cancel_goalRequest", CANCEL_REQ_T),
+                    (Writer, "rr/fib/_action/cancel_goalReply", CANCEL_REP_T),
+                    (Reader, "rq/fib/_action/get_resultRequest", RESULT_REQ_T),
+                    (Writer, "rr/fib/_action/get_resultReply", RESULT_REP_T),
+                    (Writer, "rt/fib/_action/status", STATUS_T),
+                    (Writer, "rt/fib/_action/feedback", FEEDBACK_T),
+                ],
+            ),
+            (
+                "DiscoveredActionCli",
+                vec![
+                    (Writer, "rq/fib/_action/send_goalRequest", GOAL_REQ_T),
+                    (Reader, "rr/fib/_action/send_goalReply", GOAL_REP_T),
+                    (Writer, "rq/fib/_action/cancel_goalRequest", CANCEL_REQ_T),
+                    (Reader, "rr/fib/_action/cancel_goalReply", CANCEL_REP_T),
+                    (Writer, "rq/fib/_action/get_resultRequest", RESULT_REQ_T),
+                    (Reader, "rr/fib/_action/get_resultReply", RESULT_REP_T),
+                    (Reader, "rt/fib/_action/status", STATUS_T),
+                    (Reader, "rt/fib/_action/feedback", FEEDBACK_T),
+                ],
+            ),
+        ];
+
+        for (expected_variant, feeds) in table {
+            let mut node =
+                NodeInfo::create("/lab".to_string(), "unit".to_string(), test_gid(42)).unwrap();
+            // the fixture discriminates id from fullname: the id carries the
+            // participant gid prefix
+            assert_ne!(node.id, node.fullname());
+
+            let feed_count = feeds.len();
+            let mut last_event = None;
+            for (i, (endpoint, topic, typ)) in feeds.into_iter().enumerate() {
+                let e = entity(test_gid(i as u8 + 1), topic, typ);
+                let event = match endpoint {
+                    Reader => node.update_with_reader(&e),
+                    Writer => node.update_with_writer(&e),
+                };
+                if i + 1 < feed_count {
+                    assert!(
+                        event.is_none(),
+                        "{expected_variant}: event emitted before the interface was complete: {event:?}"
+                    );
+                } else {
+                    last_event = event;
+                }
+            }
+
+            let event = last_event
+                .unwrap_or_else(|| panic!("{expected_variant}: no event on the completing feed"));
+            assert_eq!(variant_name(&event), expected_variant);
+            assert_eq!(
+                event_node_id(&event),
+                node.id,
+                "{expected_variant}: the event must be keyed by node.id, not by the fullname {:?}",
+                node.fullname()
+            );
+        }
+    }
 }

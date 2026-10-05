@@ -14,7 +14,10 @@
 use std::{
     ffi::{CStr, CString},
     mem::MaybeUninit,
-    sync::{atomic::AtomicI32, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     time::Duration,
 };
 
@@ -33,6 +36,71 @@ use crate::{
 
 // An atomic dds_entity_t (=i32), for safe concurrent creation/deletion of DDS entities
 pub type AtomicDDSEntity = AtomicI32;
+
+/// Serializes a route's DDS entity activation (performed from a zenoh
+/// `MatchingListener` callback) with the route's retirement (`Drop`).
+///
+/// Taking the `MatchingListener` in `Drop` is not a completion barrier: a
+/// callback that already started keeps executing after the listener handle is
+/// dropped, and can re-create a DDS entity for the retired route - a permanent
+/// orphan, since no further matching event can ever delete it. A plain atomic
+/// flag is not enough either: it leaves a window between the flag check and
+/// the entity creation. Instead, the callback checks liveness and creates the
+/// entities inside a single critical section (`if_live`), and `retire()` takes
+/// the same lock before clearing the flag. Once `retire()` returns, any
+/// in-flight activation has fully completed and no later callback can create
+/// entities anymore, so the deactivation that follows in `Drop` is final.
+///
+/// Locking discipline (cf. eclipse-zenoh/zenoh-plugin-ros2dds#382): `Drop`
+/// must drop the `MatchingListener` handle only after `retire()` has released
+/// this lock, since undeclaring the listener may wait for an in-flight
+/// callback that could itself be blocked on this lock.
+pub struct RouteLiveness {
+    live: Mutex<bool>,
+    // whether the poisoned-lock recovery was already logged for this route
+    poison_logged: AtomicBool,
+}
+
+impl RouteLiveness {
+    pub fn new() -> Arc<Self> {
+        Arc::new(RouteLiveness {
+            live: Mutex::new(true),
+            poison_logged: AtomicBool::new(false),
+        })
+    }
+
+    /// Runs `op` holding the liveness lock if the route was not retired yet.
+    /// Returns `None` (without running `op`) after `retire()`.
+    pub fn if_live<R>(&self, op: impl FnOnce() -> R) -> Option<R> {
+        let guard = self.lock();
+        if *guard {
+            Some(op())
+        } else {
+            None
+        }
+    }
+
+    /// Marks the route retired. Blocks until no `if_live` section is running;
+    /// afterwards `if_live` never runs its closure again.
+    pub fn retire(&self) {
+        *self.lock() = false;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        // A poisoned lock only means some closure panicked mid-activation;
+        // the liveness flag itself remains meaningful, so recover and
+        // continue - but say so once at error level, since the panicking
+        // closure may have left a partial activation behind.
+        self.live.lock().unwrap_or_else(|poison| {
+            if !self.poison_logged.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "route liveness lock poisoned by a panic in an activation/deactivation closure; recovering and continuing with the current liveness state"
+                );
+            }
+            PoisonError::into_inner(poison)
+        })
+    }
+}
 
 pub const DDS_ENTITY_NULL: dds_entity_t = 0;
 pub const CDR_HEADER_LE: [u8; 4] = [0, 1, 0, 0];
@@ -137,7 +205,7 @@ pub unsafe fn create_topic(
     let cton = CString::new(topic_name.to_owned()).unwrap().into_raw();
     let ctyn = CString::new(type_name.to_owned()).unwrap().into_raw();
 
-    match type_info {
+    let topic = match type_info {
         None => cdds_create_blob_topic(dp, cton, ctyn, keyless),
         Some(type_info) => {
             let mut descriptor: *mut dds_topic_descriptor_t = std::ptr::null_mut();
@@ -157,7 +225,13 @@ pub unsafe fn create_topic(
             }
             topic
         }
-    }
+    };
+
+    // Reclaim the CStrings: cyclonedds copies them internally, so it is safe to free now.
+    drop(CString::from_raw(cton));
+    drop(CString::from_raw(ctyn));
+
+    topic
 }
 
 pub fn create_dds_writer(
@@ -175,6 +249,8 @@ pub fn create_dds_writer(
         let qos_native = qos.to_qos_native();
         let writer: i32 = dds_create_writer(dp, t, qos_native, std::ptr::null_mut());
         Qos::delete_qos_native(qos_native);
+        drop(CString::from_raw(cton));
+        drop(CString::from_raw(ctyn));
         if writer >= 0 {
             Ok(writer)
         } else {
@@ -356,5 +432,108 @@ where
                 Ok(reader)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod route_liveness_tests {
+    use std::{
+        sync::mpsc::{channel, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+
+    use super::RouteLiveness;
+
+    // The only time-based wait in these tests: a negative check asserting
+    // that retire() did NOT complete. It is false-pass-safe: if retire()
+    // wrongly returned early, the "retired" message would arrive within the
+    // window and the assertion would fail.
+    const NEGATIVE_CHECK: Duration = Duration::from_millis(50);
+    // Generous bound for positive waits (events that must happen).
+    const POSITIVE_WAIT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn retire_blocks_until_in_flight_if_live_closure_finishes() {
+        let liveness = RouteLiveness::new();
+
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let (closure_done_tx, closure_done_rx) = channel();
+
+        let worker = {
+            let liveness = liveness.clone();
+            thread::spawn(move || {
+                let ran = liveness.if_live(|| {
+                    entered_tx.send(()).unwrap();
+                    // hold the critical section until the test releases it
+                    release_rx.recv().unwrap();
+                    closure_done_tx.send(()).unwrap();
+                });
+                assert!(ran.is_some(), "route was live, the closure must run");
+            })
+        };
+
+        // wait until the closure is inside the critical section
+        entered_rx.recv_timeout(POSITIVE_WAIT).unwrap();
+
+        let (retired_tx, retired_rx) = channel();
+        let retirer = {
+            let liveness = liveness.clone();
+            thread::spawn(move || {
+                liveness.retire();
+                retired_tx.send(()).unwrap();
+            })
+        };
+
+        // retire() must NOT complete while the closure holds the section
+        assert_eq!(
+            retired_rx.recv_timeout(NEGATIVE_CHECK),
+            Err(RecvTimeoutError::Timeout),
+            "retire() returned while an if_live closure was still running"
+        );
+
+        // release the closure: it must finish, then retire() must complete
+        release_tx.send(()).unwrap();
+        closure_done_rx.recv_timeout(POSITIVE_WAIT).unwrap();
+        retired_rx.recv_timeout(POSITIVE_WAIT).unwrap();
+
+        worker.join().unwrap();
+        retirer.join().unwrap();
+
+        // once retired, if_live never runs its closure again
+        assert!(liveness.if_live(|| ()).is_none());
+    }
+
+    #[test]
+    fn if_live_after_retire_returns_none_without_running_the_closure() {
+        let liveness = RouteLiveness::new();
+        assert_eq!(liveness.if_live(|| 42), Some(42));
+
+        liveness.retire();
+
+        let mut ran = false;
+        assert!(liveness.if_live(|| ran = true).is_none());
+        assert!(!ran, "closure must not run after retirement");
+    }
+
+    #[test]
+    fn poisoned_lock_recovers_without_panicking() {
+        let liveness = RouteLiveness::new();
+
+        // a panicking closure poisons the liveness mutex
+        let panicker = {
+            let liveness = liveness.clone();
+            thread::spawn(move || {
+                let _ = liveness.if_live(|| panic!("poison the liveness lock"));
+            })
+        };
+        assert!(panicker.join().is_err(), "the closure must have panicked");
+
+        // the poisoned lock is recovered: the liveness state stays
+        // meaningful, and neither if_live nor retire panics
+        assert_eq!(liveness.if_live(|| 7), Some(7));
+        liveness.retire();
+        assert!(liveness.if_live(|| ()).is_none());
     }
 }

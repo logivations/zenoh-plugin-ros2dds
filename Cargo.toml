@@ -43,19 +43,19 @@ serde_json = "1.0.114"
 test-case = { version = "3.3.1" }
 tokio = { version = "1.35.1", default-features = false } # Default features are disabled due to some crates' requirements
 tracing = "0.1"
-zenoh = { version = "1.10.1", features = [
+zenoh = { version = "=1.10.1", features = [
   "plugins",
   "unstable",
 ]}
-zenoh-config = { version = "1.10.1", default-features = false}
-zenoh-ext = { version = "1.10.1", features = [
+zenoh-config = { version = "=1.10.1", default-features = false}
+zenoh-ext = { version = "=1.10.1", features = [
   "unstable",
 ]}
 zenoh-plugin-ros2dds = { version = "1.10.1", path = "zenoh-plugin-ros2dds/", default-features = false }
-zenoh-plugin-rest = { version = "1.10.1", default-features = false, features = [
+zenoh-plugin-rest = { version = "=1.10.1", default-features = false, features = [
   "static_plugin",
 ]}
-zenoh-plugin-trait = { version = "1.10.1", default-features = false}
+zenoh-plugin-trait = { version = "=1.10.1", default-features = false}
 
 [profile.release]
 codegen-units = 1
@@ -63,3 +63,44 @@ debug = false
 lto = "fat"
 opt-level = 3
 panic = "abort"
+
+# TEMPORARY transport-fix pin (RTDTK-1026): the released zenoh 1.10.1 wedges under
+# connection storms; this patches the full 28-crate zenoh workspace closure to
+# logivations/zenoh branch `ros2dds/1.10.1-transport-fixes-v4` (tag `ros2dds-1.10.1-tf4`)
+# = tag 1.10.1 + the #2709/#2829/#2830-class transport fixes (+ #2779, #2619, #2736)
+# + the RX-wait fix (J. Plapp): a unicast pipeline refuses messages once a blocking push
+# failed and wakes parked pushers when its consumer stops, superseding the earlier
+# single-commit pin to logivations/zenoh@d3e7e4aa (same commit, carried on the branch).
+# The umbrella deps above are pinned `=1.10.1` so a plain `cargo update` cannot move
+# them off the patched version and silently drop this block (CI guards the lock too).
+# REMOVAL: once an eclipse zenoh release ships the #2709/#2829/#2830-class fixes,
+# delete this whole [patch.crates-io] block and relax the `=1.10.1` pins.
+[patch.crates-io]
+zenoh                      = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-buffers              = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-codec                = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-collections          = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-config               = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-core                 = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-crypto               = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-keyexpr              = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link                 = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-commons         = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-quic            = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-quic_datagram   = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-tcp             = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-tls             = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-udp             = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-unixsock_stream = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-link-ws              = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-macros               = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-plugin-trait         = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-protocol             = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-result               = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-runtime              = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-shm                  = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-stats                = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-sync                 = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-task                 = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-transport            = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }
+zenoh-util                 = { git = "https://github.com/logivations/zenoh.git", rev = "368237c5810967e8443e6f1972aa07316e8c2095" }

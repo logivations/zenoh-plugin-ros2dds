@@ -16,7 +16,10 @@ use std::{
     collections::HashSet,
     fmt,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -28,6 +31,7 @@ use serde::{Serialize, Serializer};
 use zenoh::{
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
+    matching::MatchingListener,
     qos::{CongestionControl, Priority, Reliability},
     sample::Locality,
     Wait,
@@ -38,7 +42,7 @@ use crate::{
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
         create_dds_reader, delete_dds_entity, get_guid, serialize_atomic_entity_guid,
-        AtomicDDSEntity, DDS_ENTITY_NULL,
+        AtomicDDSEntity, RouteLiveness, DDS_ENTITY_NULL,
     },
     liveliness_mgt::new_ke_liveliness_pub,
     qos_helpers::*,
@@ -81,15 +85,25 @@ pub struct RoutePublisher {
         serialize_with = "serialize_pub_cache"
     )]
     zenoh_publisher: ZPublisher,
+    // Keep the listener scoped to the route. A background listener outlives
+    // this object and can recreate a DDS Reader after the route is removed.
+    #[serde(skip)]
+    matching_listener: Option<MatchingListener<()>>,
+    // Serializes DDS Reader activation (from the matching callback) with
+    // route retirement, so a callback in flight during Drop cannot resurrect
+    // a Reader for a retired route.
+    #[serde(skip)]
+    liveness: Arc<RouteLiveness>,
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_reader: Arc<AtomicDDSEntity>,
     // the Zenoh Priority for publications
     #[serde(serialize_with = "serialize_priority")]
     priority: Priority,
-    // TypeInfo for Reader creation (if available)
+    // TypeInfo for Reader creation (if available). Any re-activation always
+    // re-uses the type/QoS this route was created with.
     #[serde(skip)]
-    _type_info: Option<Arc<TypeInfo>>,
+    type_info: Option<Arc<TypeInfo>>,
     // if the topic is keyless
     #[serde(skip)]
     keyless: bool,
@@ -97,7 +111,7 @@ pub struct RoutePublisher {
     // those are either the QoS announced by a remote bridge on a Reader discovery,
     // either the QoS adapted from a local discovered Writer
     #[serde(skip)]
-    _reader_qos: Qos,
+    reader_qos: Qos,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -109,7 +123,17 @@ pub struct RoutePublisher {
 
 impl Drop for RoutePublisher {
     fn drop(&mut self) {
+        // Retire first: this serializes with any in-flight matching callback
+        // (the liveness flag is cleared under the same lock inside which the
+        // callback creates the DDS Reader), so after this call no callback
+        // can resurrect a Reader for this route and the deactivation below
+        // is final.
+        self.liveness.retire();
         self.deactivate_dds_reader();
+        // Drop the listener handle only after retire() released the lock:
+        // undeclaring may wait for an in-flight callback, which could itself
+        // be waiting on the liveness lock (a #382-style self-deadlock).
+        self.matching_listener.take();
     }
 }
 
@@ -220,11 +244,13 @@ impl RoutePublisher {
         // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let liveness = RouteLiveness::new();
 
-        publisher
+        let matching_listener = publisher
             .matching_listener()
             .callback({
                 let dds_reader = dds_reader.clone();
+                let liveness = liveness.clone();
                 let ros2_name = ros2_name.clone();
                 let ros2_type = ros2_type.clone();
                 let zenoh_key_expr = zenoh_key_expr.clone();
@@ -236,27 +262,47 @@ impl RoutePublisher {
                 let publisher = publisher.clone();
 
                 move |status| {
-                    tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
-                    if status.matching() {
-                        if let Err(e) = activate_dds_reader(
-                            &dds_reader,
-                            &ros2_name,
-                            &ros2_type,
-                            &route_id,
-                            &context,
-                            keyless,
-                            &reader_qos,
-                            &type_info,
-                            &publisher,
-                        ) {
-                            tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
+                    // Activation/deactivation happens inside the liveness
+                    // critical section: once the route is retired (Drop) this
+                    // callback must not touch DDS entities anymore.
+                    let handled = liveness.if_live(|| {
+                        tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                        if status.matching() {
+                            // Idempotent: add_remote_route()/add_local_node()
+                            // may have re-activated the route before this edge
+                            // was delivered. The route's Reader config is
+                            // immutable (same name/type/QoS), so an existing
+                            // Reader is always the right one; re-creating it
+                            // would orphan its predecessor's gid entry in
+                            // ros_discovery_info.
+                            if dds_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                                tracing::debug!("{route_id}: already activated");
+                                return;
+                            }
+                            if let Err(e) = activate_dds_reader(
+                                &dds_reader,
+                                &ros2_name,
+                                &ros2_type,
+                                &route_id,
+                                &context,
+                                keyless,
+                                &reader_qos,
+                                &type_info,
+                                &publisher,
+                            ) {
+                                tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
+                            }
+                        } else {
+                            deactivate_dds_reader(&dds_reader, &route_id, &context.ros_discovery_mgr)
                         }
-                    } else {
-                        deactivate_dds_reader(&dds_reader, &route_id, &context.ros_discovery_mgr)
+                    });
+                    if handled.is_none() {
+                        tracing::debug!(
+                            "{route_id}: MatchingStatus changed after route retirement - ignored: {status:?}"
+                        );
                     }
                 }
             })
-            .background()
             .await
             .map_err(|e| format!("Failed to listen of matching status changes: {e}",))?;
 
@@ -269,10 +315,12 @@ impl RoutePublisher {
                 publisher,
                 cache_size,
             },
+            matching_listener: Some(matching_listener),
+            liveness,
             dds_reader,
             priority,
-            _type_info: type_info.clone(),
-            _reader_qos: reader_qos,
+            type_info: type_info.clone(),
+            reader_qos,
             keyless,
             liveliness_token: None,
             remote_routes: HashSet::new(),
@@ -292,6 +340,39 @@ impl RoutePublisher {
                 tracing::warn!("{}: error deleting DDS Reader:  {}", self, e);
             }
         }
+    }
+
+    // Re-create the DDS Reader of this route from its own stored
+    // configuration (same topic name, type and QoS) if it is currently
+    // deactivated. No-op when already active or after route retirement.
+    // On failure the route is left fully deactivated (activate_dds_reader()
+    // rolls back), so the NULL guard permits a retry on the next demand
+    // change; the callers log the error with their route/node context.
+    fn activate_dds_reader_if_deactivated(&mut self) -> Result<(), String> {
+        let liveness = self.liveness.clone();
+        liveness
+            .if_live(|| {
+                // re-check under the lock: a concurrent matching callback may
+                // have just activated the route
+                if self.dds_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                    return Ok(());
+                }
+                let route_id = self.to_string();
+                tracing::debug!("{route_id}: re-activate DDS Reader");
+                activate_dds_reader(
+                    &self.dds_reader,
+                    &self.ros2_name,
+                    &self.ros2_type,
+                    &route_id,
+                    &self.context,
+                    self.keyless,
+                    &self.reader_qos,
+                    &self.type_info,
+                    &self.zenoh_publisher.publisher,
+                )
+            })
+            // after retirement there is nothing left to re-activate
+            .unwrap_or(Ok(()))
     }
 
     async fn announce_route(&mut self, discovered_writer_qos: &Qos) -> Result<(), String> {
@@ -329,6 +410,20 @@ impl RoutePublisher {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        // The route may have been deactivated by remove_remote_route() while
+        // the zenoh Publisher stayed matched the whole time (e.g. another
+        // Subscriber on the same key expression, or the remote Subscriber
+        // returned before the retirement event was processed). In that case
+        // no MatchingStatus transition will ever fire again: re-create the
+        // DDS Reader here if a local node still feeds the route.
+        if self.is_serving_local_node() {
+            if let Err(e) = self.activate_dds_reader_if_deactivated() {
+                tracing::error!(
+                    "{self}: failed to re-activate DDS Reader on addition of remote route {zenoh_id}:{zenoh_key_expr} (local nodes {:?}): {e} - will retry on the next demand change",
+                    self.local_nodes
+                );
+            }
+        }
     }
 
     #[inline]
@@ -336,9 +431,16 @@ impl RoutePublisher {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
-        // if last remote route removed, deactivate the DDS Reader
+        // if last remote route removed, deactivate the DDS Reader.
+        // Deactivation must run inside the liveness critical section: a
+        // matching callback concurrently inside activate_dds_reader() could
+        // otherwise interleave with this deletion and leave a mixed state
+        // that the dds_reader NULL guard never heals.
+        // Lock order is liveness -> ros_discovery, as everywhere else.
+        // After retirement (if_live returns None) Drop already deactivated.
         if self.remote_routes.is_empty() {
-            self.deactivate_dds_reader();
+            let liveness = self.liveness.clone();
+            liveness.if_live(|| self.deactivate_dds_reader());
         }
     }
 
@@ -349,12 +451,22 @@ impl RoutePublisher {
 
     #[inline]
     pub async fn add_local_node(&mut self, node: String, discovered_writer_qos: &Qos) {
-        if self.local_nodes.insert(node) {
+        if self.local_nodes.insert(node.clone()) {
             tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
             // if 1st local node added, announce the route
             if self.local_nodes.len() == 1 {
                 if let Err(e) = self.announce_route(discovered_writer_qos).await {
                     tracing::error!("{self} announcement failed: {e}");
+                }
+            }
+            // Symmetric to add_remote_route(): local demand may appear while
+            // the route is wedged deactivated with the Publisher already
+            // matched.
+            if self.is_serving_remote_route() {
+                if let Err(e) = self.activate_dds_reader_if_deactivated() {
+                    tracing::error!(
+                        "{self}: failed to re-activate DDS Reader on addition of local node {node}: {e} - will retry on the next demand change"
+                    );
                 }
             }
         }
@@ -432,21 +544,50 @@ fn activate_dds_reader(
         {
             let route_id = route_id.to_string();
             let publisher = publisher.clone();
+            // per-route flag throttling the publish-failure log (see
+            // route_dds_message_to_zenoh); a fresh activation starts with
+            // error-level logging again
+            let publish_failing = Arc::new(AtomicBool::new(false));
             move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(sample, &publisher, &route_id);
+                route_dds_message_to_zenoh(sample, &publisher, &route_id, &publish_failing);
             }
         },
     )?;
+    // Get the gid before publishing the Reader in the route's atomic: if the
+    // lookup fails, roll the entity back so the route stays deactivated and
+    // the NULL guard permits a later retry. Previously the Reader was stored
+    // first, leaving the route stuck "already activated" with no gid
+    // advertised in ros_discovery_info.
+    let reader_gid = match get_guid(&reader) {
+        Ok(gid) => gid,
+        Err(e) => {
+            if let Err(e2) = delete_dds_entity(reader) {
+                tracing::warn!(
+                    "{route_id}: failed to delete DDS Reader while rolling back a partial activation: {e2}"
+                );
+            }
+            return Err(e);
+        }
+    };
     let old = dds_reader.deref().swap(reader, Ordering::Relaxed);
-    // add reader's GID in ros_discovery_info message
-    context.ros_discovery_mgr.add_dds_reader(get_guid(&reader)?);
-
     if old != DDS_ENTITY_NULL {
         tracing::warn!("{route_id}: on activation their was already a DDS Reader - overwrite it");
+        // remove the overwritten Reader's gid from ros_discovery_info BEFORE
+        // deleting the entity (get_guid fails on a deleted entity, which
+        // would leak the gid entry forever)
+        match get_guid(&old) {
+            Ok(old_gid) => context.ros_discovery_mgr.remove_dds_reader(old_gid),
+            Err(e) => tracing::warn!(
+                "{route_id}: failed to unregister overwritten DDS Reader from ros_discovery_info: {e}"
+            ),
+        }
         if let Err(e) = delete_dds_entity(old) {
             tracing::warn!("{route_id}: failed to delete overwritten DDS Reader: {e}");
         }
     }
+
+    // add reader's GID in ros_discovery_info message
+    context.ros_discovery_mgr.add_dds_reader(reader_gid);
 
     Ok(())
 }
@@ -474,13 +615,34 @@ fn route_dds_message_to_zenoh(
     sample: &DDSRawSample,
     publisher: &Arc<AdvancedPublisher>,
     route_id: &str,
+    publish_failing: &AtomicBool,
 ) {
     if *LOG_PAYLOAD {
         tracing::debug!("{route_id}: routing message - payload: {:02x?}", sample);
     } else {
         tracing::trace!("{route_id}: routing message - {} bytes", sample.len());
     }
-    if let Err(e) = publisher.put(sample).wait() {
-        tracing::error!("{route_id}: failed to route message: {e}");
+    match publisher.put(sample).wait() {
+        Err(e) => {
+            // A closed/unresponsive peer fails EVERY sample: log the first
+            // failure at error level and the follow-ups at debug until a
+            // publication succeeds again, instead of flooding the log at
+            // the route's publication rate.
+            if !publish_failing.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "{route_id}: failed to route message: {e} - follow-up failures are logged at debug level until a publication succeeds"
+                );
+            } else {
+                tracing::debug!("{route_id}: failed to route message: {e}");
+            }
+        }
+        Ok(()) => {
+            if publish_failing.load(Ordering::Relaxed) {
+                publish_failing.store(false, Ordering::Relaxed);
+                tracing::debug!(
+                    "{route_id}: routing messages succeeds again - resuming error-level logging for future failures"
+                );
+            }
+        }
     }
 }

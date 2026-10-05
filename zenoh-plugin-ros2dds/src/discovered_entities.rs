@@ -349,7 +349,7 @@ impl DiscoveredEntities {
                     );
                     events.push(e)
                 };
-            } else {
+            } else if !node.undiscovered_reader.contains(rgid) {
                 tracing::debug!(
                     "ROS Node {ros_node_info} declares a not yet discovered DDS Reader: {rgid}"
                 );
@@ -370,7 +370,7 @@ impl DiscoveredEntities {
                     );
                     events.push(e)
                 };
-            } else {
+            } else if !node.undiscovered_writer.contains(wgid) {
                 tracing::debug!(
                     "ROS Node {ros_node_info} declares a not yet discovered DDS Writer: {wgid}"
                 );
@@ -496,5 +496,160 @@ fn remove_null_qos_values(
             _ => Ok(value),
         },
         Err(error) => Err(error),
+    }
+}
+
+// TEST-ONLY (RTDTK-1026 picks qualification, gate G6): benchmark for the
+// undiscovered-gid staging cost in update_node_info. Not for upstreaming.
+#[cfg(test)]
+mod bench_undiscovered_staging {
+    use std::{collections::HashMap, time::Instant};
+
+    use super::DiscoveredEntities;
+    use crate::{
+        dds_discovery::DdsEntity, gid::Gid, node_info::NodeInfo, ros_discovery::NodeEntitiesInfo,
+    };
+
+    fn make_gid(i: u64, salt: u8) -> Gid {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b[8] = salt;
+        b[15] = 1;
+        Gid::from(b)
+    }
+
+    /// Thread CPU time in ms from /proc/thread-self/stat (utime+stime,
+    /// USER_HZ=100 -> 10 ms resolution).
+    fn thread_cpu_ms() -> f64 {
+        let stat = match std::fs::read_to_string("/proc/thread-self/stat") {
+            Ok(s) => s,
+            Err(_) => return f64::NAN,
+        };
+        let after = match stat.rsplit_once(')') {
+            Some((_, rest)) => rest,
+            None => return f64::NAN,
+        };
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        // after ')' : field 0 = state, utime = overall field 14 -> index 11
+        let utime: u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let stime: u64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+        ((utime + stime) as f64) * 10.0
+    }
+
+    fn run_case(n: usize, rounds: usize) {
+        let mut info = NodeEntitiesInfo::new("/".to_string(), format!("bench_{n}"));
+        for i in 0..n {
+            info.reader_gid_seq.insert(make_gid(i as u64, 2));
+        }
+        let mut node =
+            NodeInfo::create("/".to_string(), format!("bench_{n}"), make_gid(u64::MAX, 9))
+                .expect("NodeInfo::create");
+        let mut readers: HashMap<Gid, DdsEntity> = HashMap::new();
+        let mut writers: HashMap<Gid, DdsEntity> = HashMap::new();
+        for round in 1..=rounds {
+            let cpu0 = thread_cpu_ms();
+            let t0 = Instant::now();
+            let events =
+                DiscoveredEntities::update_node_info(&mut node, &info, &mut readers, &mut writers);
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let cpu_ms = thread_cpu_ms() - cpu0;
+            println!(
+                "G6BENCH n={n} round={round} wall_ms={wall_ms:.3} cpu_ms={cpu_ms:.1} \
+                 undiscovered_len={} events={}",
+                node.undiscovered_reader.len(),
+                events.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "G6 benchmark, run explicitly"]
+    fn bench_undiscovered_staging_cost() {
+        for n in [1000usize, 6000, 24000] {
+            run_case(n, 10);
+        }
+    }
+}
+
+// Regression tests for the #713 pick: gids declared by a graph announcement
+// but not yet discovered on DDS are staged exactly once per node.
+#[cfg(test)]
+mod undiscovered_staging_tests {
+    use std::collections::HashMap;
+
+    use cyclors::qos::Qos;
+
+    use super::DiscoveredEntities;
+    use crate::{
+        dds_discovery::DdsEntity, gid::Gid, node_info::NodeInfo, ros_discovery::NodeEntitiesInfo,
+    };
+
+    fn test_gid(i: u64, salt: u8) -> Gid {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b[8] = salt;
+        b[15] = 1;
+        Gid::from(b)
+    }
+
+    #[test]
+    fn repeated_node_info_does_not_duplicate_staged_gids() {
+        const N: u64 = 10;
+        let mut info = NodeEntitiesInfo::new("/".to_string(), "cam".to_string());
+        for i in 0..N {
+            info.reader_gid_seq.insert(test_gid(i, 2));
+            info.writer_gid_seq.insert(test_gid(i, 3));
+        }
+        let mut node =
+            NodeInfo::create("/".to_string(), "cam".to_string(), test_gid(999, 9)).unwrap();
+        let mut readers: HashMap<Gid, DdsEntity> = HashMap::new();
+        let mut writers: HashMap<Gid, DdsEntity> = HashMap::new();
+
+        // the same announcement processed twice must not duplicate the
+        // staged undiscovered gids (readers and writers)
+        for round in 1..=2 {
+            let events =
+                DiscoveredEntities::update_node_info(&mut node, &info, &mut readers, &mut writers);
+            assert!(events.is_empty(), "round {round}: no endpoint discovered");
+            assert_eq!(node.undiscovered_reader.len(), N as usize, "round {round}");
+            assert_eq!(node.undiscovered_writer.len(), N as usize, "round {round}");
+        }
+    }
+
+    #[test]
+    fn discovered_gid_leaves_staging() {
+        let participant = test_gid(77, 9);
+        let reader_gid = test_gid(1, 2);
+
+        // stage one undiscovered reader gid via a graph announcement
+        let mut info = NodeEntitiesInfo::new("/".to_string(), "cam".to_string());
+        info.reader_gid_seq.insert(reader_gid);
+        let mut node = NodeInfo::create("/".to_string(), "cam".to_string(), participant).unwrap();
+        let mut readers: HashMap<Gid, DdsEntity> = HashMap::new();
+        let mut writers: HashMap<Gid, DdsEntity> = HashMap::new();
+        DiscoveredEntities::update_node_info(&mut node, &info, &mut readers, &mut writers);
+        assert_eq!(node.undiscovered_reader, vec![reader_gid]);
+
+        // when the DDS Reader with that gid is discovered, the gid must
+        // leave the staging list and produce the discovery event
+        let fullname = node.fullname().to_string();
+        let mut entities = DiscoveredEntities::default();
+        entities
+            .nodes_info
+            .insert(participant, HashMap::from([(fullname.clone(), node)]));
+
+        let event = entities.add_reader(DdsEntity {
+            key: reader_gid,
+            participant_key: participant,
+            topic_name: "rt/detections".to_string(),
+            type_name: "std_msgs::msg::dds_::String_".to_string(),
+            _type_info: None,
+            keyless: true,
+            qos: Qos::default(),
+        });
+        assert!(event.is_some(), "a complete Subscriber must be discovered");
+
+        let node = &entities.nodes_info[&participant][&fullname];
+        assert!(node.undiscovered_reader.is_empty());
     }
 }
