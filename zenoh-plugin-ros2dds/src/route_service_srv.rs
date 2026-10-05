@@ -48,9 +48,7 @@ use crate::{
         ros2_service_type_to_request_dds_type, CddsRequestHeader, QOS_DEFAULT_SERVICE,
     },
     routes_mgr::Context,
-    serialize_option_as_bool,
-    zenoh_send_queue::{ZenohSendQueue, ZenohSender},
-    LOG_PAYLOAD,
+    serialize_option_as_bool, LOG_PAYLOAD,
 };
 
 // a route for a Service Server exposed in Zenoh as a Queryable
@@ -91,9 +89,6 @@ pub struct RouteServiceSrv {
     remote_routes: HashSet<String>,
     // the list of nodes served by this route
     local_nodes: HashSet<String>,
-    // sends the replies to Zenoh outside of the DDS listener
-    #[serde(skip)]
-    _send_queue: ZenohSendQueue,
 }
 
 impl Drop for RouteServiceSrv {
@@ -178,7 +173,6 @@ impl RouteServiceSrv {
             Arc::new(RwLock::new(HashMap::new()));
 
         // create DDS Reader to receive replies and route them to Zenoh
-        let send_queue = ZenohSendQueue::new();
         let rep_topic_name = format!("rr{ros2_name}Reply");
         let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
         let rep_reader = create_dds_reader(
@@ -192,14 +186,12 @@ impl RouteServiceSrv {
             {
                 let queries_in_progress = queries_in_progress.clone();
                 let zenoh_key_expr = zenoh_key_expr.clone();
-                let sender = send_queue.sender();
                 move |sample| {
                     route_dds_reply_to_zenoh(
                         sample,
                         zenoh_key_expr.clone(),
                         &mut zwrite!(queries_in_progress),
                         &route_id,
-                        &sender,
                     );
                 }
             },
@@ -223,7 +215,6 @@ impl RouteServiceSrv {
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
-            _send_queue: send_queue,
         })
     }
 
@@ -440,7 +431,6 @@ fn route_dds_reply_to_zenoh(
     zenoh_key_expr: OwnedKeyExpr,
     queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
     route_id: &str,
-    sender: &ZenohSender,
 ) {
     // Reply payload is expected to be the Response type encoded as CDR, including a 4 bytes CDR header,
     // the 16 bytes request_id (8 bytes client guid + 8 bytes sequence_number), and the reply payload. As per rmw_cyclonedds here:
@@ -483,12 +473,9 @@ fn route_dds_reply_to_zenoh(
                 );
             }
 
-            let owned_route_id = route_id.to_string();
-            sender.send(route_id, move || {
-                if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
-                    tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
-                }
-            });
+            if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
+                tracing::warn!("{route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
+            }
         }
         None => tracing::trace!(
             "{route_id}: received response from DDS an unknown query: {request_id} - ignore it"
