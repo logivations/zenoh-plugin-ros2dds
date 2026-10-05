@@ -283,29 +283,33 @@ impl RouteServiceCli {
     // Re-create the DDS entities of this route from its own stored
     // configuration (same service name and type) if they are currently
     // deactivated. No-op when already active or after route retirement.
-    fn activate_if_deactivated(&mut self) {
+    // On failure the route is left fully deactivated (activate() rolls
+    // back), so the NULL guard permits a retry on the next demand change;
+    // the callers log the error with their route/node context.
+    fn activate_if_deactivated(&mut self) -> Result<(), String> {
         let liveness = self.liveness.clone();
-        liveness.if_live(|| {
-            // re-check under the lock: a concurrent matching callback may
-            // have just activated the route
-            if self.req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
-                return;
-            }
-            let route_id = self.to_string();
-            tracing::debug!("{route_id}: re-activate");
-            if let Err(e) = activate(
-                &self.rep_writer,
-                &self.req_reader,
-                &self.ros2_name,
-                &self.ros2_type,
-                &route_id,
-                &self.context,
-                &self.type_info,
-                &self.zenoh_querier,
-            ) {
-                tracing::error!("{route_id}: failed to re-activate DDS Reader/Writer: {e}");
-            }
-        });
+        liveness
+            .if_live(|| {
+                // re-check under the lock: a concurrent matching callback may
+                // have just activated the route
+                if self.req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                    return Ok(());
+                }
+                let route_id = self.to_string();
+                tracing::debug!("{route_id}: re-activate");
+                activate(
+                    &self.rep_writer,
+                    &self.req_reader,
+                    &self.ros2_name,
+                    &self.ros2_type,
+                    &route_id,
+                    &self.context,
+                    &self.type_info,
+                    &self.zenoh_querier,
+                )
+            })
+            // after retirement there is nothing left to re-activate
+            .unwrap_or(Ok(()))
     }
 
     #[inline]
@@ -320,7 +324,12 @@ impl RouteServiceCli {
         // MatchingStatus transition will ever fire again: re-activate the
         // DDS entities here if a local node still needs them.
         if self.is_serving_local_node() {
-            self.activate_if_deactivated();
+            if let Err(e) = self.activate_if_deactivated() {
+                tracing::error!(
+                    "{self}: failed to re-activate DDS Reader/Writer on addition of remote route {zenoh_id}:{zenoh_key_expr} (local nodes {:?}): {e} - will retry on the next demand change",
+                    self.local_nodes
+                );
+            }
         }
     }
 
@@ -350,7 +359,7 @@ impl RouteServiceCli {
 
     #[inline]
     pub async fn add_local_node(&mut self, node: String) {
-        self.local_nodes.insert(node);
+        self.local_nodes.insert(node.clone());
         tracing::debug!("{self}: now serving local nodes {:?}", self.local_nodes);
         // if 1st local node added, announce the route
         if self.local_nodes.len() == 1 {
@@ -361,7 +370,11 @@ impl RouteServiceCli {
         // Symmetric to add_remote_route(): local demand may appear while the
         // route is wedged deactivated with the Querier already matched.
         if self.is_serving_remote_route() {
-            self.activate_if_deactivated();
+            if let Err(e) = self.activate_if_deactivated() {
+                tracing::error!(
+                    "{self}: failed to re-activate DDS Reader/Writer on addition of local node {node}: {e} - will retry on the next demand change"
+                );
+            }
         }
     }
 

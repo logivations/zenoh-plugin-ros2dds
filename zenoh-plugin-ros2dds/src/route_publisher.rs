@@ -342,30 +342,34 @@ impl RoutePublisher {
     // Re-create the DDS Reader of this route from its own stored
     // configuration (same topic name, type and QoS) if it is currently
     // deactivated. No-op when already active or after route retirement.
-    fn activate_dds_reader_if_deactivated(&mut self) {
+    // On failure the route is left fully deactivated (activate_dds_reader()
+    // rolls back), so the NULL guard permits a retry on the next demand
+    // change; the callers log the error with their route/node context.
+    fn activate_dds_reader_if_deactivated(&mut self) -> Result<(), String> {
         let liveness = self.liveness.clone();
-        liveness.if_live(|| {
-            // re-check under the lock: a concurrent matching callback may
-            // have just activated the route
-            if self.dds_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
-                return;
-            }
-            let route_id = self.to_string();
-            tracing::debug!("{route_id}: re-activate DDS Reader");
-            if let Err(e) = activate_dds_reader(
-                &self.dds_reader,
-                &self.ros2_name,
-                &self.ros2_type,
-                &route_id,
-                &self.context,
-                self.keyless,
-                &self.reader_qos,
-                &self.type_info,
-                &self.zenoh_publisher.publisher,
-            ) {
-                tracing::error!("{route_id}: failed to re-activate DDS Reader: {e}");
-            }
-        });
+        liveness
+            .if_live(|| {
+                // re-check under the lock: a concurrent matching callback may
+                // have just activated the route
+                if self.dds_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                    return Ok(());
+                }
+                let route_id = self.to_string();
+                tracing::debug!("{route_id}: re-activate DDS Reader");
+                activate_dds_reader(
+                    &self.dds_reader,
+                    &self.ros2_name,
+                    &self.ros2_type,
+                    &route_id,
+                    &self.context,
+                    self.keyless,
+                    &self.reader_qos,
+                    &self.type_info,
+                    &self.zenoh_publisher.publisher,
+                )
+            })
+            // after retirement there is nothing left to re-activate
+            .unwrap_or(Ok(()))
     }
 
     async fn announce_route(&mut self, discovered_writer_qos: &Qos) -> Result<(), String> {
@@ -410,7 +414,12 @@ impl RoutePublisher {
         // no MatchingStatus transition will ever fire again: re-create the
         // DDS Reader here if a local node still feeds the route.
         if self.is_serving_local_node() {
-            self.activate_dds_reader_if_deactivated();
+            if let Err(e) = self.activate_dds_reader_if_deactivated() {
+                tracing::error!(
+                    "{self}: failed to re-activate DDS Reader on addition of remote route {zenoh_id}:{zenoh_key_expr} (local nodes {:?}): {e} - will retry on the next demand change",
+                    self.local_nodes
+                );
+            }
         }
     }
 
@@ -439,7 +448,7 @@ impl RoutePublisher {
 
     #[inline]
     pub async fn add_local_node(&mut self, node: String, discovered_writer_qos: &Qos) {
-        if self.local_nodes.insert(node) {
+        if self.local_nodes.insert(node.clone()) {
             tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
             // if 1st local node added, announce the route
             if self.local_nodes.len() == 1 {
@@ -451,7 +460,11 @@ impl RoutePublisher {
             // the route is wedged deactivated with the Publisher already
             // matched.
             if self.is_serving_remote_route() {
-                self.activate_dds_reader_if_deactivated();
+                if let Err(e) = self.activate_dds_reader_if_deactivated() {
+                    tracing::error!(
+                        "{self}: failed to re-activate DDS Reader on addition of local node {node}: {e} - will retry on the next demand change"
+                    );
+                }
             }
         }
     }
