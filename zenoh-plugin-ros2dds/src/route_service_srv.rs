@@ -436,6 +436,26 @@ fn route_zenoh_request_to_dds(
     }
 }
 
+// Rejected or revoked replies must not run Query::drop() on a DDS/runtime
+// thread: finalizing a query can wait for the same congested transport. The
+// worker takes the Query before replying, preserving normal finalization for
+// sends that actually run.
+struct PendingReply(Option<Query>);
+
+impl PendingReply {
+    fn into_query(mut self) -> Query {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        if let Some(query) = self.0.take() {
+            query.discard();
+        }
+    }
+}
+
 fn route_dds_reply_to_zenoh(
     sample: &DDSRawSample,
     zenoh_key_expr: OwnedKeyExpr,
@@ -485,7 +505,9 @@ fn route_dds_reply_to_zenoh(
             }
 
             let owned_route_id = route_id.to_string();
+            let pending_reply = PendingReply(Some(query));
             sender.send(route_id, move || {
+                let query = pending_reply.into_query();
                 if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
                     tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
                 }
@@ -494,5 +516,87 @@ fn route_dds_reply_to_zenoh(
         None => tracing::trace!(
             "{route_id}: received response from DDS an unknown query: {request_id} - ignore it"
         ),
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn rejected_query_is_discarded_but_sent_query_finishes_normally() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut config = zenoh::Config::default();
+            config.scouting.multicast.set_enabled(Some(false)).unwrap();
+            config.listen.endpoints.set(vec![]).unwrap();
+            let session = zenoh::open(config).await.unwrap();
+            let queryable = session.declare_queryable("send/test").await.unwrap();
+            for reject in [true, false] {
+                let replies = session
+                    .get("send/test")
+                    .timeout(Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                let pending = PendingReply(Some(queryable.recv_async().await.unwrap()));
+                let queue = ZenohSendQueue::new();
+                let (release, released) = mpsc::channel();
+                if reject {
+                    let (started, running) = mpsc::channel();
+                    queue.sender().send("blocked", move || {
+                        started.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    });
+                    running.recv_timeout(Duration::from_secs(5)).unwrap();
+                    for _ in 0..16 {
+                        queue.sender().send("queued", || {});
+                    }
+                }
+                queue.sender().send("reply", move || {
+                    pending
+                        .into_query()
+                        .reply("send/test", "reply")
+                        .wait()
+                        .unwrap();
+                });
+                if reject {
+                    // Ordinary Query::drop would finalize immediately. Rejection
+                    // must leave the client to its existing timeout, without TX.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), replies.recv_async())
+                            .await
+                            .is_err()
+                    );
+                    release.send(()).unwrap();
+                    let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv_async())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(reply.result().is_err());
+                } else {
+                    let reply = tokio::time::timeout(Duration::from_secs(1), replies.recv_async())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        reply.result().unwrap().payload().to_bytes().as_ref(),
+                        b"reply"
+                    );
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(500), replies.recv_async())
+                            .await
+                            .unwrap()
+                            .is_err()
+                    );
+                }
+            }
+            session.close().await.unwrap();
+        });
     }
 }
