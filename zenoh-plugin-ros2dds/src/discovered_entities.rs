@@ -506,7 +506,9 @@ mod bench_undiscovered_staging {
     use std::{collections::HashMap, time::Instant};
 
     use super::DiscoveredEntities;
-    use crate::{dds_discovery::DdsEntity, gid::Gid, node_info::NodeInfo, ros_discovery::NodeEntitiesInfo};
+    use crate::{
+        dds_discovery::DdsEntity, gid::Gid, node_info::NodeInfo, ros_discovery::NodeEntitiesInfo,
+    };
 
     fn make_gid(i: u64, salt: u8) -> Gid {
         let mut b = [0u8; 16];
