@@ -83,7 +83,7 @@ pub struct RouteServiceSrv {
     sequence_number: Arc<AtomicU64>,
     // queries waiting for a reply
     #[serde(skip)]
-    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>>,
+    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, PendingQuery>>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -175,7 +175,7 @@ impl RouteServiceSrv {
         );
 
         // map of queries in progress
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
+        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, PendingQuery>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         // create DDS Reader to receive replies and route them to Zenoh
@@ -240,7 +240,7 @@ impl RouteServiceSrv {
 
         // create the zenoh Queryable
         // if Reader is TRANSIENT_LOCAL, use a PublicationCache to store historical data
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
+        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, PendingQuery>>> =
             self.queries_in_progress.clone();
         let sequence_number: Arc<AtomicU64> = self.sequence_number.clone();
         let route_id: String = self.to_string();
@@ -356,12 +356,14 @@ impl RouteServiceSrv {
 
 fn route_zenoh_request_to_dds(
     query: Query,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &mut HashMap<CddsRequestHeader, PendingQuery>,
     sequence_number: &AtomicU64,
     route_id: &str,
     client_guid: u64,
     req_writer: i32,
 ) {
+    let pending = PendingQuery(Some(query));
+    let query = pending.0.as_ref().unwrap();
     // Get expected endianness from the query value:
     // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
     let is_little_endian = match query.payload() {
@@ -429,17 +431,37 @@ fn route_zenoh_request_to_dds(
         );
     }
 
-    queries_in_progress.insert(request_id, query);
+    queries_in_progress.insert(request_id, pending);
     if let Err(e) = dds_write(req_writer, dds_req_buf) {
         tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
         queries_in_progress.remove(&request_id);
     }
 }
 
+// A query remains pending while awaiting DDS or a send worker. Discard on
+// rejection, DDS write failure, replacement or retirement must not send a final
+// response on the caller thread. Only the send worker takes the Query out and
+// restores normal finalization before replying.
+struct PendingQuery(Option<Query>);
+
+impl PendingQuery {
+    fn into_query(mut self) -> Query {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for PendingQuery {
+    fn drop(&mut self) {
+        if let Some(query) = self.0.take() {
+            query.discard();
+        }
+    }
+}
+
 fn route_dds_reply_to_zenoh(
     sample: &DDSRawSample,
     zenoh_key_expr: OwnedKeyExpr,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &mut HashMap<CddsRequestHeader, PendingQuery>,
     route_id: &str,
     sender: &ZenohSender,
 ) {
@@ -486,6 +508,7 @@ fn route_dds_reply_to_zenoh(
 
             let owned_route_id = route_id.to_string();
             sender.send(route_id, move || {
+                let query = query.into_query();
                 if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
                     tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
                 }
@@ -494,5 +517,87 @@ fn route_dds_reply_to_zenoh(
         None => tracing::trace!(
             "{route_id}: received response from DDS an unknown query: {request_id} - ignore it"
         ),
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn rejected_query_is_discarded_but_sent_query_finishes_normally() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut config = zenoh::Config::default();
+            config.scouting.multicast.set_enabled(Some(false)).unwrap();
+            config.listen.endpoints.set(vec![]).unwrap();
+            let session = zenoh::open(config).await.unwrap();
+            let queryable = session.declare_queryable("send/test").await.unwrap();
+            for reject in [true, false] {
+                let replies = session
+                    .get("send/test")
+                    .timeout(Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                let pending = PendingQuery(Some(queryable.recv_async().await.unwrap()));
+                let queue = ZenohSendQueue::new();
+                let (release, released) = mpsc::channel();
+                if reject {
+                    let (started, running) = mpsc::channel();
+                    queue.sender().send("blocked", move || {
+                        started.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    });
+                    running.recv_timeout(Duration::from_secs(5)).unwrap();
+                    for _ in 0..16 {
+                        queue.sender().send("queued", || {});
+                    }
+                }
+                queue.sender().send("reply", move || {
+                    pending
+                        .into_query()
+                        .reply("send/test", "reply")
+                        .wait()
+                        .unwrap();
+                });
+                if reject {
+                    // Ordinary Query::drop would finalize immediately. Rejection
+                    // must leave the client to its existing timeout, without TX.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), replies.recv_async())
+                            .await
+                            .is_err()
+                    );
+                    release.send(()).unwrap();
+                    let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv_async())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(reply.result().is_err());
+                } else {
+                    let reply = tokio::time::timeout(Duration::from_secs(1), replies.recv_async())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        reply.result().unwrap().payload().to_bytes().as_ref(),
+                        b"reply"
+                    );
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(500), replies.recv_async())
+                            .await
+                            .unwrap()
+                            .is_err()
+                    );
+                }
+            }
+            session.close().await.unwrap();
+        });
     }
 }

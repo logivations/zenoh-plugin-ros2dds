@@ -9,11 +9,13 @@
 // SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
 //
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::{Arc, Mutex},
+};
 
-use tokio::task::JoinHandle;
-
-use crate::spawn_runtime;
+use tokio::runtime::Handle;
 
 // Sends a route keeps while one of its sends is blocked. Further sends are dropped:
 // the ROS client, or the remote querier, then runs into its usual timeout.
@@ -24,33 +26,33 @@ type ZenohSend = Box<dyn FnOnce() + Send + 'static>;
 /// Runs the blocking Zenoh sends of a Service route (`get().wait()`, `reply().wait()`)
 /// outside of the DDS listener.
 ///
-/// CycloneDDS calls the listeners of all the bridge's DDS Readers from one thread
-/// (`dq.user`). Queries and replies use `CongestionControl::Block`: while the TX queue
+/// CycloneDDS can invoke these listeners on its receive thread. Queries and replies
+/// use `CongestionControl::Block`: while the TX queue
 /// towards their destination is full they wait up to
 /// `transport/link/tx/queue/congestion_control/block/wait_before_close`, and every DDS
 /// sample of the bridge (all topics, all services) waited with them. Each route runs
 /// its sends in order on its own task instead, so a congested destination only delays
 /// the routes that send to it.
 pub(crate) struct ZenohSendQueue {
-    sender: flume::Sender<ZenohSend>,
-    worker: JoinHandle<()>,
+    sender: Arc<SendWorker>,
     generation: Arc<Mutex<u64>>,
+}
+
+struct SendWorker {
+    // None means idle; Some means one blocking worker owns the queue. Enqueue
+    // and the worker's transition to idle share this lock so no wakeup is lost.
+    pending: Mutex<Option<VecDeque<ZenohSend>>>,
+    runtime: Handle,
 }
 
 impl ZenohSendQueue {
     pub(crate) fn new() -> Self {
-        let (sender, receiver) = flume::bounded::<ZenohSend>(MAX_PENDING_SENDS);
-        let worker = spawn_runtime(async move {
-            while let Ok(send) = receiver.recv_async().await {
-                // a blocked send occupies a thread of the blocking pool, not a worker
-                if let Err(e) = tokio::task::spawn_blocking(send).await {
-                    tracing::error!("Zenoh send of a Service route failed: {e}");
-                }
-            }
-        });
         ZenohSendQueue {
-            sender,
-            worker,
+            sender: Arc::new(SendWorker {
+                pending: Mutex::new(None),
+                runtime: Handle::try_current()
+                    .unwrap_or_else(|_| crate::TOKIO_RUNTIME.handle().clone()),
+            }),
             generation: Arc::new(Mutex::new(0)),
         }
     }
@@ -75,14 +77,15 @@ impl ZenohSendQueue {
 impl Drop for ZenohSendQueue {
     fn drop(&mut self) {
         self.invalidate();
-        self.worker.abort();
+        // The worker disposes revoked sends, too: a captured Zenoh Query may
+        // perform a blocking network send in Drop.
     }
 }
 
-/// Queues sends for a [`ZenohSendQueue`] without ever blocking the caller.
+/// Queues sends for a [`ZenohSendQueue`].
 #[derive(Clone)]
 pub(crate) struct ZenohSender {
-    sender: flume::Sender<ZenohSend>,
+    sender: Arc<SendWorker>,
     pub(crate) generation: SendGeneration,
 }
 
@@ -110,20 +113,50 @@ impl SendGeneration {
 impl ZenohSender {
     pub(crate) fn send(&self, route_id: &str, send: impl FnOnce() + Send + 'static) {
         let generation = self.generation.clone();
-        match self.sender.try_send(Box::new(move || {
-            // Claim on the blocking worker, not when queued: aborting its
-            // async parent cannot cancel a queued spawn_blocking closure.
-            // Once claimed it is in flight; its DDS reply needs its own guard.
+        let send: ZenohSend = Box::new(move || {
+            // Claim on the blocking worker, not when queued. Once claimed it is
+            // in flight; its DDS reply needs its own guard.
             if generation.if_current(|| ()).is_some() {
                 send();
             }
-        })) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(_)) => tracing::warn!(
-                "{route_id}: {MAX_PENDING_SENDS} sends to Zenoh are still pending (congested destination?) - dropping this one"
-            ),
-            Err(flume::TrySendError::Disconnected(_)) => {
-                tracing::debug!("{route_id}: route is gone - dropping send to Zenoh")
+        });
+        let mut pending = self
+            .sender
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(queue) = pending.as_mut() {
+            if queue.len() < MAX_PENDING_SENDS {
+                queue.push_back(send);
+            } else {
+                // Do not hold the queue lock while dropping captured resources.
+                drop(pending);
+                tracing::warn!(
+                    "{route_id}: {MAX_PENDING_SENDS} sends to Zenoh are still pending (congested destination?) - dropping this one"
+                );
+            }
+            return;
+        }
+        *pending = Some(VecDeque::new());
+        drop(pending);
+        let worker = self.sender.clone();
+        self.sender.runtime.spawn_blocking(move || worker.run(send));
+    }
+}
+
+impl SendWorker {
+    fn run(&self, mut send: ZenohSend) {
+        loop {
+            if catch_unwind(AssertUnwindSafe(send)).is_err() {
+                tracing::error!("Zenoh send of a Service route panicked");
+            }
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            match pending.as_mut().and_then(VecDeque::pop_front) {
+                Some(next) => send = next,
+                None => {
+                    *pending = None;
+                    return;
+                }
             }
         }
     }
@@ -245,17 +278,7 @@ mod tests {
         queue.sender().send("route", move || {
             sent.send(()).unwrap();
         });
-        let deadline = Instant::now() + WAIT;
-        while !queue.sender.is_empty() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(queue.sender.is_empty(), "worker must dequeue the send");
-        let worker = queue.worker.abort_handle();
         drop(queue);
-        while !worker.is_finished() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(worker.is_finished());
         release.send(()).unwrap();
         rt.block_on(blocker).unwrap();
         assert!(matches!(
@@ -329,5 +352,63 @@ mod tests {
         assert!(reply.join().unwrap().is_some());
         invalidated.recv_timeout(WAIT).unwrap();
         retire.join().unwrap();
+    }
+
+    #[test]
+    fn retirement_disposes_queued_resources_on_worker() {
+        struct BlockingDrop(mpsc::Sender<std::thread::ThreadId>, mpsc::Receiver<()>);
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                self.0.send(std::thread::current().id()).unwrap();
+                self.1.recv_timeout(WAIT).unwrap();
+            }
+        }
+
+        let rt = runtime();
+        let _guard = rt.enter();
+        let queue = ZenohSendQueue::new();
+        let (release_send, sending) = mpsc::channel();
+        let (started, running) = mpsc::channel();
+        queue.sender().send("route", move || {
+            started.send(std::thread::current().id()).unwrap();
+            sending.recv_timeout(WAIT).unwrap();
+        });
+        let worker_thread = running.recv_timeout(WAIT).unwrap();
+        let (dropping, dropped) = mpsc::channel();
+        let (release_drop, disposing) = mpsc::channel();
+        let resource = BlockingDrop(dropping, disposing);
+        let (executed, execution) = mpsc::channel();
+        queue.sender().send("route", move || {
+            executed.send(()).unwrap();
+            drop(resource);
+        });
+        drop(queue);
+        // Retirement is complete while the first send is still blocked. The
+        // queued resource is disposed by that same worker, after it can resume.
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_send.send(()).unwrap();
+        assert_eq!(dropped.recv_timeout(WAIT).unwrap(), worker_thread);
+        release_drop.send(()).unwrap();
+        assert!(matches!(
+            execution.recv_timeout(WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn worker_survives_panic_and_idle_enqueue_races() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let queue = ZenohSendQueue::new();
+        let sender = queue.sender();
+        let (sent, received) = mpsc::channel();
+        sender.send("route", || panic!("injected send panic"));
+        // One outstanding send: every enqueue can race with the worker's
+        // return to idle, without ever legitimately filling the queue.
+        for n in 0..1000 {
+            let sent = sent.clone();
+            sender.send("route", move || sent.send(n).unwrap());
+            assert_eq!(received.recv_timeout(WAIT).unwrap(), n);
+        }
     }
 }
