@@ -42,6 +42,7 @@ use crate::{
     route_service_cli::RouteServiceCli,
     route_service_srv::RouteServiceSrv,
     route_subscriber::RouteSubscriber,
+    zenoh_send_queue::SendBudget,
 };
 
 lazy_static::lazy_static!(
@@ -75,6 +76,7 @@ enum RouteRef {
 // A Context struct to be shared as an Arc amongst all the code
 #[derive(Clone)]
 pub struct Context {
+    pub(crate) service_send_budget: Arc<SendBudget>,
     pub(crate) config: Arc<Config>,
     pub(crate) zsession: Arc<Session>,
     pub(crate) participant: dds_entity_t,
@@ -109,6 +111,9 @@ impl RoutesMgr {
         admin_prefix: OwnedKeyExpr,
     ) -> RoutesMgr {
         let context = Context {
+            service_send_budget: Arc::new(SendBudget::new(
+                config.service_send_queue_max_bytes.get(),
+            )),
             config,
             zsession,
             participant,

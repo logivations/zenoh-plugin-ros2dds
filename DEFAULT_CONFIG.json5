@@ -149,6 +149,13 @@
       //   }
       // },
 
+      //// service_send_queue_max_bytes: Shared payload budget for queued and in-flight service
+      //// requests/replies (including action services). Positive bytes; default 64 MiB.
+      //// Exhaustion drops the send; the caller's usual timeout applies.
+      //// One oversized payload is allowed only when the budget is empty. This is not an RSS
+      //// limit: DDS/transport buffers and other bridge memory need additional headroom.
+      // service_send_queue_max_bytes: 67108864,
+
       //// transient_local_cache_multiplier: A multiplier used to determine the size of the `PublicationCache` for a route serving a `TRANSIENT_LOCAL` Publisher.
       ////                                   When a `TRANSIENT_LOCAL` Publisher is discovered, the plugin creates a route with a `PublicationCache` to store
       ////                                   the publications for late joiner bridges that serve late joiner Subscribers.
