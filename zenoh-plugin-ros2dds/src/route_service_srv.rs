@@ -179,7 +179,7 @@ impl RouteServiceSrv {
             Arc::new(RwLock::new(HashMap::new()));
 
         // create DDS Reader to receive replies and route them to Zenoh
-        let send_queue = ZenohSendQueue::new();
+        let send_queue = ZenohSendQueue::new(context.service_send_budget.clone());
         let rep_topic_name = format!("rr{ros2_name}Reply");
         let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
         let rep_reader = create_dds_reader(
@@ -507,7 +507,7 @@ fn route_dds_reply_to_zenoh(
             }
 
             let owned_route_id = route_id.to_string();
-            sender.send(route_id, move || {
+            sender.send(route_id, zenoh_rep_buf.len(), move || {
                 let query = query.into_query();
                 if let Err(e) = query.reply(zenoh_key_expr, zenoh_rep_buf).wait() {
                     tracing::warn!("{owned_route_id}: routing reply for request {request_id} from DDS to Zenoh failed: {e}");
@@ -525,6 +525,7 @@ mod send_tests {
     use std::{sync::mpsc, time::Duration};
 
     use super::*;
+    use crate::zenoh_send_queue::SendBudget;
 
     #[test]
     fn rejected_query_is_discarded_but_sent_query_finishes_normally() {
@@ -539,27 +540,32 @@ mod send_tests {
             config.listen.endpoints.set(vec![]).unwrap();
             let session = zenoh::open(config).await.unwrap();
             let queryable = session.declare_queryable("send/test").await.unwrap();
-            for reject in [true, false] {
+            // (queue rejection, byte-budget rejection)
+            for (reject, budget_reject) in [(true, false), (true, true), (false, false)] {
                 let replies = session
                     .get("send/test")
                     .timeout(Duration::from_secs(1))
                     .await
                     .unwrap();
                 let pending = PendingQuery(Some(queryable.recv_async().await.unwrap()));
-                let queue = ZenohSendQueue::new();
+                // A budget of 8 bytes is exhausted by the blocked 8-byte send.
+                let budget = Arc::new(SendBudget::new(if budget_reject { 8 } else { 1 << 20 }));
+                let queue = ZenohSendQueue::new(budget.clone());
                 let (release, released) = mpsc::channel();
                 if reject {
                     let (started, running) = mpsc::channel();
-                    queue.sender().send("blocked", move || {
+                    queue.sender().send("blocked", 8, move || {
                         started.send(()).unwrap();
                         released.recv_timeout(Duration::from_secs(5)).unwrap();
                     });
                     running.recv_timeout(Duration::from_secs(5)).unwrap();
-                    for _ in 0..16 {
-                        queue.sender().send("queued", || {});
+                    if !budget_reject {
+                        for _ in 0..16 {
+                            queue.sender().send("queued", 1, || {});
+                        }
                     }
                 }
-                queue.sender().send("reply", move || {
+                queue.sender().send("reply", 5, move || {
                     pending
                         .into_query()
                         .reply("send/test", "reply")
@@ -596,6 +602,12 @@ mod send_tests {
                             .is_err()
                     );
                 }
+                // Sent, rejected and discarded payloads all return their budget.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while budget.used() != 0 && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(budget.used(), 0);
             }
             session.close().await.unwrap();
         });

@@ -12,7 +12,10 @@
 use std::{
     collections::VecDeque,
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use tokio::runtime::Handle;
@@ -21,7 +24,48 @@ use tokio::runtime::Handle;
 // the ROS client, or the remote querier, then runs into its usual timeout.
 const MAX_PENDING_SENDS: usize = 16;
 
-type ZenohSend = Box<dyn FnOnce() + Send + 'static>;
+// Drop the payload before returning its reservation, including on queue rejection.
+type ZenohSend = (Box<dyn FnOnce() + Send + 'static>, SendReservation);
+
+/// One budget per bridge, shared by every service request/reply queue.
+pub(crate) struct SendBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl SendBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<SendReservation> {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                // Permit one oversized payload only when otherwise empty, so
+                // a valid large response is not permanently impossible to send.
+                used.checked_add(bytes)
+                    .filter(|&total| used == 0 || total <= self.limit)
+            })
+            .ok()
+            .map(|_| SendReservation(self.clone(), bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+struct SendReservation(Arc<SendBudget>, usize);
+
+impl Drop for SendReservation {
+    fn drop(&mut self) {
+        self.0.used.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
 
 /// Runs the blocking Zenoh sends of a Service route (`get().wait()`, `reply().wait()`)
 /// outside of the DDS listener.
@@ -36,6 +80,7 @@ type ZenohSend = Box<dyn FnOnce() + Send + 'static>;
 pub(crate) struct ZenohSendQueue {
     sender: Arc<SendWorker>,
     generation: Arc<Mutex<u64>>,
+    budget: Arc<SendBudget>,
 }
 
 struct SendWorker {
@@ -46,7 +91,7 @@ struct SendWorker {
 }
 
 impl ZenohSendQueue {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(budget: Arc<SendBudget>) -> Self {
         ZenohSendQueue {
             sender: Arc::new(SendWorker {
                 pending: Mutex::new(None),
@@ -54,12 +99,14 @@ impl ZenohSendQueue {
                     .unwrap_or_else(|_| crate::TOKIO_RUNTIME.handle().clone()),
             }),
             generation: Arc::new(Mutex::new(0)),
+            budget,
         }
     }
 
     pub(crate) fn sender(&self) -> ZenohSender {
         ZenohSender {
             sender: self.sender.clone(),
+            budget: self.budget.clone(),
             generation: SendGeneration {
                 current: self.generation.clone(),
                 expected: *self.generation.lock().unwrap_or_else(|e| e.into_inner()),
@@ -86,6 +133,7 @@ impl Drop for ZenohSendQueue {
 #[derive(Clone)]
 pub(crate) struct ZenohSender {
     sender: Arc<SendWorker>,
+    budget: Arc<SendBudget>,
     pub(crate) generation: SendGeneration,
 }
 
@@ -111,15 +159,25 @@ impl SendGeneration {
 }
 
 impl ZenohSender {
-    pub(crate) fn send(&self, route_id: &str, send: impl FnOnce() + Send + 'static) {
+    pub(crate) fn send(&self, route_id: &str, bytes: usize, send: impl FnOnce() + Send + 'static) {
+        let Some(reservation) = self.budget.reserve(bytes) else {
+            tracing::warn!(
+                "{route_id}: service send byte budget ({}) exhausted - dropping {bytes}-byte send to Zenoh",
+                self.budget.limit
+            );
+            return;
+        };
         let generation = self.generation.clone();
-        let send: ZenohSend = Box::new(move || {
-            // Claim on the blocking worker, not when queued. Once claimed it is
-            // in flight; its DDS reply needs its own guard.
-            if generation.if_current(|| ()).is_some() {
-                send();
-            }
-        });
+        let send: ZenohSend = (
+            Box::new(move || {
+                // Claim on the blocking worker, not when queued. Once claimed it is
+                // in flight; its DDS reply needs its own guard.
+                if generation.if_current(|| ()).is_some() {
+                    send();
+                }
+            }),
+            reservation,
+        );
         let mut pending = self
             .sender
             .pending
@@ -147,9 +205,12 @@ impl ZenohSender {
 impl SendWorker {
     fn run(&self, mut send: ZenohSend) {
         loop {
-            if catch_unwind(AssertUnwindSafe(send)).is_err() {
+            let (send_op, reservation) = send;
+            if catch_unwind(AssertUnwindSafe(send_op)).is_err() {
                 tracing::error!("Zenoh send of a Service route panicked");
             }
+            // The payload is gone (sent, revoked or unwound): return its budget.
+            drop(reservation);
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             match pending.as_mut().and_then(VecDeque::pop_front) {
                 Some(next) => send = next,
@@ -173,6 +234,18 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(5);
 
+    fn queue() -> ZenohSendQueue {
+        ZenohSendQueue::new(Arc::new(SendBudget::new(64 * 1024 * 1024)))
+    }
+
+    fn assert_released(budget: &SendBudget) {
+        let deadline = Instant::now() + WAIT;
+        while budget.used.load(Ordering::Relaxed) != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+    }
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -188,15 +261,15 @@ mod tests {
     fn blocked_send_delays_only_its_own_route() {
         let rt = runtime();
         let _guard = rt.enter();
-        let congested = ZenohSendQueue::new();
-        let other = ZenohSendQueue::new();
+        let congested = queue();
+        let other = queue();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (release, released) = mpsc::channel::<()>();
 
         let start = Instant::now();
         {
             let sent = sent.clone();
-            congested.sender().send("congested", move || {
+            congested.sender().send("congested", 1, move || {
                 released.recv_timeout(WAIT).unwrap();
                 sent.lock().unwrap().push("congested 1");
             });
@@ -205,12 +278,12 @@ mod tests {
             let sent = sent.clone();
             congested
                 .sender()
-                .send("congested", move || sent.lock().unwrap().push(name));
+                .send("congested", 1, move || sent.lock().unwrap().push(name));
         }
         let (other_sent, other_done) = mpsc::channel();
         other
             .sender()
-            .send("other", move || other_sent.send(()).unwrap());
+            .send("other", 1, move || other_sent.send(()).unwrap());
         assert!(start.elapsed() < Duration::from_millis(100));
 
         other_done.recv_timeout(WAIT).unwrap();
@@ -233,11 +306,11 @@ mod tests {
     fn full_route_drops_sends_without_blocking() {
         let rt = runtime();
         let _guard = rt.enter();
-        let queue = ZenohSendQueue::new();
+        let queue = queue();
         let sender = queue.sender();
         let (release, released) = mpsc::channel::<()>();
         let (started, has_started) = mpsc::channel();
-        sender.send("route", move || {
+        sender.send("route", 1, move || {
             started.send(()).unwrap();
             released.recv_timeout(WAIT).unwrap();
         });
@@ -247,14 +320,20 @@ mod tests {
         let start = Instant::now();
         for i in 0..MAX_PENDING_SENDS + 5 {
             let done = done.clone();
-            sender.send("route", move || done.send(i).unwrap());
+            sender.send("route", 1, move || done.send(i).unwrap());
         }
         assert!(start.elapsed() < Duration::from_millis(100));
+
+        assert_eq!(
+            queue.budget.used.load(Ordering::Relaxed),
+            MAX_PENDING_SENDS + 1
+        );
 
         release.send(()).unwrap();
         drop(done);
         let run: Vec<usize> = sends_done.iter().take(MAX_PENDING_SENDS + 5).collect();
         assert_eq!(run, (0..MAX_PENDING_SENDS).collect::<Vec<_>>());
+        assert_released(&queue.budget);
     }
 
     #[test]
@@ -273,36 +352,41 @@ mod tests {
             released.recv_timeout(WAIT).unwrap();
         });
         started.recv_timeout(WAIT).unwrap();
-        let queue = ZenohSendQueue::new();
+        let queue = queue();
         let (sent, received) = mpsc::channel();
-        queue.sender().send("route", move || {
+        queue.sender().send("route", 1, move || {
             sent.send(()).unwrap();
         });
+        let budget = queue.budget.clone();
         drop(queue);
+        // Retirement cannot free a send still waiting for the blocking pool:
+        // its payload must remain charged until the worker really drops it.
+        assert_eq!(budget.used.load(Ordering::Relaxed), 1);
         release.send(()).unwrap();
         rt.block_on(blocker).unwrap();
         assert!(matches!(
             received.recv_timeout(WAIT),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
+        assert_released(&budget);
     }
 
     #[test]
     fn reactivation_discards_old_sends_and_reply_access() {
         let rt = runtime();
         let _guard = rt.enter();
-        let queue = ZenohSendQueue::new();
+        let queue = queue();
         let old = queue.sender();
         let (release, released) = mpsc::channel();
         let (ready, started) = mpsc::channel();
-        old.send("route", move || {
+        old.send("route", 1, move || {
             ready.send(()).unwrap();
             released.recv_timeout(WAIT).unwrap();
         });
         started.recv_timeout(WAIT).unwrap();
         let (sent, received) = mpsc::channel();
         let stale_sent = sent.clone();
-        old.send("route", move || {
+        old.send("route", 1, move || {
             stale_sent.send("stale").unwrap();
         });
         queue.invalidate(); // deactivation must not wait for the blocked send
@@ -312,7 +396,7 @@ mod tests {
             .is_none());
         let current = queue.sender();
         assert_eq!(current.generation.if_current(|| 42), Some(42));
-        current.send("route", move || {
+        current.send("route", 1, move || {
             sent.send("current").unwrap();
         });
         release.send(()).unwrap();
@@ -321,13 +405,14 @@ mod tests {
             received.recv_timeout(WAIT),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
+        assert_released(&queue.budget);
     }
 
     #[test]
     fn invalidation_waits_for_in_flight_dds_reply_access() {
         let rt = runtime();
         let _guard = rt.enter();
-        let queue = Arc::new(ZenohSendQueue::new());
+        let queue = Arc::new(queue());
         let generation = queue.sender().generation;
         let (entered, entering) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -366,10 +451,11 @@ mod tests {
 
         let rt = runtime();
         let _guard = rt.enter();
-        let queue = ZenohSendQueue::new();
+        let queue = queue();
+        let budget = queue.budget.clone();
         let (release_send, sending) = mpsc::channel();
         let (started, running) = mpsc::channel();
-        queue.sender().send("route", move || {
+        queue.sender().send("route", 1, move || {
             started.send(std::thread::current().id()).unwrap();
             sending.recv_timeout(WAIT).unwrap();
         });
@@ -378,14 +464,16 @@ mod tests {
         let (release_drop, disposing) = mpsc::channel();
         let resource = BlockingDrop(dropping, disposing);
         let (executed, execution) = mpsc::channel();
-        queue.sender().send("route", move || {
+        queue.sender().send("route", 1, move || {
             executed.send(()).unwrap();
             drop(resource);
         });
         drop(queue);
         // Retirement is complete while the first send is still blocked. The
-        // queued resource is disposed by that same worker, after it can resume.
+        // queued resource is disposed by that same worker, after it can resume,
+        // and stays charged to the budget until then.
         assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(budget.used.load(Ordering::Relaxed), 2);
         release_send.send(()).unwrap();
         assert_eq!(dropped.recv_timeout(WAIT).unwrap(), worker_thread);
         release_drop.send(()).unwrap();
@@ -393,22 +481,103 @@ mod tests {
             execution.recv_timeout(WAIT),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
+        assert_released(&budget);
     }
 
     #[test]
     fn worker_survives_panic_and_idle_enqueue_races() {
         let rt = runtime();
         let _guard = rt.enter();
-        let queue = ZenohSendQueue::new();
+        let queue = queue();
         let sender = queue.sender();
         let (sent, received) = mpsc::channel();
-        sender.send("route", || panic!("injected send panic"));
+        sender.send("route", 1, || panic!("injected send panic"));
         // One outstanding send: every enqueue can race with the worker's
         // return to idle, without ever legitimately filling the queue.
         for n in 0..1000 {
             let sent = sent.clone();
-            sender.send("route", move || sent.send(n).unwrap());
+            sender.send("route", 1, move || sent.send(n).unwrap());
             assert_eq!(received.recv_timeout(WAIT).unwrap(), n);
         }
+        assert_released(&queue.budget);
+    }
+
+    #[test]
+    fn byte_budget_covers_queued_and_in_flight_sends_across_routes() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let budget = Arc::new(SendBudget::new(8));
+        let first = ZenohSendQueue::new(budget.clone());
+        let second = ZenohSendQueue::new(budget.clone());
+        let (release, released) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
+        first.sender().send("first", 6, move || {
+            started.send(()).unwrap();
+            released.recv_timeout(WAIT).unwrap();
+        });
+        ready.recv_timeout(WAIT).unwrap();
+        // The remaining two bytes are held in the same route's queue.
+        first.sender().send("first", 2, || {});
+        let (sent, received) = mpsc::channel();
+        let start = Instant::now();
+        second
+            .sender()
+            .send("second", 1, move || sent.send(()).unwrap());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(matches!(
+            received.recv_timeout(WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(budget.used.load(Ordering::Relaxed), 8);
+        release.send(()).unwrap();
+        assert_released(&budget);
+
+        // A panic also releases the reservation and does not stop the worker.
+        second
+            .sender()
+            .send("second", 8, || panic!("injected send failure"));
+        assert_released(&budget);
+        let (sent, received) = mpsc::channel();
+        second
+            .sender()
+            .send("second", 8, move || sent.send(()).unwrap());
+        received.recv_timeout(WAIT).unwrap();
+        assert_released(&budget);
+    }
+
+    #[test]
+    fn concurrent_admission_enforces_budget_and_single_oversized_send() {
+        for (bytes, allowed) in [(4, 2), (9, 1), (usize::MAX, 1)] {
+            let budget = Arc::new(SendBudget::new(8));
+            let barrier = Arc::new(std::sync::Barrier::new(16));
+            let jobs: Vec<_> = (0..16)
+                .map(|_| {
+                    let budget = budget.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let reservation = budget.reserve(bytes);
+                        barrier.wait(); // everyone attempts admission before anyone releases
+                        reservation.is_some()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                jobs.into_iter()
+                    .map(|job| usize::from(job.join().unwrap()))
+                    .sum::<usize>(),
+                allowed
+            );
+            assert_released(&budget);
+        }
+    }
+
+    #[test]
+    fn budget_config_defaults_and_rejects_zero() {
+        let config: crate::config::Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.service_send_queue_max_bytes.get(), 64 * 1024 * 1024);
+        assert!(serde_json::from_str::<crate::config::Config>(
+            r#"{"service_send_queue_max_bytes":0}"#
+        )
+        .is_err());
     }
 }

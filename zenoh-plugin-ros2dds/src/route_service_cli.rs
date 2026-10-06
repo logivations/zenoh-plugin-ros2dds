@@ -161,7 +161,7 @@ impl RouteServiceCli {
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let liveness = RouteLiveness::new();
-        let send_queue = Arc::new(ZenohSendQueue::new());
+        let send_queue = Arc::new(ZenohSendQueue::new(context.service_send_budget.clone()));
 
         let matching_listener = zenoh_querier
             .matching_listener()
@@ -643,7 +643,7 @@ fn route_dds_request_to_zenoh(
     let querier = querier.clone();
     let reply_generation = sender.generation.clone();
     let owned_route_id = route_id.to_string();
-    sender.send(route_id, move || {
+    sender.send(route_id, zenoh_req_buf.len(), move || {
         let route_id = owned_route_id;
         if let Err(e) = querier
             .get()
