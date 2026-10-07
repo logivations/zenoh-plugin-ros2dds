@@ -31,7 +31,7 @@ use zenoh::{
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
     matching::MatchingListener,
-    query::{Querier, Reply},
+    query::{ConsolidationMode, Querier, Reply},
     sample::Locality,
     Wait,
 };
@@ -148,6 +148,10 @@ impl RouteServiceCli {
                 .zsession
                 .declare_querier(zenoh_key_expr.clone())
                 .congestion_control(zenoh::qos::CongestionControl::Block)
+                // A ROS service has a single replier: hand its reply to the client as soon as it
+                // arrives. The default consolidation holds replies until the query's final, so a
+                // late or lost final delays every reply up to queries_timeout.
+                .consolidation(ConsolidationMode::None)
                 .allowed_destination(Locality::Remote)
                 .timeout(queries_timeout)
                 .await
