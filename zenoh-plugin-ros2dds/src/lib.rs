@@ -61,6 +61,7 @@ mod gid;
 mod liveliness_mgt;
 mod node_info;
 mod qos_helpers;
+mod rmw_zenoh;
 mod ros2_utils;
 mod ros_discovery;
 mod route_action_cli;
@@ -71,7 +72,7 @@ mod route_service_srv;
 mod route_subscriber;
 mod routes_mgr;
 mod zenoh_send_queue;
-use config::{Config, RosAutomaticDiscoveryRange};
+use config::{Config, Rmw, RosAutomaticDiscoveryRange};
 
 use crate::{
     dds_utils::get_guid,
@@ -288,6 +289,13 @@ pub async fn run(runtime: DynamicRuntime, config: Config) {
             return;
         }
     };
+
+    // rmw_zenoh: no DDS participant; the local nodes are reached through their zenoh router
+    // (the plugin's liveliness token is declared once that router is reached)
+    if config.rmw == Rmw::Zenoh {
+        rmw_zenoh::run(zsession, Arc::new(config)).await;
+        return;
+    }
 
     // Declare plugin's liveliness token
     let ke_liveliness = keformat!(
