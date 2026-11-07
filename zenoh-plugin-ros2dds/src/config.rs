@@ -31,6 +31,7 @@ pub const DEFAULT_QUERIES_TIMEOUT: f32 = 5.0;
 pub const DEFAULT_ACTION_GET_RESULT_TIMEOUT: f32 = 300.0;
 pub const DEFAULT_WORK_THREAD_NUM: usize = 2;
 pub const DEFAULT_MAX_BLOCK_THREAD_NUM: usize = 50;
+pub const DEFAULT_RMW_ZENOH_CONNECT: &str = "tcp/localhost:7447";
 
 #[derive(Deserialize, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +80,13 @@ pub struct Config {
     pub work_thread_num: usize,
     #[serde(default = "default_max_block_thread_num")]
     pub max_block_thread_num: usize,
+    /// The RMW the local ROS 2 nodes use: "cyclonedds" (default, the bridge is a DDS participant)
+    /// or "zenoh" (the nodes use rmw_zenoh_cpp; the bridge is a client of their zenoh router).
+    #[serde(default)]
+    pub rmw: Rmw,
+    /// rmw: "zenoh" only: the endpoints of the local rmw_zenoh router (rmw_zenohd).
+    #[serde(default = "default_rmw_zenoh_connect")]
+    pub rmw_zenoh_connect: Vec<String>,
     __required__: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_path")]
     __path__: Option<Vec<String>>,
@@ -496,6 +504,18 @@ impl<'de> serde::de::Visitor<'de> for PathVisitor {
 
 fn default_reliable_routes_blocking() -> bool {
     DEFAULT_RELIABLE_ROUTES_BLOCKING
+}
+
+#[derive(Deserialize, Debug, Serialize, Eq, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Rmw {
+    #[default]
+    Cyclonedds,
+    Zenoh,
+}
+
+fn default_rmw_zenoh_connect() -> Vec<String> {
+    vec![DEFAULT_RMW_ZENOH_CONNECT.to_string()]
 }
 
 #[derive(Deserialize, Debug, Serialize, Eq, PartialEq, Clone, Copy)]

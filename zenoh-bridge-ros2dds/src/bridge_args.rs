@@ -49,6 +49,15 @@ pub struct BridgeArgs {
     /// Configure CycloneDDS to apply ROS_STATIC_PEERS. The argument only takes effect after ROS 2 Iron.
     #[arg(long, env("ROS_STATIC_PEERS"))]
     pub ros_static_peers: Option<String>,
+    /// The RMW of the local ROS 2 nodes: "cyclonedds" (the bridge joins the DDS domain) or "zenoh"
+    /// (the nodes use rmw_zenoh_cpp: the bridge connects to their router, see --rmw-zenoh-connect).
+    /// Overwrites 'plugins/ros2dds/rmw' of the configuration file [default: cyclonedds].
+    #[arg(long, value_name = "cyclonedds | zenoh", verbatim_doc_comment)]
+    pub rmw: Option<String>,
+    /// With --rmw zenoh: an endpoint of the local rmw_zenoh router (rmw_zenohd). Repeat for several.
+    /// Overwrites 'plugins/ros2dds/rmw_zenoh_connect' of the configuration file [default: tcp/localhost:7447].
+    #[arg(long, value_name = "ENDPOINT", verbatim_doc_comment)]
+    pub rmw_zenoh_connect: Vec<String>,
     /// Configure CycloneDDS to use Iceoryx shared memory. If not set, CycloneDDS will instead use any shared memory settings defined in "$CYCLONEDDS_URI" configuration.
     #[cfg(feature = "dds_shm")]
     #[arg(long)]
@@ -130,6 +139,12 @@ impl From<&BridgeArgs> for Config {
             &mut config,
             "plugins/ros2dds/pub_max_frequencies",
             &args.pub_max_frequency,
+        );
+        insert_json5_option(&mut config, "plugins/ros2dds/rmw", &args.rmw);
+        insert_json5_list(
+            &mut config,
+            "plugins/ros2dds/rmw_zenoh_connect",
+            &args.rmw_zenoh_connect,
         );
         insert_json5_option(
             &mut config,
